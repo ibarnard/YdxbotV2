@@ -72,4 +72,4 @@ websocket-client==1.9.0
 # - zq.py: 押注逻辑和状态管理
 # - model_manager.py: AI模型管理器
 # - variable.py: 全局变量和配置
-# - config.py: 用户配置文件(需从config_example.py复制)
+# - shared/global.json + users/*/config.json: 多用户配置入口

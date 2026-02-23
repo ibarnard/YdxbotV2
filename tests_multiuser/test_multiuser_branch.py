@@ -8,7 +8,6 @@ from types import SimpleNamespace
 from user_manager import UserContext, UserManager
 from model_manager import ModelManager
 import zq_multiuser as zm
-import config
 
 
 def _write_json(path: Path, data):
@@ -367,16 +366,19 @@ def test_process_bet_on_allows_short_history_like_master(tmp_path, monkeypatch):
 
 def test_user_context_migrates_legacy_state_when_history_empty(tmp_path, monkeypatch):
     monkeypatch.chdir(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    legacy_user_id = 500099
 
     user_dir = tmp_path / "users" / "xu"
     _write_json(
         user_dir / "config.json",
         {
             "account": {"name": "迁移用户"},
-            "telegram": {"user_id": int(config.user)},
+            "telegram": {"user_id": legacy_user_id},
         },
     )
     _write_json(user_dir / "state.json", {"history": [], "runtime": {}})
+    (tmp_path / "config.py").write_text(f"user = {legacy_user_id}\n", encoding="utf-8")
 
     legacy_state = {
         "history": [0, 1] * 30,  # 60条

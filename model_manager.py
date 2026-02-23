@@ -3,7 +3,11 @@ import aiohttp
 import asyncio
 import time
 from typing import Dict, List, Any, Optional
-import config
+
+try:
+    import config as legacy_config
+except Exception:
+    legacy_config = None
 
 # 尝试导入 DashScope SDK
 try:
@@ -32,16 +36,16 @@ class ModelManager:
         self.load_models_from_config()
 
     def load_models_from_config(self):
-        """从 config.py 加载并标准化模型配置"""
+        """从 shared 配置（优先）或 legacy config.py（回退）加载并标准化模型配置"""
         self.models = []
         self.api_key_indices = {}
         self.fallback_chain = []
         try:
             # 1. 加载 Google 模型
-            if getattr(config, 'GOOGLE_ENABLED', False):
-                api_key = getattr(config, 'GOOGLE_API_KEY', "")
-                base_url = getattr(config, 'GOOGLE_BASE_URL', "")
-                google_models = getattr(config, 'GOOGLE_MODELS', {})
+            if getattr(legacy_config, 'GOOGLE_ENABLED', False):
+                api_key = getattr(legacy_config, 'GOOGLE_API_KEY', "")
+                base_url = getattr(legacy_config, 'GOOGLE_BASE_URL', "")
+                google_models = getattr(legacy_config, 'GOOGLE_MODELS', {})
                 
                 for model_id, info in google_models.items():
                     self.models.append({
@@ -65,11 +69,11 @@ class ModelManager:
                 iflow_models = self.shared_ai_config.get('models', {})
                 configured_chain = self.shared_ai_config.get('fallback_chain', [])
             else:
-                iflow_enabled = getattr(config, 'IFLOW_ENABLED', False)
-                api_key = getattr(config, 'IFLOW_API_KEY', "")
-                base_url = getattr(config, 'IFLOW_BASE_URL', "https://apis.iflow.cn/v1")
-                iflow_models = getattr(config, 'IFLOW_MODELS', {})
-                configured_chain = getattr(config, 'MODEL_FALLBACK_CHAIN', [])
+                iflow_enabled = getattr(legacy_config, 'IFLOW_ENABLED', False)
+                api_key = getattr(legacy_config, 'IFLOW_API_KEY', "")
+                base_url = getattr(legacy_config, 'IFLOW_BASE_URL', "https://apis.iflow.cn/v1")
+                iflow_models = getattr(legacy_config, 'IFLOW_MODELS', {})
+                configured_chain = getattr(legacy_config, 'MODEL_FALLBACK_CHAIN', [])
 
             if iflow_enabled:
                 if not isinstance(iflow_models, dict):
@@ -97,9 +101,9 @@ class ModelManager:
                     self.fallback_chain = [str(x) for x in iflow_models.keys()]
 
             # 4. 加载 Aliyun 模型 (兼容旧配置)
-            if getattr(config, 'ALIYUN_ENABLED', False):
-                api_key = getattr(config, 'ALIYUN_API_KEY', "")
-                aliyun_models = getattr(config, 'ALIYUN_MODELS', {})
+            if getattr(legacy_config, 'ALIYUN_ENABLED', False):
+                api_key = getattr(legacy_config, 'ALIYUN_API_KEY', "")
+                aliyun_models = getattr(legacy_config, 'ALIYUN_MODELS', {})
                 
                 for model_id, info in aliyun_models.items():
                     self.models.append({
@@ -164,7 +168,7 @@ class ModelManager:
         返回格式: {"success": bool, "content": str, "error": str, "usage": dict}
         """
         # 获取降级链
-        fallback_chain = [str(x) for x in (self.fallback_chain or getattr(config, 'MODEL_FALLBACK_CHAIN', []))]
+        fallback_chain = [str(x) for x in (self.fallback_chain or getattr(legacy_config, 'MODEL_FALLBACK_CHAIN', []))]
         target_model_id = str(model_id)
         
         # 确定尝试顺序
