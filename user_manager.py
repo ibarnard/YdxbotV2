@@ -1,6 +1,6 @@
 """
 user_manager.py - 多用户管理模块
-版本: 2.4.0
+版本: 2.4.1
 日期: 2026-02-21
 功能: 用户配置加载、状态管理、多用户隔离
 """
@@ -82,6 +82,17 @@ def load_json_with_comments(filepath: str) -> Dict[str, Any]:
             cleaned_lines.append(line)
 
     return json.loads('\n'.join(cleaned_lines))
+
+
+def merge_dict(base: Dict[str, Any], override: Dict[str, Any]) -> Dict[str, Any]:
+    """深度合并字典: override 覆盖 base。"""
+    result = dict(base or {})
+    for key, value in (override or {}).items():
+        if isinstance(result.get(key), dict) and isinstance(value, dict):
+            result[key] = merge_dict(result[key], value)
+        else:
+            result[key] = value
+    return result
 
 
 @dataclass
@@ -202,8 +213,9 @@ def get_default_runtime() -> Dict[str, Any]:
 
 
 class UserContext:
-    def __init__(self, user_dir: str):
+    def __init__(self, user_dir: str, global_config: Optional[Dict[str, Any]] = None):
         self.user_dir = user_dir
+        self.global_config = global_config or {}
         self.user_id = 0  # 临时值，将在加载配置后更新
         self.config: Optional[UserConfig] = None
         self.state: Optional[UserState] = None
@@ -223,9 +235,18 @@ class UserContext:
             raise FileNotFoundError(f"配置文件不存在: {config_path}")
 
         data = load_json_with_comments(config_path)
+        global_cfg = self.global_config or {}
+
+        account_cfg = merge_dict(global_cfg.get("account", {}), data.get("account", {}))
+        telegram_cfg = merge_dict(global_cfg.get("telegram", {}), data.get("telegram", {}))
+        groups_cfg = merge_dict(global_cfg.get("groups", {}), data.get("groups", {}))
+        zhuque_cfg = merge_dict(global_cfg.get("zhuque", {}), data.get("zhuque", {}))
+        notification_cfg = merge_dict(global_cfg.get("notification", {}), data.get("notification", {}))
+        proxy_cfg = merge_dict(global_cfg.get("proxy", {}), data.get("proxy", {}))
+        ai_cfg = merge_dict(global_cfg.get("ai") or global_cfg.get("iflow", {}), data.get("ai", {}))
+        betting_cfg = merge_dict(global_cfg.get("betting", {}), data.get("betting", {}))
         
         # 从配置中读取user_id，如果没有则使用目录名的哈希值
-        telegram_cfg = data.get("telegram", {})
         self.user_id = telegram_cfg.get("user_id", 0)
         if self.user_id == 0:
             # 使用目录名作为user_id的备选
@@ -239,14 +260,14 @@ class UserContext:
         
         self.config = UserConfig(
             user_id=self.user_id,
-            name=data.get("account", {}).get("name", data.get("name", f"用户{self.user_id}")),
+            name=account_cfg.get("name", data.get("name", f"用户{self.user_id}")),
             telegram=telegram_cfg,
-            groups=data.get("groups", {}),
-            zhuque=data.get("zhuque", {}),
-            notification=data.get("notification", {}),
-            proxy=data.get("proxy", {}),
-            ai=data.get("ai", {}),
-            betting=data.get("betting", {})
+            groups=groups_cfg,
+            zhuque=zhuque_cfg,
+            notification=notification_cfg,
+            proxy=proxy_cfg,
+            ai=ai_cfg,
+            betting=betting_cfg
         )
         log_event(logging.INFO, 'load_config', f'加载用户配置成功', f'user_id={self.user_id}, name={self.config.name}')
     
@@ -392,12 +413,18 @@ class UserManager:
     def _load_global_config(self):
         global_path = os.path.join(self.shared_dir, "global.json")
         if os.path.exists(global_path):
-            with open(global_path, 'r', encoding='utf-8') as f:
-                self.global_config = json.load(f)
+            self.global_config = load_json_with_comments(global_path)
             log_event(logging.INFO, 'load_global', '加载全局配置成功', f'path={global_path}')
         else:
             self.global_config = {}
             log_event(logging.WARNING, 'load_global', '全局配置文件不存在', f'path={global_path}')
+
+        # 同步共享 AI 配置给模型管理器，确保多用户统一使用 shared/global.json
+        try:
+            from model_manager import model_manager
+            model_manager.apply_shared_config(self.global_config)
+        except Exception as e:
+            log_event(logging.WARNING, 'load_global', '同步模型共享配置失败', f'error={str(e)}')
     
     def load_all_users(self) -> int:
         self._load_global_config()
@@ -415,7 +442,7 @@ class UserManager:
             user_dir = os.path.join(self.users_dir, user_id_str)
             if os.path.isdir(user_dir):
                 try:
-                    ctx = UserContext(user_dir)
+                    ctx = UserContext(user_dir, self.global_config)
                     self.users[ctx.user_id] = ctx
                     loaded_count += 1
                 except Exception as e:

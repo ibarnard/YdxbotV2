@@ -19,12 +19,23 @@ logger = logging.getLogger('model_manager')
 class ModelManager:
     def __init__(self):
         self.models: List[Dict[str, Any]] = []
-        self.load_models_from_config()
         self.api_key_indices = {}  # 用于轮询 API Key
+        self.shared_ai_config: Dict[str, Any] = {}
+        self.fallback_chain: List[str] = []
+        self.load_models_from_config()
+
+    def apply_shared_config(self, global_config: Dict[str, Any]):
+        """接收 shared/global.json 中的 AI 配置并生效。"""
+        cfg = global_config or {}
+        ai_cfg = cfg.get("ai") or cfg.get("iflow") or {}
+        self.shared_ai_config = ai_cfg if isinstance(ai_cfg, dict) else {}
+        self.load_models_from_config()
 
     def load_models_from_config(self):
         """从 config.py 加载并标准化模型配置"""
         self.models = []
+        self.api_key_indices = {}
+        self.fallback_chain = []
         try:
             # 1. 加载 Google 模型
             if getattr(config, 'GOOGLE_ENABLED', False):
@@ -47,12 +58,26 @@ class ModelManager:
             pass
 
             # 3. 加载 iFlow 模型
-            if getattr(config, 'IFLOW_ENABLED', False):
+            if self.shared_ai_config:
+                iflow_enabled = self.shared_ai_config.get('enabled', True)
+                api_key = self.shared_ai_config.get('api_keys', self.shared_ai_config.get('api_key', ""))
+                base_url = self.shared_ai_config.get('base_url', "https://apis.iflow.cn/v1")
+                iflow_models = self.shared_ai_config.get('models', {})
+                configured_chain = self.shared_ai_config.get('fallback_chain', [])
+            else:
+                iflow_enabled = getattr(config, 'IFLOW_ENABLED', False)
                 api_key = getattr(config, 'IFLOW_API_KEY', "")
                 base_url = getattr(config, 'IFLOW_BASE_URL', "https://apis.iflow.cn/v1")
                 iflow_models = getattr(config, 'IFLOW_MODELS', {})
+                configured_chain = getattr(config, 'MODEL_FALLBACK_CHAIN', [])
+
+            if iflow_enabled:
+                if not isinstance(iflow_models, dict):
+                    iflow_models = {}
                 
                 for idx, info in iflow_models.items():
+                    if not isinstance(info, dict):
+                        continue
                     # 新格式：序号作为key，model_id在value中
                     actual_model_id = info.get("model_id", idx)
                     self.models.append({
@@ -63,8 +88,13 @@ class ModelManager:
                         "base_url": base_url,
                         "max_tokens": info.get("max_tokens", 8192),
                         "enabled": info.get("enabled", True),
-                        "idx": idx  # 保留序号用于选择
+                        "idx": str(idx)  # 保留序号用于选择
                     })
+
+                if isinstance(configured_chain, list) and configured_chain:
+                    self.fallback_chain = [str(x) for x in configured_chain]
+                else:
+                    self.fallback_chain = [str(x) for x in iflow_models.keys()]
 
             # 4. 加载 Aliyun 模型 (兼容旧配置)
             if getattr(config, 'ALIYUN_ENABLED', False):
@@ -134,25 +164,26 @@ class ModelManager:
         返回格式: {"success": bool, "content": str, "error": str, "usage": dict}
         """
         # 获取降级链
-        fallback_chain = getattr(config, 'MODEL_FALLBACK_CHAIN', [])
+        fallback_chain = [str(x) for x in (self.fallback_chain or getattr(config, 'MODEL_FALLBACK_CHAIN', []))]
+        target_model_id = str(model_id)
         
         # 确定尝试顺序
         try_models = []
         
         # 检查传入的 model_id 是否是配置的key（如"1"）
-        if model_id in fallback_chain:
+        if target_model_id in fallback_chain:
             # 是配置的key，按降级链处理
-            start_idx = fallback_chain.index(model_id)
+            start_idx = fallback_chain.index(target_model_id)
             try_models = fallback_chain[start_idx:]
         else:
             # 可能是真实的模型ID（如"iflow-rome-30ba3b"）
             # 先尝试直接调用
-            try_models = [model_id]
+            try_models = [target_model_id]
             
             # 如果该模型在降级链中，添加链中后续的模型作为备选
             for idx_key in fallback_chain:
                 model_cfg = self.get_model(idx_key)
-                if model_cfg and model_cfg.get('model_id') == model_id:
+                if model_cfg and str(model_cfg.get('model_id')) == target_model_id:
                     # 找到了对应的配置key，添加链中后续的模型
                     start_idx = fallback_chain.index(idx_key) + 1
                     try_models.extend(fallback_chain[start_idx:])
@@ -188,8 +219,8 @@ class ModelManager:
                     result = {"success": False, "error": f"不支持的厂商: {provider}", "content": ""}
                 
                 if result['success']:
-                    if current_id != model_id:
-                        logger.warning(f"模型 {model_id} 调用失败，已降级并成功使用 {current_id}")
+                    if current_id != target_model_id:
+                        logger.warning(f"模型 {target_model_id} 调用失败，已降级并成功使用 {current_id}")
                     return result
                 else:
                     error_msg = f"{current_id} 调用失败: {result['error']}"

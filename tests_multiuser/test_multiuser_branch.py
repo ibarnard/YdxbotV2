@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from user_manager import UserContext, UserManager
+from model_manager import ModelManager
 import zq_multiuser as zm
 import config
 
@@ -61,6 +62,65 @@ def test_user_manager_get_iflow_config_compatible_with_ai_key(tmp_path):
     cfg = mgr.get_iflow_config()
     assert cfg.get("enabled") is True
     assert "base_url" in cfg
+
+
+def test_user_context_merges_shared_and_user_config(tmp_path):
+    users_dir = tmp_path / "users"
+    shared_dir = tmp_path / "shared"
+    users_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        shared_dir / "global.json",
+        {
+            "groups": {"monitor": [101, 102], "zq_group": [201], "admin_chat": 9, "zq_bot": 8},
+            "zhuque": {"api_url": "https://zhuque.in/api/user/getInfo?"},
+            "notification": {"iyuu": {"enable": True}, "tg_bot": {"enable": True, "chat_id": "9"}},
+            "proxy": {"enabled": False, "host": "127.0.0.1", "port": 7890},
+            "ai": {"enabled": True, "base_url": "https://apis.iflow.cn/v1", "models": {"1": {"model_id": "m1", "enabled": True}}},
+        },
+    )
+    _write_json(
+        users_dir / "6001" / "config.json",
+        {
+            "account": {"name": "合并用户"},
+            "telegram": {"user_id": 6001},
+            "groups": {"admin_chat": 6001},
+            "zhuque": {"cookie": "c1", "x_csrf": "x1"},
+        },
+    )
+
+    mgr = UserManager(users_dir=str(users_dir), shared_dir=str(shared_dir))
+    assert mgr.load_all_users() == 1
+
+    ctx = mgr.get_user(6001)
+    assert ctx is not None
+    assert ctx.config.groups["monitor"] == [101, 102]
+    assert ctx.config.groups["admin_chat"] == 6001
+    assert ctx.config.zhuque["api_url"] == "https://zhuque.in/api/user/getInfo?"
+    assert ctx.config.zhuque["cookie"] == "c1"
+    assert ctx.config.notification["iyuu"]["enable"] is True
+    assert ctx.config.ai["base_url"] == "https://apis.iflow.cn/v1"
+
+
+def test_model_manager_apply_shared_config_uses_shared_chain():
+    mgr = ModelManager()
+    mgr.apply_shared_config(
+        {
+            "ai": {
+                "enabled": True,
+                "api_keys": ["k1"],
+                "base_url": "https://apis.iflow.cn/v1",
+                "models": {
+                    "1": {"model_id": "model-1", "enabled": True},
+                    "2": {"model_id": "model-2", "enabled": True},
+                },
+                "fallback_chain": ["2", "1"],
+            }
+        }
+    )
+
+    assert mgr.fallback_chain == ["2", "1"]
+    assert mgr.get_model("1")["model_id"] == "model-1"
+    assert mgr.get_model("2")["model_id"] == "model-2"
 
 
 def test_user_context_supports_hash_comments_in_config(tmp_path):
