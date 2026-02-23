@@ -1,6 +1,6 @@
 {
     # 配置结构版本
-    "version": "2.4.1",
+    "version": "2.4.2",
 
     # Telegram 登录参数（必填）
     # api_id/api_hash: 从 my.telegram.org 获取

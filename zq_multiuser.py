@@ -1,6 +1,6 @@
 """
 zq_multiuser.py - 多用户版本核心逻辑
-版本: 2.4.1
+版本: 2.4.2
 日期: 2026-02-21
 功能: 多用户押注、结算、命令处理
 """
@@ -111,6 +111,17 @@ def format_dashboard(user_ctx: UserContext) -> str:
         mes += f"\n\n还剩 {stop_count} 局恢复押注"
     
     return mes
+
+
+def get_bet_status_text(rt: Dict[str, Any]) -> str:
+    """统一押注状态展示。"""
+    if rt.get("manual_pause", False):
+        return "手动暂停"
+    if not rt.get("switch", True):
+        return "已关闭"
+    if rt.get("bet_on", False):
+        return "运行中"
+    return "已暂停"
 
 
 # 消息分发规则表（与 master 一致）
@@ -649,6 +660,13 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             await send_to_admin(client, "押注已关闭，无法执行", user_ctx, global_config)
             rt["bet"] = False
             user_ctx.save_state()
+        return
+
+    if rt.get("manual_pause", False):
+        if rt.get("bet", False):
+            rt["bet"] = False
+            user_ctx.save_state()
+        log_event(logging.DEBUG, 'bet_on', '手动暂停中，跳过押注', user_id=user_ctx.user_id)
         return
 
     stop_count = int(rt.get("stop_count", 0))
@@ -1243,9 +1261,14 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                 rt["bet_amount"] = int(rt.get("initial_amount", 500))
                 rt["mode_stop"] = True
                 rt["flag"] = True
-                rt["bet_on"] = True
-                rt["bet"] = True
-                mes = "**恢复押注**\n暂停已结束，新轮次开始"
+                if rt.get("manual_pause", False):
+                    rt["bet_on"] = False
+                    rt["bet"] = False
+                    mes = "**暂停结束**\n检测到手动暂停，保持暂停状态"
+                else:
+                    rt["bet_on"] = True
+                    rt["bet"] = True
+                    mes = "**恢复押注**\n暂停已结束，新轮次开始"
                 log_event(logging.INFO, 'settle', '恢复押注', 
                           user_id=user_ctx.user_id, data=f'round={rt.get("current_round", 1)}, bet_amount={rt.get("bet_amount", 500)}')
                 await send_to_admin(client, mes, user_ctx, global_config)
@@ -1428,6 +1451,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 **基础控制**
 - `open` : 开启押注
 - `off`  : 停止押注
+- `pause` : 仅暂停当前账号押注（不影响其他账号）
+- `resume` : 恢复当前账号押注
 - `st [预设名]` : 启动预设 (例: `st yc`)
 
 **参数设置**
@@ -1480,6 +1505,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             rt["open_ydx"] = True
             rt["bet"] = False
             rt["bet_on"] = True
+            rt["mode_stop"] = True
+            rt["manual_pause"] = False
             user_ctx.save_state()
             mes = "押注已启动"
             message = await send_to_admin(client, mes, user_ctx, global_config)
@@ -1493,6 +1520,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             rt["bet"] = False
             rt["open_ydx"] = False
             rt["bet_on"] = False
+            rt["manual_pause"] = False
             user_ctx.save_state()
             mes = "押注已停止"
             message = await send_to_admin(client, mes, user_ctx, global_config)
@@ -1501,21 +1529,29 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             return
         
         # pause/resume - 暂停/恢复押注（新增，master没有但有用）
-        if cmd == "pause":
+        if cmd in ("pause", "暂停"):
+            if rt.get("manual_pause", False):
+                await send_to_admin(client, "⏸ 当前账号已是暂停状态", user_ctx, global_config)
+                return
             rt["bet_on"] = False
+            rt["bet"] = False
             rt["mode_stop"] = True
+            rt["manual_pause"] = True
             user_ctx.save_state()
-            mes = "⏸ 已暂停押注"
+            mes = "⏸ 已暂停当前账号押注"
             await send_to_admin(client, mes, user_ctx, global_config)
             log_event(logging.INFO, 'user_cmd', '暂停押注', user_id=user_ctx.user_id)
             return
         
-        if cmd == "resume":
+        if cmd in ("resume", "恢复"):
+            if not rt.get("switch", True):
+                await send_to_admin(client, "当前为 off 状态，请先执行 `open`", user_ctx, global_config)
+                return
             rt["bet_on"] = True
-            rt["mode_stop"] = False
-            rt["lose_count"] = 0
+            rt["mode_stop"] = True
+            rt["manual_pause"] = False
             user_ctx.save_state()
-            mes = "▶️ 已恢复押注"
+            mes = "▶️ 已恢复当前账号押注"
             await send_to_admin(client, mes, user_ctx, global_config)
             log_event(logging.INFO, 'user_cmd', '恢复押注', user_id=user_ctx.user_id)
             return
@@ -1852,6 +1888,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["mark"] = True
                     rt["flag"] = True
                     rt["mode_stop"] = True
+                    rt["manual_pause"] = False
                     rt["pause_count"] = 0
                     rt["current_bet_seq"] = 1
                     user_ctx.save_state()
@@ -1985,7 +2022,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             # 获取当前用户信息
             user_info = f"👤 当前用户: {user_ctx.config.name} (ID: {user_ctx.user_id})\n"
             user_info += f"💰 菠菜资金: {format_number(rt.get('gambling_fund', 0))}\n"
-            user_info += f"📊 状态: {'运行中' if rt.get('bet_on', False) else '已暂停'}\n"
+            user_info += f"📊 状态: {get_bet_status_text(rt)}\n"
             user_info += f"🎯 预设: {rt.get('current_preset_name', '无')}\n"
             user_info += f"🤖 模型: {rt.get('current_model_id', 'default')}\n"
             user_info += f"📈 胜率: {rt.get('win_total', 0)}/{rt.get('total', 0)}"
@@ -2008,6 +2045,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
     """检查押注状态 - 与master版本一致"""
     rt = user_ctx.state.runtime
+    if rt.get("manual_pause", False):
+        return
     next_bet_amount = calculate_bet_amount(rt)
     if is_fund_available(user_ctx, next_bet_amount) and not rt.get("bet", False) and rt.get("switch", True) and rt.get("stop_count", 0) == 0:
         rt["bet"] = True

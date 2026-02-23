@@ -1,6 +1,6 @@
 """
 user_manager.py - 多用户管理模块
-版本: 2.4.1
+版本: 2.4.2
 日期: 2026-02-21
 功能: 用户配置加载、状态管理、多用户隔离
 """
@@ -154,6 +154,7 @@ def get_default_runtime() -> Dict[str, Any]:
         # 核心控制变量
         "switch": True,
         "open_ydx": False,
+        "manual_pause": False,
         "consequence": "大",
         
         # 历史和状态管理

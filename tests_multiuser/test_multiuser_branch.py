@@ -526,6 +526,90 @@ def test_check_bet_status_can_resume_when_fund_sufficient(tmp_path, monkeypatch)
     assert "押注已恢复" in sent["message"]
 
 
+def test_pause_command_sets_manual_pause_and_blocks_bet_on(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5005"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "暂停用户"},
+            "telegram": {"user_id": 5005},
+            "groups": {"admin_chat": 5005},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["bet"] = True
+    rt["bet_on"] = True
+    rt["mode_stop"] = True
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        return SimpleNamespace(chat_id=5005, id=1)
+
+    async def fake_sleep(*args, **kwargs):
+        return None
+
+    async def fail_predict(*args, **kwargs):
+        raise AssertionError("predict should not run while manual pause is active")
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(zm, "predict_next_bet_v10", fail_predict)
+
+    cmd_event = SimpleNamespace(raw_text="pause", chat_id=5005, id=10)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert rt["manual_pause"] is True
+    assert rt["bet_on"] is False
+    assert rt["bet"] is False
+
+    class DummyEvent:
+        def __init__(self):
+            history = " ".join((["0", "1"] * 20))
+            self.message = SimpleNamespace(message=f"[近 40 次结果][由近及远][0 小 1 大] {history}")
+            self.reply_markup = object()
+            self.chat_id = 5005
+            self.id = 11
+
+    asyncio.run(zm.process_bet_on(SimpleNamespace(), DummyEvent(), ctx, {}))
+
+
+def test_check_bet_status_does_not_resume_when_manual_pause(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5006"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "手动暂停用户"},
+            "telegram": {"user_id": 5006},
+            "groups": {"admin_chat": 5006},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["manual_pause"] = True
+    rt["stop_count"] = 0
+    rt["bet"] = False
+    rt["gambling_fund"] = 2_000_000
+    rt["bet_amount"] = 0
+    rt["lose_count"] = 0
+    rt["win_count"] = 0
+
+    sent = {"called": False}
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent["called"] = True
+        return SimpleNamespace(chat_id=5006, id=1)
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    asyncio.run(zm.check_bet_status(SimpleNamespace(), ctx, {}))
+
+    assert rt["bet"] is False
+    assert sent["called"] is False
+
+
 def test_process_settle_lose_warning_matches_master_style(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "5004"
     _write_json(
