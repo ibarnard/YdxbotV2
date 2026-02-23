@@ -61,11 +61,38 @@ def _parse_repo_slug(remote_url: str) -> Optional[str]:
 
 
 def detect_repo_slug(repo_root: Optional[str] = None) -> Optional[str]:
+    remote = detect_repo_remote(repo_root)
+    return remote.get("slug") or None
+
+
+def detect_repo_remote(repo_root: Optional[str] = None) -> Dict[str, str]:
     root = _repo_root(repo_root)
     result = _run_cmd(["git", "config", "--get", "remote.origin.url"], root, timeout=10)
-    if result.returncode != 0:
-        return None
-    return _parse_repo_slug(result.stdout.strip())
+    if result.returncode == 0 and result.stdout.strip():
+        url = result.stdout.strip()
+        return {"name": "origin", "url": url, "slug": _parse_repo_slug(url) or ""}
+
+    remotes_res = _run_cmd(["git", "remote", "-v"], root, timeout=10)
+    if remotes_res.returncode != 0:
+        return {}
+
+    fetch_remotes: List[Dict[str, str]] = []
+    for line in remotes_res.stdout.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+        name, url, kind = parts[0], parts[1], parts[2]
+        if kind != "(fetch)":
+            continue
+        fetch_remotes.append({"name": name, "url": url, "slug": _parse_repo_slug(url) or ""})
+
+    if not fetch_remotes:
+        return {}
+
+    for item in fetch_remotes:
+        if item.get("slug"):
+            return item
+    return fetch_remotes[0]
 
 
 def get_current_repo_info(repo_root: Optional[str] = None) -> Dict[str, Any]:
@@ -197,9 +224,12 @@ def _is_runtime_file(path: str) -> bool:
     if not path:
         return True
     normalized = path.replace("\\", "/")
+    filename = Path(normalized).name
     if normalized in {"state.json", "account_funds.json", "MULTIUSER_TEST_RESULTS.json"}:
         return True
     if normalized.endswith(".log"):
+        return True
+    if ".log." in filename:
         return True
     if normalized.endswith(".session") or normalized.endswith(".session-journal"):
         return True
@@ -353,25 +383,39 @@ def update_to_release(repo_root: Optional[str] = None, target_tag: Optional[str]
             }
 
         current = get_current_repo_info(root)
-        repo_slug = detect_repo_slug(root)
-        if not repo_slug:
-            return {"success": False, "error": "无法识别 GitHub 仓库地址(remote.origin.url)"}
-
-        fetch_res = _run_cmd(["git", "fetch", "--tags", "origin"], root, timeout=120)
-        if fetch_res.returncode != 0:
-            return {
-                "success": False,
-                "error": "git fetch --tags 失败",
-                "detail": (fetch_res.stderr or fetch_res.stdout).strip()[:600],
-            }
+        remote = detect_repo_remote(root)
+        remote_name = remote.get("name", "")
+        repo_slug = remote.get("slug", "")
 
         final_tag = (target_tag or "").strip()
         latest = None
         if not final_tag:
+            if not repo_slug:
+                return {
+                    "success": False,
+                    "error": "无法识别 GitHub 仓库地址(remote.origin.url)",
+                    "detail": "请检查 git 远程配置，例如：git remote add origin https://github.com/<owner>/<repo>.git",
+                }
+            if remote_name:
+                fetch_res = _run_cmd(["git", "fetch", "--tags", remote_name], root, timeout=120)
+                if fetch_res.returncode != 0:
+                    return {
+                        "success": False,
+                        "error": f"git fetch --tags {remote_name} 失败",
+                        "detail": (fetch_res.stderr or fetch_res.stdout).strip()[:600],
+                    }
             latest = get_latest_release(repo_slug)
             if not latest.get("success"):
                 return {"success": False, "error": latest.get("error", "获取最新 release 失败")}
             final_tag = latest.get("tag_name", "").strip()
+        elif remote_name:
+            fetch_res = _run_cmd(["git", "fetch", "--tags", remote_name], root, timeout=120)
+            if fetch_res.returncode != 0:
+                return {
+                    "success": False,
+                    "error": f"git fetch --tags {remote_name} 失败",
+                    "detail": (fetch_res.stderr or fetch_res.stdout).strip()[:600],
+                }
 
         if not final_tag:
             return {"success": False, "error": "未找到可用的 release tag"}
@@ -419,6 +463,96 @@ def update_to_release(repo_root: Optional[str] = None, target_tag: Optional[str]
         _release_update_lock(root)
 
 
+def update_to_ref(repo_root: Optional[str] = None, target_ref: Optional[str] = None) -> Dict[str, Any]:
+    """更新到任意 git 引用（commit/tag/branch）。"""
+    root = _repo_root(repo_root)
+    lock = _acquire_update_lock(root)
+    if not lock.get("success"):
+        return lock
+
+    try:
+        blocking = get_blocking_dirty_paths(root)
+        if blocking:
+            return {
+                "success": False,
+                "error": "存在未提交代码变更，已阻止更新",
+                "blocking_paths": blocking,
+            }
+
+        final_ref = (target_ref or "").strip()
+        if not final_ref:
+            return {"success": False, "error": "请提供目标 ref（commit/tag/branch）"}
+
+        current = get_current_repo_info(root)
+        remote = detect_repo_remote(root)
+        remote_name = remote.get("name", "")
+
+        if remote_name:
+            fetch_res = _run_cmd(["git", "fetch", "--tags", remote_name], root, timeout=120)
+            if fetch_res.returncode != 0:
+                verify_local = _run_cmd(["git", "rev-parse", "--verify", f"{final_ref}^{{commit}}"], root, timeout=20)
+                if verify_local.returncode != 0:
+                    return {
+                        "success": False,
+                        "error": f"git fetch --tags {remote_name} 失败，且本地不存在目标 ref",
+                        "detail": (fetch_res.stderr or fetch_res.stdout).strip()[:600],
+                    }
+
+        resolve_res = _run_cmd(["git", "rev-parse", "--verify", f"{final_ref}^{{commit}}"], root, timeout=20)
+        if resolve_res.returncode != 0:
+            return {
+                "success": False,
+                "error": f"目标 ref 不存在: {final_ref}",
+                "detail": (resolve_res.stderr or resolve_res.stdout).strip()[:600],
+            }
+        target_commit = resolve_res.stdout.strip()
+
+        if current.get("commit") == target_commit:
+            return {
+                "success": True,
+                "no_change": True,
+                "current": current,
+                "target_ref": final_ref,
+                "target_commit": target_commit,
+                "message": "当前已是目标版本",
+            }
+
+        _save_rollback_point(root, current, final_ref)
+
+        checkout_res = _run_cmd(["git", "checkout", final_ref], root, timeout=60)
+        if checkout_res.returncode != 0:
+            return {
+                "success": False,
+                "error": f"切换到目标 ref 失败: {final_ref}",
+                "detail": (checkout_res.stderr or checkout_res.stdout).strip()[:600],
+            }
+
+        health = run_health_check(root)
+        if not health.get("success"):
+            rollback_result = _rollback_to_last_release_unlocked(root)
+            return {
+                "success": False,
+                "error": health.get("error", "更新后健康检查失败"),
+                "detail": health.get("detail", ""),
+                "rollback": rollback_result,
+            }
+
+        after = get_current_repo_info(root)
+        if after.get("current_tag"):
+            mark_release_applied(after.get("current_tag"), root)
+            mark_release_notified(after.get("current_tag"), root)
+
+        return {
+            "success": True,
+            "current": current,
+            "after": after,
+            "target_ref": final_ref,
+            "target_commit": target_commit,
+        }
+    finally:
+        _release_update_lock(root)
+
+
 async def restart_process(delay_seconds: float = 2.0) -> None:
     await asyncio.sleep(delay_seconds)
     os.execv(sys.executable, [sys.executable] + sys.argv)
@@ -433,7 +567,7 @@ def build_release_update_message(check_result: Dict[str, Any]) -> str:
         f"最新版本：{latest.get('tag_name', 'unknown')}\n"
         f"发布时间：{latest.get('published_at', 'unknown')}\n"
         f"发布链接：{latest.get('html_url', '')}\n"
-        "可用命令：`upcheck` `upnow` `uprollback` `restart`"
+        "可用命令：`upcheck` `upnow` `upref` `uprollback` `restart`"
     )
 
 

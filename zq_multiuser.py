@@ -26,6 +26,7 @@ from update_manager import (
     get_current_repo_info,
     restart_process,
     rollback_to_last_release,
+    update_to_ref,
     update_to_release,
 )
 
@@ -97,7 +98,7 @@ def format_dashboard(user_ctx: UserContext) -> str:
     mes += f"💰 **账户余额：{balance_str}**\n"
     # 防止资金显示为负数
     display_fund = max(0, rt.get('gambling_fund', 0))
-    mes += f"💰 **菠菜资金剩余：{display_fund / 10000:.2f} 万**\n📈 **盈利目标：{rt.get('profit', 1000000) / 10000:.2f} 万，暂停 {rt.get('profit_stop', 5)} 局**\n"
+    mes += f"💰 **菠菜余额：{display_fund / 10000:.2f} 万**\n📈 **盈利目标：{rt.get('profit', 1000000) / 10000:.2f} 万，暂停 {rt.get('profit_stop', 5)} 局**\n"
     mes += f"📈 **本轮盈利：{rt.get('period_profit', 0) / 10000:.2f} 万**\n📈 **总盈利：{rt.get('earnings', 0) / 10000:.2f} 万**\n\n"
     
     win_total = rt.get('win_total', 0)
@@ -1107,7 +1108,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                                     f"💵 押注本金：{format_number(bet_amount)}\n"
                                     f"💰 累计损失：{format_number(total_losses)}\n"
                                     f"💰 账户余额：{rt.get('account_balance', 0) / 10000:.2f} 万\n"
-                                    f"💰 菠菜资金剩余：{rt.get('gambling_fund', 0) / 10000:.2f} 万"
+                                    f"💰 菠菜余额：{rt.get('gambling_fund', 0) / 10000:.2f} 万"
                                 )
 
                                 log_event(
@@ -1146,10 +1147,15 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                             end_seq = rt.get("current_bet_seq", 1)
                             
                             date_str = datetime.now().strftime("%m月%d日")
-                            
-                            rec_msg = f"✅ 连输已终止！\n"
-                            rec_msg += f"{date_str} 第 {start_round} 轮第 {start_seq} 次 至 第 {end_seq} 次\n"
-                            rec_msg += f"本局连输 {old_lose_count} 局，最终盈利： {format_number(total_profit)}\n"
+
+                            rec_msg = (
+                                f"✅ 连输已终止！✅\n"
+                                f"🔢 {date_str} 第 {start_round} 轮第 {start_seq} 次 至 第 {end_seq} 次\n"
+                                f"⚠️本局连输： {old_lose_count} 局\n"
+                                f"💰 最终盈利： {format_number(total_profit)}\n"
+                                f"💰 账户余额：{rt.get('account_balance', 0) / 10000:.2f} 万\n"
+                                f"💰 菠菜资金剩余：{rt.get('gambling_fund', 0) / 10000:.2f} 万"
+                            )
                             
                             await send_message_v2(client, "lose_end", rec_msg, user_ctx, global_config)
                             
@@ -1480,6 +1486,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `ver` : 查看当前版本/分支/提交
 - `upcheck` : 检查最新 GitHub Release
 - `upnow [tag]` : 更新到最新(或指定)发布版本并自动重启
+- `upref [ref]` : 更新到指定 git 引用(commit/tag/branch)并自动重启
 - `uprollback` : 回滚到上一个版本并自动重启
 - `restart` : 仅重启当前进程
 
@@ -1799,6 +1806,48 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 blocking_paths = result.get("blocking_paths", [])
                 detail = result.get("detail", "")
                 mes_lines = [f"❌ 发布更新失败：{result.get('error', 'unknown')}"]
+                if blocking_paths:
+                    mes_lines.append("阻塞文件：")
+                    mes_lines.extend([f"- {path}" for path in blocking_paths[:10]])
+                if detail:
+                    mes_lines.append(f"详情：{detail[:200]}")
+
+                rollback = result.get("rollback", {})
+                if rollback.get("success"):
+                    mes_lines.append("⚠️ 已自动回滚到上一个版本，2 秒后自动重启")
+                    await send_to_admin(client, "\n".join(mes_lines), user_ctx, global_config)
+                    asyncio.create_task(restart_process())
+                else:
+                    await send_to_admin(client, "\n".join(mes_lines), user_ctx, global_config)
+            asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+            return
+
+        if cmd in ("upref", "upcommit"):
+            target_ref = my[1].strip() if len(my) > 1 else ""
+            if not target_ref:
+                await send_to_admin(client, "用法：`upref <commit|tag|branch>`", user_ctx, global_config)
+                return
+
+            await send_to_admin(client, f"🔄 开始更新到目标引用：{target_ref}", user_ctx, global_config)
+            result = await asyncio.to_thread(update_to_ref, None, target_ref)
+
+            if result.get("success"):
+                if result.get("no_change"):
+                    await send_to_admin(client, f"✅ {result.get('message', '当前已是目标版本')}", user_ctx, global_config)
+                else:
+                    after = result.get("after", {})
+                    mes = (
+                        "✅ 引用更新成功\n"
+                        f"目标：{result.get('target_ref', target_ref)}\n"
+                        f"当前：{after.get('display_version', after.get('short_commit', 'unknown'))}\n"
+                        "♻️ 2 秒后自动重启进程"
+                    )
+                    await send_to_admin(client, mes, user_ctx, global_config)
+                    asyncio.create_task(restart_process())
+            else:
+                blocking_paths = result.get("blocking_paths", [])
+                detail = result.get("detail", "")
+                mes_lines = [f"❌ 引用更新失败：{result.get('error', 'unknown')}"]
                 if blocking_paths:
                     mes_lines.append("阻塞文件：")
                     mes_lines.extend([f"- {path}" for path in blocking_paths[:10]])
