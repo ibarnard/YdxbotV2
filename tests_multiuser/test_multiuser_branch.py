@@ -1,0 +1,521 @@
+import asyncio
+import json
+import re
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
+from user_manager import UserContext, UserManager
+import zq_multiuser as zm
+import config
+
+
+def _write_json(path: Path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def test_user_context_user_id_fallback_numeric_dir(tmp_path):
+    user_dir = tmp_path / "users" / "1001"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "测试用户"},
+            "telegram": {},
+        },
+    )
+
+    ctx = UserContext(str(user_dir))
+    assert ctx.user_id == 1001
+    assert ctx.config.name == "测试用户"
+
+
+def test_user_context_user_id_fallback_hash_dir(tmp_path):
+    user_dir = tmp_path / "users" / "alpha_user"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "Alpha"},
+            "telegram": {},
+        },
+    )
+
+    ctx = UserContext(str(user_dir))
+    assert isinstance(ctx.user_id, int)
+    assert ctx.user_id > 0
+
+
+def test_user_manager_get_iflow_config_compatible_with_ai_key(tmp_path):
+    users_dir = tmp_path / "users"
+    shared_dir = tmp_path / "shared"
+    users_dir.mkdir(parents=True, exist_ok=True)
+    _write_json(
+        shared_dir / "global.json",
+        {
+            "ai": {"enabled": True, "base_url": "https://apis.iflow.cn/v1"},
+        },
+    )
+
+    mgr = UserManager(users_dir=str(users_dir), shared_dir=str(shared_dir))
+    mgr.load_all_users()
+    cfg = mgr.get_iflow_config()
+    assert cfg.get("enabled") is True
+    assert "base_url" in cfg
+
+
+def test_user_context_supports_hash_comments_in_config(tmp_path):
+    user_dir = tmp_path / "users" / "commented"
+    user_dir.mkdir(parents=True, exist_ok=True)
+    config_text = """{
+    # Telegram 登录参数
+    "telegram": {
+        "api_id": 123456,
+        "api_hash": "abc123",
+        "session_name": "demo",
+        "user_id": 778899
+    },
+    # 账号信息
+    "account": {"name": "注释用户"} # 行尾注释
+}
+"""
+    (user_dir / "config.json").write_text(config_text, encoding="utf-8")
+    ctx = UserContext(str(user_dir))
+    assert ctx.user_id == 778899
+    assert ctx.config.name == "注释用户"
+
+
+def test_main_multiuser_settle_regex_is_strict():
+    source = Path("main_multiuser.py").read_text(encoding="utf-8")
+    assert 'pattern=r"已结算: 结果为 (\\d+) (大|小)"' in source
+
+    pattern = re.compile(r"已结算: 结果为 (\d+) (大|小)")
+    assert pattern.search("已结算: 结果为 12 大")
+    assert pattern.search("已结算: 结果为 8 小")
+    assert pattern.search("已结算: 结果为 9 |") is None
+
+
+def test_user_isolation_between_two_contexts(tmp_path):
+    users_dir = tmp_path / "users"
+    shared_dir = tmp_path / "shared"
+    _write_json(shared_dir / "global.json", {"ai": {"enabled": True}})
+
+    _write_json(users_dir / "1001" / "config.json", {"account": {"name": "U1"}, "telegram": {"user_id": 1001}})
+    _write_json(users_dir / "1002" / "config.json", {"account": {"name": "U2"}, "telegram": {"user_id": 1002}})
+
+    mgr = UserManager(users_dir=str(users_dir), shared_dir=str(shared_dir))
+    assert mgr.load_all_users() == 2
+
+    u1 = mgr.get_user(1001)
+    u2 = mgr.get_user(1002)
+    assert u1 is not None and u2 is not None
+
+    u1.set_runtime("bet_amount", 12345)
+    u2.set_runtime("bet_amount", 54321)
+
+    assert u1.get_runtime("bet_amount") == 12345
+    assert u2.get_runtime("bet_amount") == 54321
+
+
+def test_user_state_save_concurrent_no_corruption(tmp_path):
+    user_dir = tmp_path / "users" / "2001"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "并发用户"},
+            "telegram": {"user_id": 2001},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+
+    def worker(i):
+        ctx.set_runtime("counter", i)
+        ctx.save_state()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    state_path = user_dir / "state.json"
+    loaded = json.loads(state_path.read_text(encoding="utf-8"))
+    assert "runtime" in loaded
+    assert isinstance(loaded["runtime"], dict)
+    assert "counter" in loaded["runtime"]
+
+
+def test_send_message_returns_admin_message_object(tmp_path):
+    user_dir = tmp_path / "users" / "3001"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "消息用户"},
+            "telegram": {"user_id": 3001},
+            "groups": {"admin_chat": 3001},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+
+    class DummyClient:
+        async def send_message(self, target, message, parse_mode=None):
+            return SimpleNamespace(chat_id=target, id=88)
+
+    message = asyncio.run(
+        zm.send_message(
+            DummyClient(),
+            "admin",
+            "hello",
+            ctx,
+            {},
+        )
+    )
+    assert message is not None
+    assert message.id == 88
+
+
+def test_process_bet_on_parses_history_and_places_bet(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "4001"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "下注用户"},
+            "telegram": {"user_id": 4001},
+            "groups": {"admin_chat": 4001},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["bet_on"] = True
+    rt["mode_stop"] = True
+    rt["stop_count"] = 0
+    rt["bet_amount"] = 500
+    rt["lose_count"] = 0
+    rt["win_count"] = 0
+
+    async def fake_predict(user_ctx, global_cfg):
+        user_ctx.state.runtime["last_predict_info"] = "test"
+        user_ctx.state.predictions.append(1)
+        return 1
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        return SimpleNamespace(chat_id=1, id=1)
+
+    async def fake_delete_later(*args, **kwargs):
+        return None
+
+    async def fake_sleep(*args, **kwargs):
+        return None
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "predict_next_bet_v10", fake_predict)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "delete_later", fake_delete_later)
+    monkeypatch.setattr(zm.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    class DummyEvent:
+        def __init__(self):
+            history = " ".join((["0", "1"] * 20))
+            self.message = SimpleNamespace(message=f"[近 40 次结果][由近及远][0 小 1 大] {history}")
+            self.reply_markup = object()
+            self.chat_id = 1
+            self.id = 1
+            self.clicks = []
+
+        async def click(self, data):
+            self.clicks.append(data)
+
+    event = DummyEvent()
+    asyncio.run(zm.process_bet_on(SimpleNamespace(), event, ctx, {}))
+
+    assert len(ctx.state.history) >= 40
+    assert rt.get("bet") is True
+    assert len(ctx.state.bet_sequence_log) == 1
+    assert rt.get("current_bet_seq", 1) >= 2
+
+
+def test_process_bet_on_allows_short_history_like_master(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "4002"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "短历史用户"},
+            "telegram": {"user_id": 4002},
+            "groups": {"admin_chat": 4002},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["bet_on"] = True
+    rt["mode_stop"] = True
+    rt["stop_count"] = 0
+    rt["initial_amount"] = 500
+    rt["bet_amount"] = 500
+    rt["lose_count"] = 0
+    rt["win_count"] = 0
+
+    async def fake_predict(user_ctx, global_cfg):
+        user_ctx.state.runtime["last_predict_info"] = "test-short-history"
+        user_ctx.state.predictions.append(1)
+        return 1
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        return SimpleNamespace(chat_id=1, id=1)
+
+    async def fake_delete_later(*args, **kwargs):
+        return None
+
+    async def fake_sleep(*args, **kwargs):
+        return None
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "predict_next_bet_v10", fake_predict)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "delete_later", fake_delete_later)
+    monkeypatch.setattr(zm.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    class DummyEvent:
+        def __init__(self):
+            self.message = SimpleNamespace(message="[近 40 次结果][由近及远][0 小 1 大] 1 0 1")
+            self.reply_markup = object()
+            self.chat_id = 1
+            self.id = 1
+            self.clicks = []
+
+        async def click(self, data):
+            self.clicks.append(data)
+
+    event = DummyEvent()
+    asyncio.run(zm.process_bet_on(SimpleNamespace(), event, ctx, {}))
+
+    assert len(ctx.state.history) == 3
+    assert rt.get("bet") is True
+    assert len(ctx.state.bet_sequence_log) == 1
+
+
+def test_user_context_migrates_legacy_state_when_history_empty(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+
+    user_dir = tmp_path / "users" / "xu"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "迁移用户"},
+            "telegram": {"user_id": int(config.user)},
+        },
+    )
+    _write_json(user_dir / "state.json", {"history": [], "runtime": {}})
+
+    legacy_state = {
+        "history": [0, 1] * 30,  # 60条
+        "bet_type_history": [0, 1] * 30,
+        "predictions": [1, 0] * 30,
+        "bet_sequence_log": [],
+        "state": {"current_model_id": "qwen3-coder-plus", "bet_amount": 500},
+    }
+    _write_json(tmp_path / "state.json", legacy_state)
+
+    ctx = UserContext(str(user_dir))
+    assert len(ctx.state.history) >= 40
+
+
+def test_send_message_v2_routes_and_account_prefix(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5001"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "路由用户"},
+            "telegram": {"user_id": 5001},
+            "groups": {"admin_chat": 5001},
+            "notification": {
+                "iyuu": {"enable": True, "url": "https://iyuu.test/send"},
+                "tg_bot": {"enable": True, "bot_token": "token", "chat_id": "chat"},
+            },
+        },
+    )
+    ctx = UserContext(str(user_dir))
+
+    requests_payloads = []
+
+    def fake_post(url, data=None, json=None, timeout=5):
+        requests_payloads.append({"url": url, "data": data, "json": json})
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(zm.requests, "post", fake_post)
+
+    class DummyClient:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, target, message, parse_mode=None):
+            self.messages.append((target, message))
+            return SimpleNamespace(chat_id=target, id=7)
+
+    client = DummyClient()
+    asyncio.run(
+        zm.send_message_v2(
+            client,
+            "lose_streak",
+            "【账号：路由用户】\n测试告警",
+            ctx,
+            {},
+            title="标题",
+            desp="测试告警",
+        )
+    )
+
+    assert client.messages == [(5001, "测试告警")]
+    assert len(requests_payloads) == 2
+    iyuu_payload = next(item for item in requests_payloads if "iyuu" in item["url"])
+    tg_payload = next(item for item in requests_payloads if "api.telegram.org" in item["url"])
+    assert iyuu_payload["data"]["desp"].startswith("【账号：路由用户】")
+    assert tg_payload["json"]["text"].startswith("【账号：路由用户】")
+
+
+def test_process_settle_open_ydx_supports_monitor_list(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5002"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "结算用户"},
+            "telegram": {"user_id": 5002},
+            "groups": {"admin_chat": 5002, "monitor": [101, 102]},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.runtime["open_ydx"] = True
+    ctx.state.runtime["bet"] = False
+
+    async def fake_fetch_balance(user_ctx):
+        return 123456
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        return SimpleNamespace(chat_id=5002, id=99)
+
+    monkeypatch.setattr(zm, "fetch_balance", fake_fetch_balance)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    class DummyClient:
+        def __init__(self):
+            self.sent = []
+
+        async def send_message(self, target, message, parse_mode=None):
+            self.sent.append((target, message))
+            return SimpleNamespace(chat_id=target, id=1)
+
+        async def delete_messages(self, chat_id, message_id):
+            return None
+
+    event = SimpleNamespace(message=SimpleNamespace(message="已结算: 结果为 8 小"))
+    client = DummyClient()
+    asyncio.run(zm.process_settle(client, event, ctx, {}))
+
+    monitor_messages = [msg for msg in client.sent if msg[1] == "/ydx"]
+    assert (101, "/ydx") in monitor_messages
+    assert (102, "/ydx") in monitor_messages
+    assert ctx.state.history[-1] == 0
+
+
+def test_check_bet_status_can_resume_when_fund_sufficient(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5003"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "恢复用户"},
+            "telegram": {"user_id": 5003},
+            "groups": {"admin_chat": 5003},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["stop_count"] = 0
+    rt["bet"] = False
+    rt["gambling_fund"] = 2_000_000
+    rt["bet_amount"] = 0
+    rt["lose_count"] = 0
+    rt["win_count"] = 0
+
+    sent = {}
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent["message"] = message
+        return SimpleNamespace(chat_id=5003, id=1)
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    asyncio.run(zm.check_bet_status(SimpleNamespace(), ctx, {}))
+
+    assert rt["bet"] is True
+    assert rt["pause_count"] == 0
+    assert "押注已恢复" in sent["message"]
+
+
+def test_process_settle_lose_warning_matches_master_style(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5004"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "告警用户"},
+            "telegram": {"user_id": 5004},
+            "groups": {"admin_chat": 5004},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["bet"] = True
+    rt["bet_type"] = 0  # 押小
+    rt["bet_amount"] = 500
+    rt["warning_lose_count"] = 1
+    rt["bet_sequence_count"] = 1
+    rt["account_balance"] = 10_000_000
+    rt["gambling_fund"] = 9_000_000
+    rt["current_round"] = 1
+    rt["current_bet_seq"] = 2
+    ctx.state.bet_sequence_log = [{"bet_id": "20260223_1_1", "profit": None}]
+
+    captured = {}
+
+    async def fake_send_message_v2(client, msg_type, message, user_ctx, global_cfg, parse_mode="markdown", title=None, desp=None):
+        captured["type"] = msg_type
+        captured["message"] = message
+        return None
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        return SimpleNamespace(chat_id=5004, id=12)
+
+    async def fake_fetch_balance(user_ctx):
+        return rt["account_balance"]
+
+    monkeypatch.setattr(zm, "send_message_v2", fake_send_message_v2)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "fetch_balance", fake_fetch_balance)
+
+    class DummyClient:
+        async def send_message(self, target, message, parse_mode=None):
+            return SimpleNamespace(chat_id=target, id=1)
+
+        async def delete_messages(self, chat_id, message_id):
+            return None
+
+    event = SimpleNamespace(message=SimpleNamespace(message="已结算: 结果为 9 大"))
+    asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
+
+    assert captured["type"] == "lose_streak"
+    assert "⚠️ 1 连输告警 ⚠️" in captured["message"]
+    assert "💰 账户余额：" in captured["message"]
+    assert "🤖 当局 AI 预测提示" not in captured["message"]

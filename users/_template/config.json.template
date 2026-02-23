@@ -1,0 +1,107 @@
+{
+    # 配置结构版本
+    "version": "2.4.0",
+
+    # Telegram 登录参数（必填）
+    # api_id/api_hash: 从 my.telegram.org 获取
+    # session_name: 对应 .session 文件名（不带后缀）
+    # user_id: 多用户内部唯一 ID，不能重复
+    "telegram": {
+        "api_id": 12345678,
+        "api_hash": "your_api_hash",
+        "session_name": "your_session_name",
+        "user_id": 1234567890
+    },
+
+    # 账号显示信息（消息前缀和日志）
+    "account": {
+        "name": "你的账号名",
+        "description": "账号备注"
+    },
+
+    # 群组与机器人配置（监听开奖）
+    "groups": {
+        "monitor": [
+            "me"
+        ],
+        "zq_group": [
+            "me"
+        ],
+        "admin_chat": 123456789,
+        "zq_bot": 123456789
+    },
+
+    # 朱雀余额接口配置
+    "zhuque": {
+        "cookie": "socute=请填你的cookie",
+        "x_csrf": "请填你的x_csrf",
+        "api_url": "https://zhuque.in/api/user/getInfo?"
+    },
+
+    # 通知配置（重点消息推送）
+    "notification": {
+        "iyuu": {
+            "enable": false,
+            "url": "",
+            "token": "",
+            "notify_types": [
+                "explode",
+                "profit",
+                "explode_summary"
+            ]
+        },
+        "tg_bot": {
+            "enable": false,
+            "bot_token": "",
+            "chat_id": ""
+        }
+    },
+
+    # 代理配置（不用就 enabled=false）
+    "proxy": {
+        "enabled": false,
+        "type": "socks5",
+        "host": "127.0.0.1",
+        "port": 7890,
+        "username": "",
+        "password": ""
+    },
+
+    # AI 配置（模型与 key）
+    "ai": {
+        "enabled": true,
+        "api_keys": [
+            "请填你的apikey"
+        ],
+        "base_url": "https://apis.iflow.cn/v1",
+        "models": {
+            "1": {
+                "model_id": "iflow-rome-30ba3b",
+                "enabled": true
+            },
+            "2": {
+                "model_id": "qwen3-coder-plus",
+                "enabled": true
+            },
+            "3": {
+                "model_id": "qwen3-max",
+                "enabled": true
+            },
+            "4": {
+                "model_id": "deepseek-v3.2",
+                "enabled": true
+            },
+            "5": {
+                "model_id": "glm-4.6",
+                "enabled": true
+            }
+        },
+        "fallback_chain": [
+            "1",
+            "2",
+            "3",
+            "4",
+            "5"
+        ]
+    }
+}

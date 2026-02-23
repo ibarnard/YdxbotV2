@@ -1,0 +1,53 @@
+# 配置文件（包含敏感信息）
+config.py
+
+# 用户数据目录（多用户版本）
+users/*
+!users/_template/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# 日志文件
+*.log
+.release_state.json
+.release_rollback.json
+.update.lock
+
+# 本地环境文件
+.env
+.env.local
+
+# 会话文件
+*.session
+*.session-journal

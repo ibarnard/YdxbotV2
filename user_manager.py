@@ -1,0 +1,570 @@
+"""
+user_manager.py - 多用户管理模块
+版本: 2.4.0
+日期: 2026-02-21
+功能: 用户配置加载、状态管理、多用户隔离
+"""
+
+import os
+import json
+import threading
+import logging
+from dataclasses import dataclass, field
+from typing import Dict, Any, Optional, List
+from logging.handlers import TimedRotatingFileHandler
+import constants
+
+# 日志配置
+logger = logging.getLogger('user_manager')
+logger.setLevel(logging.DEBUG)
+file_handler = TimedRotatingFileHandler('user_manager.log', when='midnight', interval=1, backupCount=3, encoding='utf-8')
+file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+logger.addHandler(file_handler)
+
+
+def log_event(level, module, event, message=None, **kwargs):
+    # 兼容旧调用: log_event(level, event, message, data)
+    if message is None:
+        message = event
+        event = module
+        module = 'user_manager'
+    data = ', '.join(f'{k}={v}' for k, v in kwargs.items())
+    logger.log(level, f"[{module}:{event}] {message} | {data}")
+
+
+def load_json_with_comments(filepath: str) -> Dict[str, Any]:
+    """
+    读取支持注释的 JSON 文件。
+    说明：
+    - 支持整行注释：# ... 或 // ...
+    - 支持行尾注释：... # ... 或 ... // ...
+    """
+    with open(filepath, 'r', encoding='utf-8') as f:
+        raw_text = f.read()
+
+    cleaned_lines = []
+    for raw_line in raw_text.splitlines():
+        stripped = raw_line.lstrip()
+        if stripped.startswith('#') or stripped.startswith('//'):
+            continue
+
+        in_string = False
+        escaped = False
+        cleaned = []
+        i = 0
+        while i < len(raw_line):
+            ch = raw_line[i]
+            if escaped:
+                cleaned.append(ch)
+                escaped = False
+                i += 1
+                continue
+            if ch == '\\':
+                cleaned.append(ch)
+                escaped = True
+                i += 1
+                continue
+            if ch == '"':
+                in_string = not in_string
+                cleaned.append(ch)
+                i += 1
+                continue
+            if not in_string:
+                if ch == '#':
+                    break
+                if ch == '/' and i + 1 < len(raw_line) and raw_line[i + 1] == '/':
+                    break
+            cleaned.append(ch)
+            i += 1
+
+        line = ''.join(cleaned).rstrip()
+        if line:
+            cleaned_lines.append(line)
+
+    return json.loads('\n'.join(cleaned_lines))
+
+
+@dataclass
+class UserConfig:
+    user_id: int
+    name: str
+    telegram: Dict[str, Any] = field(default_factory=dict)
+    groups: Dict[str, Any] = field(default_factory=dict)
+    zhuque: Dict[str, Any] = field(default_factory=dict)
+    notification: Dict[str, Any] = field(default_factory=dict)
+    proxy: Dict[str, Any] = field(default_factory=dict)
+    ai: Dict[str, Any] = field(default_factory=dict)
+    betting: Dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class UserState:
+    """
+    用户状态数据类
+    包含所有运行时变量，与 master 分支 variable.py 保持一致
+    """
+    # 历史数据
+    history: List[int] = field(default_factory=list)
+    bet_type_history: List[int] = field(default_factory=list)
+    predictions: List[int] = field(default_factory=list)
+    bet_sequence_log: List[Dict] = field(default_factory=list)
+    
+    # 运行时变量（存储在 runtime 字典中）
+    runtime: Dict[str, Any] = field(default_factory=dict)
+    
+    def get_runtime(self, key: str, default: Any = None) -> Any:
+        """获取运行时变量，支持类型转换"""
+        value = self.runtime.get(key, default)
+        # 如果默认值是 int，但存储的是字符串，进行转换
+        if default is not None and isinstance(default, int) and isinstance(value, str):
+            try:
+                return int(value)
+            except (ValueError, TypeError):
+                return default
+        if default is not None and isinstance(default, float) and isinstance(value, str):
+            try:
+                return float(value)
+            except (ValueError, TypeError):
+                return default
+        return value
+    
+    def set_runtime(self, key: str, value: Any):
+        """设置运行时变量"""
+        self.runtime[key] = value
+
+
+def get_default_runtime() -> Dict[str, Any]:
+    """
+    获取默认运行时变量
+    与 master 分支 variable.py 保持一致
+    """
+    from datetime import datetime
+    return {
+        # 核心控制变量
+        "switch": True,
+        "open_ydx": False,
+        "consequence": "大",
+        
+        # 历史和状态管理
+        "current_round": 1,
+        "current_bet_seq": 1,
+        "last_reset_date": datetime.now().strftime("%Y%m%d"),
+        
+        # 押注参数
+        "bet": False,
+        "bet_on": False,
+        "mode": 1,
+        "mode_stop": True,
+        "bet_type": 0,
+        "initial_amount": 500,
+        "bet_amount": 0,
+        "bet_sequence_count": 0,
+        "lose_stop": 20,
+        "warning_lose_count": 3,
+        "lose_notify_pending": False,
+        "lose_start_info": {},
+        "last_logic_audit": "",
+        "lose_once": 2.5,
+        "lose_twice": 2.5,
+        "lose_three": 2.5,
+        "lose_four": 2.1,
+        "continuous": 10,
+        "explode": 1,
+        "stop": 3,
+        "profit_stop": 2,
+        "explode_count": 0,
+        "stop_count": 0,
+        "mark": True,
+        "flag": True,
+        "pause_count": 0,
+        
+        # 统计和仪表盘变量
+        "total": 0,
+        "win_total": 0,
+        "earnings": 0,
+        "period_profit": 0,
+        "profit": 1000000,
+        "win_count": 0,
+        "lose_count": 0,
+        "gambling_fund": 25000000,
+        "account_balance": 0,
+        "balance_status": "unknown",
+        "status": 0,
+        
+        # 算法相关变量
+        "last_predict_info": "V10 预测",
+        "api_key_index": 0,
+        "current_model_id": "qwen3-coder-plus",
+        
+        # 预设相关
+        "current_preset_name": "",
+    }
+
+
+class UserContext:
+    def __init__(self, user_dir: str):
+        self.user_dir = user_dir
+        self.user_id = 0  # 临时值，将在加载配置后更新
+        self.config: Optional[UserConfig] = None
+        self.state: Optional[UserState] = None
+        self.presets: Dict[str, List] = {}
+        self.client = None
+        self._lock = threading.Lock()
+        self._load_all()
+    
+    def _load_all(self):
+        self._load_config()
+        self._load_state()
+        self._load_presets()
+    
+    def _load_config(self):
+        config_path = os.path.join(self.user_dir, "config.json")
+        if not os.path.exists(config_path):
+            raise FileNotFoundError(f"配置文件不存在: {config_path}")
+
+        data = load_json_with_comments(config_path)
+        
+        # 从配置中读取user_id，如果没有则使用目录名的哈希值
+        telegram_cfg = data.get("telegram", {})
+        self.user_id = telegram_cfg.get("user_id", 0)
+        if self.user_id == 0:
+            # 使用目录名作为user_id的备选
+            # 修复：多用户分支 - 变量名写错导致 NameError（user_id 缺失时会直接崩溃）。
+            dir_name = os.path.basename(self.user_dir)
+            try:
+                self.user_id = int(dir_name)
+            except ValueError:
+                # 如果目录名不是数字，使用哈希值
+                self.user_id = hash(dir_name) % 100000000
+        
+        self.config = UserConfig(
+            user_id=self.user_id,
+            name=data.get("account", {}).get("name", data.get("name", f"用户{self.user_id}")),
+            telegram=telegram_cfg,
+            groups=data.get("groups", {}),
+            zhuque=data.get("zhuque", {}),
+            notification=data.get("notification", {}),
+            proxy=data.get("proxy", {}),
+            ai=data.get("ai", {}),
+            betting=data.get("betting", {})
+        )
+        log_event(logging.INFO, 'load_config', f'加载用户配置成功', f'user_id={self.user_id}, name={self.config.name}')
+    
+    def _load_state(self):
+        state_path = os.path.join(self.user_dir, "state.json")
+        default_rt = get_default_runtime()
+        
+        if os.path.exists(state_path):
+            try:
+                with open(state_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # 合并默认运行时变量和保存的运行时变量
+                saved_runtime = data.get("runtime", {})
+                merged_runtime = {**default_rt, **saved_runtime}
+                
+                self.state = UserState(
+                    history=data.get("history", [])[-2000:],
+                    bet_type_history=data.get("bet_type_history", [])[-2000:],
+                    predictions=data.get("predictions", [])[-2000:],
+                    bet_sequence_log=data.get("bet_sequence_log", [])[-5000:],
+                    runtime=merged_runtime
+                )
+                log_event(logging.DEBUG, 'load_state', '加载用户状态成功', f'user_id={self.user_id}')
+            except Exception as e:
+                log_event(logging.ERROR, 'load_state', '加载用户状态失败', f'user_id={self.user_id}, error={str(e)}, action=使用默认状态')
+                self.state = UserState(runtime=default_rt)
+        else:
+            self.state = UserState(runtime=default_rt)
+            log_event(logging.INFO, 'load_state', '创建新用户状态', f'user_id={self.user_id}')
+
+        # 修复：多用户分支 - 新建用户若历史为空会长期无法下注；兼容导入 master 单用户 state.json 历史。
+        if len(self.state.history) < 40:
+            self._try_migrate_legacy_state()
+
+    def _try_migrate_legacy_state(self):
+        """尝试从根目录 legacy state.json 导入历史与关键运行时字段。"""
+        legacy_state_path = "state.json"
+        if not os.path.exists(legacy_state_path):
+            return False
+
+        # 仅导入与当前账号匹配的单用户状态，避免多账号串状态
+        try:
+            import config as legacy_config
+            if int(getattr(legacy_config, "user", 0)) != int(self.user_id):
+                return False
+        except Exception:
+            return False
+
+        try:
+            with open(legacy_state_path, 'r', encoding='utf-8') as f:
+                legacy_state = json.load(f)
+        except Exception as e:
+            log_event(logging.WARNING, 'load_state', '读取legacy状态失败', f'user_id={self.user_id}, error={str(e)}')
+            return False
+
+        legacy_history = [x for x in legacy_state.get("history", []) if x in [0, 1]][-2000:]
+        if len(legacy_history) < 40:
+            return False
+
+        self.state.history = legacy_history
+        self.state.bet_type_history = legacy_state.get("bet_type_history", [])[-2000:]
+        self.state.predictions = legacy_state.get("predictions", [])[-2000:]
+        self.state.bet_sequence_log = legacy_state.get("bet_sequence_log", [])[-5000:]
+
+        legacy_runtime = legacy_state.get("state", {})
+        for key in [
+            "win_count", "lose_count", "bet_amount", "bet_sequence_count", "win_total",
+            "total", "earnings", "period_profit", "explode_count", "mode", "initial_amount",
+            "lose_stop", "lose_once", "lose_twice", "lose_three", "lose_four",
+            "stop_count", "pause_count", "account_balance", "current_model_id"
+        ]:
+            if key in legacy_runtime:
+                self.state.runtime[key] = legacy_runtime[key]
+
+        log_event(logging.INFO, 'load_state', '已导入legacy单用户状态', f'user_id={self.user_id}, history_len={len(legacy_history)}')
+        self.save_state()
+        return True
+    
+    def _load_presets(self):
+        presets_path = os.path.join(self.user_dir, "presets.json")
+        
+        # 先加载全局预设作为基础
+        self.presets = dict(constants.PRESETS)
+        
+        if os.path.exists(presets_path):
+            try:
+                with open(presets_path, 'r', encoding='utf-8') as f:
+                    user_presets = json.load(f)
+                    # 合并用户预设（用户预设会覆盖全局预设）
+                    self.presets.update(user_presets)
+                log_event(logging.DEBUG, 'load_presets', '加载用户预设成功', f'user_id={self.user_id}')
+            except Exception as e:
+                log_event(logging.ERROR, 'load_presets', '加载用户预设失败', f'user_id={self.user_id}, error={str(e)}')
+        else:
+            log_event(logging.INFO, 'load_presets', '初始化默认预设', f'user_id={self.user_id}')
+        
+        # 保存合并后的预设到文件（确保文件是最新的）
+        self.save_presets()
+    
+    def save_state(self):
+        with self._lock:
+            state_path = os.path.join(self.user_dir, "state.json")
+            data = {
+                "history": self.state.history[-2000:],
+                "bet_type_history": self.state.bet_type_history[-2000:],
+                "predictions": self.state.predictions[-2000:],
+                "bet_sequence_log": self.state.bet_sequence_log[-5000:],
+                "runtime": self.state.runtime
+            }
+            try:
+                with open(state_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=4, ensure_ascii=False)
+                log_event(logging.DEBUG, 'save_state', '保存用户状态成功', f'user_id={self.user_id}')
+            except Exception as e:
+                log_event(logging.ERROR, 'save_state', '保存用户状态失败', f'user_id={self.user_id}, error={str(e)}')
+    
+    def save_presets(self):
+        with self._lock:
+            presets_path = os.path.join(self.user_dir, "presets.json")
+            try:
+                with open(presets_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.presets, f, indent=4, ensure_ascii=False)
+                log_event(logging.DEBUG, 'save_presets', '保存用户预设成功', f'user_id={self.user_id}')
+            except Exception as e:
+                log_event(logging.ERROR, 'save_presets', '保存用户预设失败', f'user_id={self.user_id}, error={str(e)}')
+    
+    def get_runtime(self, key: str, default=None):
+        return self.state.runtime.get(key, default)
+    
+    def set_runtime(self, key: str, value: Any):
+        self.state.runtime[key] = value
+
+
+class UserManager:
+    def __init__(self, users_dir: str = "users", shared_dir: str = "shared"):
+        self.users_dir = users_dir
+        self.shared_dir = shared_dir
+        self.users: Dict[int, UserContext] = {}
+        self.global_config: Dict[str, Any] = {}
+        log_event(logging.INFO, 'init', '用户管理器初始化', f'users_dir={users_dir}')
+    
+    def _load_global_config(self):
+        global_path = os.path.join(self.shared_dir, "global.json")
+        if os.path.exists(global_path):
+            with open(global_path, 'r', encoding='utf-8') as f:
+                self.global_config = json.load(f)
+            log_event(logging.INFO, 'load_global', '加载全局配置成功', f'path={global_path}')
+        else:
+            self.global_config = {}
+            log_event(logging.WARNING, 'load_global', '全局配置文件不存在', f'path={global_path}')
+    
+    def load_all_users(self) -> int:
+        self._load_global_config()
+        
+        if not os.path.exists(self.users_dir):
+            os.makedirs(self.users_dir)
+            log_event(logging.INFO, 'load_users', '创建用户目录', f'path={self.users_dir}')
+            return 0
+        
+        loaded_count = 0
+        for user_id_str in os.listdir(self.users_dir):
+            if user_id_str.startswith('_'):
+                continue
+            
+            user_dir = os.path.join(self.users_dir, user_id_str)
+            if os.path.isdir(user_dir):
+                try:
+                    ctx = UserContext(user_dir)
+                    self.users[ctx.user_id] = ctx
+                    loaded_count += 1
+                except Exception as e:
+                    log_event(logging.ERROR, 'load_user', '加载用户失败', f'user_dir={user_dir}, error={str(e)}')
+        
+        log_event(logging.INFO, 'load_users', '加载用户完成', f'count={loaded_count}')
+        return loaded_count
+    
+    def get_user(self, user_id: int) -> Optional[UserContext]:
+        return self.users.get(user_id)
+    
+    def get_all_users(self) -> Dict[int, UserContext]:
+        return self.users
+    
+    def create_user(self, user_id: int, config: dict) -> UserContext:
+        user_dir = os.path.join(self.users_dir, str(user_id))
+        os.makedirs(user_dir, exist_ok=True)
+        
+        config_path = os.path.join(user_dir, "config.json")
+        with open(config_path, 'w', encoding='utf-8') as f:
+            json.dump(config, f, indent=4, ensure_ascii=False)
+        
+        ctx = UserContext(user_dir)
+        self.users[user_id] = ctx
+        log_event(logging.INFO, 'create_user', '创建用户成功', f'user_id={user_id}')
+        return ctx
+    
+    def delete_user(self, user_id: int) -> bool:
+        if user_id not in self.users:
+            return False
+        
+        user_dir = os.path.join(self.users_dir, str(user_id))
+        import shutil
+        shutil.rmtree(user_dir)
+        del self.users[user_id]
+        log_event(logging.INFO, 'delete_user', '删除用户成功', f'user_id={user_id}')
+        return True
+    
+    def get_button_mapping(self) -> Dict[str, Dict[int, int]]:
+        return self.global_config.get("button_mapping", {
+            "small": {500: 14, 2000: 12, 20000: 10, 50000: 8, 250000: 6, 1000000: 4, 5000000: 2, 50000000: 0},
+            "big": {500: 15, 2000: 13, 20000: 11, 50000: 9, 250000: 7, 1000000: 5, 5000000: 3, 50000000: 1}
+        })
+    
+    def get_proxy_config(self) -> Optional[Dict]:
+        proxy_cfg = self.global_config.get("proxy", {})
+        if not proxy_cfg.get("enabled"):
+            return None
+        return {
+            'proxy_type': proxy_cfg.get("type", "socks5"),
+            'addr': proxy_cfg.get("host", "127.0.0.1"),
+            'port': proxy_cfg.get("port", 7890),
+            'username': proxy_cfg.get("username") or None,
+            'password': proxy_cfg.get("password") or None,
+            'rdns': True
+        }
+    
+    def get_iflow_config(self) -> Dict:
+        # 修复：多用户分支 - global.json 当前使用 ai 键；兼容旧 iflow 键避免读取空配置。
+        return self.global_config.get("ai") or self.global_config.get("iflow", {})
+
+
+def migrate_from_legacy(config_module, variable_module) -> UserContext:
+    """
+    从旧版config.py和variable.py迁移到新结构
+    """
+    user_id = config_module.user
+    user_dir = os.path.join("users", str(user_id))
+    os.makedirs(user_dir, exist_ok=True)
+    
+    config_data = {
+        "user_id": user_id,
+        "name": config_module.name,
+        "telegram": {
+            "api_id": config_module.api_id,
+            "api_hash": config_module.api_hash,
+            "session_name": config_module.user_session
+        },
+        "groups": {
+            "zq_group": config_module.zq_group,
+            "zq_bot": config_module.zq_bot,
+            "admin_chat": config_module.user
+        },
+        "zhuque": {
+            "cookie": config_module.ZHUQUE_COOKIE,
+            "csrf_token": config_module.ZHUQUE_X_CSRF
+        },
+        "notification": {
+            "iyuu": {
+                "enable": config_module.iyuu_config.get("enable", False),
+                "token": config_module.iyuu_config.get("token", ""),
+                "notify_types": config_module.iyuu_config.get("notify_types", [])
+            },
+            "tg_bot": {
+                "enable": config_module.tg_bot_config.get("enable", False),
+                "bot_token": config_module.tg_bot_config.get("bot_token", ""),
+                "chat_id": config_module.tg_bot_config.get("chat_id", "")
+            }
+        }
+    }
+    
+    config_path = os.path.join(user_dir, "config.json")
+    with open(config_path, 'w', encoding='utf-8') as f:
+        json.dump(config_data, f, indent=4, ensure_ascii=False)
+    
+    state_data = {
+        "history": variable_module.history[-2000:],
+        "bet_type_history": variable_module.bet_type_history[-2000:],
+        "predictions": variable_module.predictions[-2000:],
+        "bet_sequence_log": variable_module.bet_sequence_log[-5000:],
+        "runtime": {
+            "current_round": variable_module.current_round,
+            "current_bet_seq": variable_module.current_bet_seq,
+            "win_count": variable_module.win_count,
+            "lose_count": variable_module.lose_count,
+            "bet_amount": variable_module.bet_amount,
+            "bet_sequence_count": variable_module.bet_sequence_count,
+            "win_total": variable_module.win_total,
+            "total": variable_module.total,
+            "earnings": variable_module.earnings,
+            "period_profit": variable_module.period_profit,
+            "explode_count": variable_module.explode_count,
+            "stop_count": variable_module.stop_count,
+            "gambling_fund": variable_module.gambling_fund,
+            "account_balance": variable_module.account_balance,
+            "current_model_id": variable_module.current_model_id,
+            "current_preset_name": variable_module.current_preset_name,
+            "initial_amount": variable_module.initial_amount,
+            "lose_stop": variable_module.lose_stop,
+            "lose_once": variable_module.lose_once,
+            "lose_twice": variable_module.lose_twice,
+            "lose_three": variable_module.lose_three,
+            "lose_four": variable_module.lose_four,
+            "continuous": variable_module.continuous,
+            "explode": variable_module.explode,
+            "stop": variable_module.stop,
+            "profit_stop": variable_module.profit_stop,
+            "profit": variable_module.profit
+        }
+    }
+    
+    state_path = os.path.join(user_dir, "state.json")
+    with open(state_path, 'w', encoding='utf-8') as f:
+        json.dump(state_data, f, indent=4, ensure_ascii=False)
+    
+    presets_data = constants.PRESETS
+    presets_path = os.path.join(user_dir, "presets.json")
+    with open(presets_path, 'w', encoding='utf-8') as f:
+        json.dump(presets_data, f, indent=4, ensure_ascii=False)
+    
+    log_event(logging.INFO, 'migrate', '迁移完成', f'user_id={user_id}')
+    return UserContext(user_dir)
