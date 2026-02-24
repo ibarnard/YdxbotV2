@@ -1,6 +1,6 @@
 """
 zq_multiuser.py - 多用户版本核心逻辑
-版本: 2.4.2
+版本: 2.4.3
 日期: 2026-02-21
 功能: 多用户押注、结算、命令处理
 """
@@ -901,6 +901,23 @@ def format_bet_id(bet_id):
         return str(bet_id)
 
 
+def get_settle_position(state, rt):
+    """
+    获取当前结算对应的轮次与序号。
+    优先用当前结算 bet_id，回退到 current_bet_seq - 1。
+    """
+    settle_round = int(rt.get("current_round", 1))
+    settle_seq = max(1, int(rt.get("current_bet_seq", 1)) - 1)
+    if state.bet_sequence_log:
+        last_bet_id = str(state.bet_sequence_log[-1].get("bet_id", ""))
+        import re
+        match = re.match(r"^\d{8}_(\d+)_(\d+)$", last_bet_id)
+        if match:
+            settle_round = int(match.group(1))
+            settle_seq = int(match.group(2))
+    return settle_round, settle_seq
+
+
 def _format_recent_binary(history: list, window: int) -> str:
     """
     格式化最近 N 局结果为二进制字符串
@@ -1037,6 +1054,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         direction = None
         profit = 0
         result_amount = 0
+        lose_end_payload = None
         
         # 资金安全闸门
         if not is_fund_available(user_ctx):
@@ -1056,6 +1074,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     win = (is_big and prediction == 1) or (not is_big and prediction == 0)
                     bet_amount = int(rt.get("bet_amount", 500))
                     profit = int(bet_amount * 0.99) if win else -bet_amount
+                    settle_round, settle_seq = get_settle_position(state, rt)
                     
                     # 记录连输状态用于回补播报
                     old_lose_count = rt.get("lose_count", 0)
@@ -1076,8 +1095,8 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                         # 如果连输刚开始（第1次），记录起始信息
                         if rt.get("lose_count", 0) == 1:
                             rt["lose_start_info"] = {
-                                "round": rt.get("current_round", 1),
-                                "seq": rt.get("current_bet_seq", 1),
+                                "round": settle_round,
+                                "seq": settle_seq,
                                 "fund": rt.get("gambling_fund", 0) + bet_amount
                             }
                         
@@ -1102,7 +1121,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                                 bet_dir_str = "大" if prediction == 1 else "小"
                                 warn_msg = (
                                     f"⚠️ {rt.get('lose_count', 0)} 连输告警 ⚠️\n"
-                                    f"🔢 {date_str} 第 {rt.get('current_round', 1)} 轮第 {rt.get('current_bet_seq', 1)} 次：\n"
+                                    f"🔢 {date_str} 第 {settle_round} 轮第 {settle_seq} 次：\n"
                                     f"😀 连续押注：{rt.get('bet_sequence_count', 0)} 次\n"
                                     f"⚡️ 押注方向：{bet_dir_str}\n"
                                     f"💵 押注本金：{format_number(bet_amount)}\n"
@@ -1144,23 +1163,16 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                             
                             start_round = lose_start_info.get("round", "?")
                             start_seq = lose_start_info.get("seq", "?")
-                            end_seq = rt.get("current_bet_seq", 1)
-                            
-                            date_str = datetime.now().strftime("%m月%d日")
-
-                            rec_msg = (
-                                f"✅ 连输已终止！✅\n"
-                                f"🔢 {date_str} 第 {start_round} 轮第 {start_seq} 次 至 第 {end_seq} 次\n"
-                                f"⚠️本局连输： {old_lose_count} 局\n"
-                                f"💰 最终盈利： {format_number(total_profit)}\n"
-                                f"💰 账户余额：{rt.get('account_balance', 0) / 10000:.2f} 万\n"
-                                f"💰 菠菜资金剩余：{rt.get('gambling_fund', 0) / 10000:.2f} 万"
-                            )
-                            
-                            await send_message_v2(client, "lose_end", rec_msg, user_ctx, global_config)
-                            
-                            log_event(logging.INFO, 'settle', '触发连输终止通知', 
-                                      user_id=user_ctx.user_id, data=f'old_lose={old_lose_count}, total_profit={total_profit}')
+                            end_round = settle_round
+                            end_seq = settle_seq
+                            lose_end_payload = {
+                                "start_round": start_round,
+                                "start_seq": start_seq,
+                                "end_round": end_round,
+                                "end_seq": end_seq,
+                                "lose_count": old_lose_count,
+                                "total_profit": total_profit,
+                            }
                         except Exception as e:
                             log_event(logging.ERROR, 'settle', '连输终止通知异常', 
                                       user_id=user_ctx.user_id, data=str(e))
@@ -1337,6 +1349,39 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             log_event(logging.WARNING, 'settle', '获取账户余额失败，使用默认值', 
                       user_id=user_ctx.user_id, data=str(e))
             rt["balance_status"] = "network_error"
+
+        # 连输终止播报延后到结算数据写入后，避免与结算通知时序错位
+        if lose_end_payload:
+            date_str = datetime.now().strftime("%m月%d日")
+            start_round = lose_end_payload.get("start_round", "?")
+            start_seq = lose_end_payload.get("start_seq", "?")
+            end_round = lose_end_payload.get("end_round", "?")
+            end_seq = lose_end_payload.get("end_seq", "?")
+            if str(start_round) == str(end_round):
+                range_text = f"{date_str} 第 {start_round} 轮第 {start_seq} 次 至 第 {end_seq} 次"
+            else:
+                range_text = f"{date_str} 第 {start_round} 轮第 {start_seq} 次 至 第 {end_round} 轮第 {end_seq} 次"
+
+            rec_msg = (
+                f"✅ 连输已终止！✅\n"
+                f"🔢 {range_text}\n"
+                f"⚠️本局连输： {lose_end_payload.get('lose_count', 0)} 局\n"
+                f"💰 最终盈利： {format_number(lose_end_payload.get('total_profit', 0))}\n"
+                f"💰 账户余额：{rt.get('account_balance', 0) / 10000:.2f} 万\n"
+                f"💰 菠菜资金剩余：{rt.get('gambling_fund', 0) / 10000:.2f} 万"
+            )
+            await send_message_v2(client, "lose_end", rec_msg, user_ctx, global_config)
+            log_event(
+                logging.INFO,
+                'settle',
+                '触发连输终止通知',
+                user_id=user_ctx.user_id,
+                data=(
+                    f"lose_count={lose_end_payload.get('lose_count', 0)}, "
+                    f"start={start_round}-{start_seq}, end={end_round}-{end_seq}, "
+                    f"total_profit={lose_end_payload.get('total_profit', 0)}"
+                ),
+            )
         
         # 发送仪表盘
         dashboard = format_dashboard(user_ctx)

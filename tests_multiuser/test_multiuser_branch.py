@@ -663,6 +663,7 @@ def test_process_settle_lose_warning_matches_master_style(tmp_path, monkeypatch)
 
     assert captured["type"] == "lose_streak"
     assert "⚠️ 1 连输告警 ⚠️" in captured["message"]
+    assert "第 1 轮第 1 次" in captured["message"]
     assert "💰 账户余额：" in captured["message"]
     assert "🤖 当局 AI 预测提示" not in captured["message"]
 
@@ -688,7 +689,7 @@ def test_process_settle_lose_end_message_contains_balance_lines(tmp_path, monkey
     rt["lose_notify_pending"] = True
     rt["lose_start_info"] = {"round": 1, "seq": 5, "fund": 24_566_390}
     rt["current_round"] = 1
-    rt["current_bet_seq"] = 9
+    rt["current_bet_seq"] = 10
     rt["account_balance"] = 24_634_900
     rt["gambling_fund"] = 24_567_390
     ctx.state.bet_sequence_log = [{"bet_id": "20260224_1_9", "profit": None}]
