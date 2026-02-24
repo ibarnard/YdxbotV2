@@ -412,15 +412,29 @@ class UserManager:
         log_event(logging.INFO, 'init', '用户管理器初始化', f'users_dir={users_dir}')
     
     def _load_global_config(self):
-        global_path = os.path.join(self.shared_dir, "global.json")
-        if os.path.exists(global_path):
-            self.global_config = load_json_with_comments(global_path)
-            log_event(logging.INFO, 'load_global', '加载全局配置成功', f'path={global_path}')
-        else:
-            self.global_config = {}
-            log_event(logging.WARNING, 'load_global', '全局配置文件不存在', f'path={global_path}')
+        candidates = [
+            os.path.join(self.shared_dir, "global.local.json"),
+            os.path.join(self.shared_dir, "global.json"),
+            os.path.join(self.shared_dir, "global.example.json"),
+        ]
 
-        # 同步共享 AI 配置给模型管理器，确保多用户统一使用 shared/global.json
+        chosen_path = ""
+        self.global_config = {}
+        for path in candidates:
+            if os.path.exists(path):
+                self.global_config = load_json_with_comments(path)
+                chosen_path = path
+                break
+
+        if chosen_path:
+            if chosen_path.endswith("global.example.json"):
+                log_event(logging.WARNING, 'load_global', '使用示例全局配置（请复制为本地私有配置）', f'path={chosen_path}')
+            else:
+                log_event(logging.INFO, 'load_global', '加载全局配置成功', f'path={chosen_path}')
+        else:
+            log_event(logging.WARNING, 'load_global', '全局配置文件不存在', f'checked={candidates}')
+
+        # 同步共享 AI 配置给模型管理器，确保多用户统一使用共享全局配置
         try:
             from model_manager import model_manager
             model_manager.apply_shared_config(self.global_config)

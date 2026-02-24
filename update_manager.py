@@ -31,6 +31,7 @@ RELEASE_STATE_FILE = ".release_state.json"
 ROLLBACK_FILE = ".release_rollback.json"
 UPDATE_LOCK_FILE = ".update.lock"
 GITHUB_TOKEN_ENV_KEYS = ("YDXBOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
+SHARED_GLOBAL_CANDIDATES = ("global.local.json", "global.json", "global.example.json")
 
 
 def _repo_root(repo_root: Optional[str] = None) -> Path:
@@ -138,6 +139,16 @@ def _load_json_with_comments(path: Path) -> Dict[str, Any]:
         return {}
 
 
+def _load_shared_global_config(repo_root: Path) -> Dict[str, Any]:
+    shared_dir = repo_root / "shared"
+    for filename in SHARED_GLOBAL_CANDIDATES:
+        path = shared_dir / filename
+        if not path.exists():
+            continue
+        return _load_json_with_comments(path)
+    return {}
+
+
 def _looks_like_github_token(value: str) -> bool:
     token = (value or "").strip()
     if not token:
@@ -168,7 +179,7 @@ def resolve_github_token(repo_root: Optional[str] = None, remote_url: str = "") 
             return token
 
     root = _repo_root(repo_root)
-    shared_cfg = _load_json_with_comments(root / "shared" / "global.json")
+    shared_cfg = _load_shared_global_config(root)
     update_cfg = shared_cfg.get("update", {}) if isinstance(shared_cfg.get("update", {}), dict) else {}
 
     cfg_candidates = [
@@ -282,7 +293,7 @@ def get_latest_release(repo_slug: str, timeout: int = 10, github_token: str = ""
 
     if response.status_code != 200:
         if response.status_code in {401, 403, 404}:
-            hint = "（私有仓库请配置 GitHub Token：环境变量 YDXBOT_GITHUB_TOKEN/GITHUB_TOKEN，或 shared/global.json -> update.github_token）"
+            hint = "（私有仓库请配置 GitHub Token：环境变量 YDXBOT_GITHUB_TOKEN/GITHUB_TOKEN，或 shared/global.json/shared/global.local.json -> update.github_token）"
         else:
             hint = ""
         return {

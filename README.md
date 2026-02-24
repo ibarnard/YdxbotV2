@@ -7,7 +7,7 @@ Ydxbot 的多账号版本（从主仓库剥离），仅保留多用户运行所�
 - `zq_multiuser.py`: 多用户核心逻辑
 - `user_manager.py`: 用户隔离与配置加载
 - `users/_template/`: 用户配置模板
-- `shared/global.json`: 全局共享配置
+- `shared/global.example.json`: 全局共享配置脱敏模板（可公开）
 
 ## 快速开始
 1. 安装依赖
@@ -15,6 +15,10 @@ Ydxbot 的多账号版本（从主仓库剥离），仅保留多用户运行所�
 pip install -r requirements.txt
 ```
 2. 先配置共享项（所有账号共用）
+先复制模板并填写本地私有配置（`shared/global.json` 已默认 gitignore，不会同步到仓库）：
+```bash
+cp shared/global.example.json shared/global.json
+```
 编辑 `shared/global.json`，填写这些共享配置：
 - `proxy`
 - `ai`（模型、apikey、降级链）
@@ -39,5 +43,5 @@ python3 main_multiuser.py
 ```
 
 ## 说明
-- 默认读取 `shared/global.json` 作为共享配置，再与 `users/*/config.json` 做深度合并（用户配置优先）。
+- 默认按顺序读取共享配置：`shared/global.local.json` -> `shared/global.json` -> `shared/global.example.json`，再与 `users/*/config.json` 做深度合并（用户配置优先）。
 - 仅保留多用户实现，不包含单用户入口。
