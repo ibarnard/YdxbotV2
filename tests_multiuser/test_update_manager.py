@@ -25,14 +25,14 @@ def test_parse_repo_slug_rejects_non_github_remote():
 
 
 def test_extract_github_token_from_remote_url():
-    url = "https://ibarnard:ghp_exampleToken1234567890@github.com/ibarnard/YdxbotV2.git"
-    assert um._extract_github_token_from_remote(url) == "ghp_exampleToken1234567890"
+    url = "https://ibarnard:token_example_1234567890@github.com/ibarnard/YdxbotV2.git"
+    assert um._extract_github_token_from_remote(url) == "token_example_1234567890"
 
 
 def test_resolve_github_token_prefers_env(monkeypatch, tmp_path):
-    monkeypatch.setenv("YDXBOT_GITHUB_TOKEN", "ghp_env_token")
+    monkeypatch.setenv("YDXBOT_GITHUB_TOKEN", "token_env_value")
     token = um.resolve_github_token(str(tmp_path), "")
-    assert token == "ghp_env_token"
+    assert token == "token_env_value"
 
 
 def test_resolve_github_token_from_shared_global(monkeypatch, tmp_path):
@@ -45,14 +45,14 @@ def test_resolve_github_token_from_shared_global(monkeypatch, tmp_path):
         """{
   # release auth for private repo
   "update": {
-    "github_token": "ghp_cfg_token"
+    "github_token": "token_cfg_value"
   }
 }
 """,
         encoding="utf-8",
     )
     token = um.resolve_github_token(str(tmp_path), "")
-    assert token == "ghp_cfg_token"
+    assert token == "token_cfg_value"
 
 
 def test_get_latest_release_gives_private_repo_hint_on_auth_errors(monkeypatch):
