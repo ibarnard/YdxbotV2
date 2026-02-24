@@ -1490,11 +1490,11 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             rec_msg = (
                 f"✅ 连输已终止！✅\n"
                 f"🔢 {range_text}\n"
-                f"😭连续押注： {lose_end_payload.get('continuous_count', lose_end_payload.get('lose_count', 0) + 1)} 次\n"
-                f"⚠️本局连输： {lose_end_payload.get('lose_count', 0)} 局\n"
-                f"💰最终盈利： {format_number(lose_end_payload.get('total_profit', 0))}\n"
-                f"💰账户余额：{rt.get('account_balance', 0) / 10000:.2f} 万\n"
-                f"💰菠菜资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万"
+                f"😀 连续押注：{lose_end_payload.get('continuous_count', lose_end_payload.get('lose_count', 0) + 1)} 次\n"
+                f"⚠️本局连输： {lose_end_payload.get('lose_count', 0)} 次\n"
+                f"💰 本局盈利： {format_number(lose_end_payload.get('total_profit', 0))}\n"
+                f"💰 账户余额：{rt.get('account_balance', 0) / 10000:.2f} 万\n"
+                f"💰 菠菜资金剩余：{rt.get('gambling_fund', 0) / 10000:.2f} 万"
             )
             await send_message_v2(client, "lose_end", rec_msg, user_ctx, global_config)
             log_event(
