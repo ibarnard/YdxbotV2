@@ -397,7 +397,11 @@ def _is_runtime_file(path: str) -> bool:
         return True
     if normalized.endswith(".session") or normalized.endswith(".session-journal"):
         return True
+    if normalized in {"global.json", "shared/global.json", "shared/global.local.json"}:
+        return True
     if normalized.startswith("tests_multiuser/users/"):
+        return True
+    if normalized.startswith("user/"):
         return True
     if normalized.startswith("users/") and not normalized.startswith("users/_template/"):
         return True
