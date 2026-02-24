@@ -597,19 +597,22 @@ def _save_rollback_point(repo_root: Path, info: Dict[str, Any], target_tag: str)
 
 def run_health_check(repo_root: Optional[str] = None) -> Dict[str, Any]:
     root = _repo_root(repo_root)
-    commands = [
-        [sys.executable, "verify_deps.py"],
-        [
-            sys.executable,
-            "-m",
-            "py_compile",
-            "main.py",
-            "main_multiuser.py",
-            "zq.py",
-            "zq_multiuser.py",
-            "user_manager.py",
-        ],
+    commands: List[List[str]] = []
+
+    verify_script = root / "verify_deps.py"
+    if verify_script.exists():
+        commands.append([sys.executable, "verify_deps.py"])
+
+    compile_candidates = [
+        "main.py",
+        "main_multiuser.py",
+        "zq.py",
+        "zq_multiuser.py",
+        "user_manager.py",
     ]
+    compile_targets = [path for path in compile_candidates if (root / path).exists()]
+    if compile_targets:
+        commands.append([sys.executable, "-m", "py_compile", *compile_targets])
 
     for cmd in commands:
         result = _run_cmd(cmd, root, timeout=120)

@@ -159,3 +159,31 @@ def test_reback_to_version_requires_target():
     result = um.reback_to_version("/tmp/repo", "")
     assert result["success"] is False
     assert "请提供目标版本号或提交" in result["error"]
+
+
+def test_run_health_check_skips_missing_legacy_files(monkeypatch, tmp_path):
+    (tmp_path / "verify_deps.py").write_text("print('ok')\n", encoding="utf-8")
+    (tmp_path / "main_multiuser.py").write_text("x=1\n", encoding="utf-8")
+    (tmp_path / "zq_multiuser.py").write_text("x=1\n", encoding="utf-8")
+    (tmp_path / "user_manager.py").write_text("x=1\n", encoding="utf-8")
+
+    recorded = {"verify": 0, "compile_args": []}
+
+    def fake_run_cmd(args, cwd, timeout=30):
+        if args == [um.sys.executable, "verify_deps.py"]:
+            recorded["verify"] += 1
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args[:3] == [um.sys.executable, "-m", "py_compile"]:
+            recorded["compile_args"] = args[3:]
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(um, "_run_cmd", fake_run_cmd)
+    result = um.run_health_check(str(tmp_path))
+
+    assert result["success"] is True
+    assert recorded["verify"] == 1
+    assert "main.py" not in recorded["compile_args"]
+    assert "zq.py" not in recorded["compile_args"]
+    assert "main_multiuser.py" in recorded["compile_args"]
+    assert "zq_multiuser.py" in recorded["compile_args"]
