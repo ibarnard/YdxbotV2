@@ -724,7 +724,8 @@ def test_process_settle_lose_end_message_contains_balance_lines(tmp_path, monkey
     msg = captured["message"]
     assert "✅ 连输已终止！✅" in msg
     assert "🔢 " in msg and "第 1 轮第 5 次 至 第 9 次" in msg
+    assert "😭连续押注： 4 次" in msg
     assert "⚠️本局连输： 3 局" in msg
-    assert "💰 最终盈利： 1,990" in msg
-    assert "💰 账户余额：2463.49 万" in msg
-    assert "💰 菠菜资金剩余：2456.84 万" in msg
+    assert "💰最终盈利： 1,990" in msg
+    assert "💰账户余额：2463.49 万" in msg
+    assert "💰菠菜资金：2456.84 万" in msg
