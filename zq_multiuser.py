@@ -795,13 +795,132 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
 
 # 结算处理
 async def cleanup_message(client, message_ref):
-    """清理指定消息 - 与master版本一致"""
-    if message_ref is not None:
+    """安全地删除指定消息对象。"""
+    if not message_ref:
+        return
+    try:
+        await message_ref.delete()
+        return
+    except Exception:
+        pass
+    try:
+        chat_id = getattr(message_ref, "chat_id", None)
+        msg_id = getattr(message_ref, "id", None)
+        if chat_id is not None and msg_id is not None:
+            await client.delete_messages(chat_id, msg_id)
+    except Exception:
+        pass
+
+
+async def process_red_packet(client, event, user_ctx: UserContext, global_config: dict):
+    """处理红包消息，尝试领取。"""
+    sender_id = getattr(event, "sender_id", None)
+    zq_bot = user_ctx.config.groups.get("zq_bot")
+    zq_bot_targets = {str(item) for item in _iter_targets(zq_bot)}
+    if zq_bot_targets and str(sender_id) not in zq_bot_targets:
+        return
+
+    text = (getattr(event, "raw_text", None) or getattr(event, "text", None) or "").strip()
+    if "灵石" not in text:
+        return
+
+    reply_markup = getattr(event, "reply_markup", None)
+    rows = getattr(reply_markup, "rows", None) if reply_markup else None
+    if not rows:
+        return
+
+    first_row = rows[0]
+    buttons = getattr(first_row, "buttons", None)
+    if not buttons:
+        return
+
+    button = buttons[0]
+    button_data = getattr(button, "data", None)
+    if not button_data:
+        log_event(logging.WARNING, "red_packet", "红包按钮无效", user_id=user_ctx.user_id)
+        return
+
+    log_event(
+        logging.INFO,
+        "red_packet",
+        "检测到红包按钮消息",
+        user_id=user_ctx.user_id,
+        msg_id=getattr(event, "id", None),
+    )
+
+    from telethon.tl import functions as tl_functions
+    import re
+
+    max_attempts = 3
+    for attempt in range(max_attempts):
         try:
-            await client.delete_messages(message_ref.chat_id, message_ref.id)
-            log_event(logging.INFO, 'msg_cleanup', '删除旧消息', user_id=0, data=f'msg_id={message_ref.id}')
+            try:
+                await event.click(0, 0)
+            except Exception:
+                await event.click(button_data)
+            await asyncio.sleep(random.uniform(0.5, 1.0))
+
+            response = await client(
+                tl_functions.messages.GetBotCallbackAnswerRequest(
+                    peer=event.chat_id,
+                    msg_id=event.id,
+                    data=button_data,
+                )
+            )
+            response_msg = getattr(response, "message", "") or ""
+
+            if "已获得" in response_msg:
+                bonus_match = re.search(r"已获得\s*(\d+)\s*灵石", response_msg)
+                bonus = bonus_match.group(1) if bonus_match else "未知数量"
+                mes = f"🎉 抢到红包 {bonus} 灵石！"
+                log_event(
+                    logging.INFO,
+                    "red_packet",
+                    "领取成功",
+                    user_id=user_ctx.user_id,
+                    bonus=bonus,
+                )
+                await send_to_admin(client, mes, user_ctx, global_config)
+                return
+
+            if any(flag in response_msg for flag in ("不能重复领取", "来晚了", "领过")):
+                log_event(
+                    logging.INFO,
+                    "red_packet",
+                    "红包已领取或过期",
+                    user_id=user_ctx.user_id,
+                    response=response_msg,
+                )
+                return
+
+            log_event(
+                logging.WARNING,
+                "red_packet",
+                "红包领取回复未知，准备重试",
+                user_id=user_ctx.user_id,
+                attempt=attempt + 1,
+                response=response_msg[:80],
+            )
         except Exception as e:
-            log_event(logging.ERROR, 'msg_cleanup', '删除旧消息失败', user_id=0, data=str(e))
+            log_event(
+                logging.WARNING,
+                "red_packet",
+                "尝试领取红包失败",
+                user_id=user_ctx.user_id,
+                attempt=attempt + 1,
+                error=str(e),
+            )
+
+        if attempt < max_attempts - 1:
+            await asyncio.sleep(random.uniform(1.5, 2.5) * (attempt + 1))
+
+    log_event(
+        logging.WARNING,
+        "red_packet",
+        "多次尝试后未成功领取红包",
+        user_id=user_ctx.user_id,
+        msg_id=getattr(event, "id", None),
+    )
 
 
 def is_fund_available(user_ctx: UserContext, bet_amount: int = 0) -> bool:
@@ -1405,12 +1524,12 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
 
 # 用户命令处理
 async def delete_later(client, chat_id, message_id, delay=10):
-    """延迟删除消息 - 与master版本一致"""
+    """延迟指定秒数后删除消息。"""
     await asyncio.sleep(delay)
     try:
         await client.delete_messages(chat_id, message_id)
-    except Exception as e:
-        log_event(logging.DEBUG, 'delete_msg', '删除消息失败', user_id=0, data=str(e))
+    except Exception:
+        pass
 
 
 async def handle_model_command_multiuser(event, args, user_ctx: UserContext, global_config: dict):
@@ -1511,7 +1630,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `off`  : 停止押注
 - `pause` : 仅暂停当前账号押注（不影响其他账号）
 - `resume` : 恢复当前账号押注
-- `st [预设名]` : 启动预设 (例: `st yc`)
+- `st [预设名]` : 启动预设并自动测算 (例: `st yc`)
 
 **参数设置**
 - `gf [金额]` : 设置本金 (例: `gf 1000000`)
@@ -1533,6 +1652,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `res bet` : 重置押注策略
 - `explain` : 查看AI决策解释
 - `stats` : 查看连大、连小、连输统计
+- `xx` : 清理配置群中“我发送的消息”
 
 **发布更新**
 - `ver` : 查看当前版本/分支/提交
@@ -1586,6 +1706,65 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             log_event(logging.INFO, 'user_cmd', '停止押注', user_id=user_ctx.user_id)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             return
+
+        if cmd == "xx":
+            target_groups = []
+            target_groups.extend(_iter_targets(user_ctx.config.groups.get("zq_group", [])))
+            target_groups.extend(_iter_targets(user_ctx.config.groups.get("monitor", [])))
+
+            # 去重并保持顺序
+            unique_groups = []
+            seen = set()
+            for gid in target_groups:
+                key = str(gid)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique_groups.append(gid)
+
+            if not unique_groups:
+                message = await send_to_admin(client, "未配置可清理的群组（zq_group/monitor）", user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))
+                return
+
+            deleted_total = 0
+            failed_groups = []
+            scanned_groups = 0
+
+            for gid in unique_groups:
+                try:
+                    msg_ids = [msg.id async for msg in client.iter_messages(gid, from_user="me", limit=500)]
+                    scanned_groups += 1
+                    if msg_ids:
+                        await client.delete_messages(gid, msg_ids)
+                        deleted_total += len(msg_ids)
+                except Exception as e:
+                    failed_groups.append(f"{gid}: {str(e)[:40]}")
+
+            mes = (
+                "群组消息已清理\n"
+                f"扫描群组：{scanned_groups}\n"
+                f"删除消息：{deleted_total}"
+            )
+            if failed_groups:
+                mes += "\n失败群组：\n" + "\n".join(f"- {item}" for item in failed_groups[:5])
+
+            log_event(
+                logging.INFO,
+                'user_cmd',
+                '执行xx清理',
+                user_id=user_ctx.user_id,
+                groups=scanned_groups,
+                deleted=deleted_total,
+                failed=len(failed_groups),
+            )
+            message = await send_to_admin(client, mes, user_ctx, global_config)
+            asyncio.create_task(delete_later(client, event.chat_id, event.id, 3))
+            if message:
+                asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))
+            return
         
         # pause/resume - 暂停/恢复押注（新增，master没有但有用）
         if cmd in ("pause", "暂停"):
@@ -1638,6 +1817,14 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
                 if message:
                     asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))
+                await yc_command_handler_multiuser(
+                    client,
+                    event,
+                    [preset_name],
+                    user_ctx,
+                    global_config,
+                    auto_trigger=True,
+                )
             else:
                 await send_to_admin(client, f"预设不存在: {preset_name}", user_ctx, global_config)
             return
@@ -2162,16 +2349,16 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
         await send_to_admin(client, "⚠️ 菠菜资金不足，已自动暂停押注", user_ctx, global_config)
 
 
-async def yc_command_handler_multiuser(client, event, args, user_ctx: UserContext, global_config: dict):
-    """处理 yc 测算命令 - 与master版本yc_command_handler一致"""
-    presets = user_ctx.presets
-    rt = user_ctx.state.runtime
-    
+def _parse_yc_params(args, presets):
     if not args:
-        await event.reply("📊 **测算功能**\n\n用法:\n`yc [预设名]` - 测算已有预设\n`yc [参数...]` - 自定义参数测算\n\n例: `yc yc05` 或 `yc 1 13 3 2.1 2.1 2.05 500`")
-        return
-    
-    # 检查是否是预设名
+        return None, None, (
+            "📊 **测算功能**\n\n"
+            "用法:\n"
+            "`yc [预设名]` - 测算已有预设\n"
+            "`yc [参数...]` - 自定义参数测算\n\n"
+            "例: `yc yc05` 或 `yc 1 13 3 2.1 2.1 2.05 500`"
+        )
+
     if args[0] in presets:
         preset = presets[args[0]]
         params = {
@@ -2181,11 +2368,11 @@ async def yc_command_handler_multiuser(client, event, args, user_ctx: UserContex
             "lose_twice": float(preset[3]),
             "lose_three": float(preset[4]),
             "lose_four": float(preset[5]),
-            "initial_amount": int(preset[6])
+            "initial_amount": int(preset[6]),
         }
-        preset_name = args[0]
-    elif len(args) >= 7:
-        # 自定义参数
+        return params, args[0], None
+
+    if len(args) >= 7:
         try:
             params = {
                 "continuous": int(args[0]),
@@ -2194,34 +2381,41 @@ async def yc_command_handler_multiuser(client, event, args, user_ctx: UserContex
                 "lose_twice": float(args[3]),
                 "lose_three": float(args[4]),
                 "lose_four": float(args[5]),
-                "initial_amount": int(args[6])
+                "initial_amount": int(args[6]),
             }
-            preset_name = "自定义"
+            return params, "自定义", None
         except ValueError:
-            await event.reply("❌ 参数格式错误，请确保所有参数都是数字")
-            return
-    else:
-        await event.reply(f"❌ 预设 `{args[0]}` 不存在，且参数不足7个")
-        return
-    
-    # 执行测算
-    initial = params["initial_amount"]
-    multipliers = [params["lose_once"], params["lose_twice"], 
-                   params["lose_three"], params["lose_four"]]
-    
-    # 计算连输时的押注序列
+            return None, None, "❌ 参数格式错误，请确保所有参数都是数字"
+
+    return None, None, f"❌ 预设 `{args[0]}` 不存在，且参数不足7个"
+
+
+def _calculate_yc_sequence(params):
+    initial = max(0, int(params["initial_amount"]))
+    lose_stop = max(1, int(params["lose_stop"]))
+    multipliers = [
+        float(params["lose_once"]),
+        float(params["lose_twice"]),
+        float(params["lose_three"]),
+        float(params["lose_four"]),
+    ]
+
     sequence = [initial]
-    for i in range(1, params["lose_stop"]):
-        multiplier = multipliers[min(i-1, 3)]
+    for i in range(1, lose_stop):
+        multiplier = multipliers[min(i - 1, 3)]
         next_bet = int(sequence[-1] * multiplier)
         sequence.append(next_bet)
-    
-    # 计算总投入和最大押注
+
     total_investment = sum(sequence)
-    max_bet = max(sequence)
-    
-    # 构建结果消息
-    result_msg = f"""📊 **测算结果: {preset_name}**
+    max_bet = max(sequence) if sequence else 0
+    return sequence, total_investment, max_bet
+
+
+def _build_yc_result_message(params, preset_name: str, current_fund: int, auto_trigger: bool) -> str:
+    sequence, total_investment, max_bet = _calculate_yc_sequence(params)
+
+    header = "🔮 已根据当前预设自动测算\n\n" if auto_trigger else ""
+    result_msg = f"""{header}📊 **测算结果: {preset_name}**
 
 **参数:**
 - 连续: {params['continuous']}次
@@ -2235,16 +2429,54 @@ async def yc_command_handler_multiuser(client, event, args, user_ctx: UserContex
         result_msg += f"第{i}次: {format_number(bet)}\n"
     if len(sequence) > 10:
         result_msg += f"... (共{len(sequence)}次)\n"
-    
+
     result_msg += f"""
 **统计:**
 - 总投入: {format_number(total_investment)}
 - 最大押注: {format_number(max_bet)}
 - 建议资金: {format_number(int(total_investment * 1.2))}
 """
-    
-    await event.reply(result_msg)
-    log_event(logging.INFO, 'yc', '测算完成', user_id=user_ctx.user_id, preset=preset_name)
+    if current_fund > 0:
+        coverage = current_fund / total_investment if total_investment > 0 else 0
+        result_msg += (
+            f"- 菠菜资金: {format_number(current_fund)}\n"
+            f"- 覆盖倍数: {coverage:.2f}x"
+        )
+    return result_msg
+
+
+async def yc_command_handler_multiuser(
+    client,
+    event,
+    args,
+    user_ctx: UserContext,
+    global_config: dict,
+    auto_trigger: bool = False,
+):
+    """处理 yc 测算命令，支持 st 切换预设后自动触发。"""
+    presets = user_ctx.presets
+    rt = user_ctx.state.runtime
+
+    params, preset_name, error_msg = _parse_yc_params(args, presets)
+    if error_msg:
+        await send_to_admin(client, error_msg, user_ctx, global_config)
+        return
+
+    result_msg = _build_yc_result_message(
+        params=params,
+        preset_name=preset_name,
+        current_fund=int(rt.get("gambling_fund", 0)),
+        auto_trigger=auto_trigger,
+    )
+    await send_to_admin(client, result_msg, user_ctx, global_config)
+    log_event(
+        logging.INFO,
+        'yc',
+        '测算完成',
+        user_id=user_ctx.user_id,
+        preset=preset_name,
+        auto_trigger=auto_trigger,
+    )
 
 
 async def fetch_balance(user_ctx: UserContext) -> int:

@@ -729,3 +729,144 @@ def test_process_settle_lose_end_message_contains_balance_lines(tmp_path, monkey
     assert "💰最终盈利： 1,990" in msg
     assert "💰账户余额：2463.49 万" in msg
     assert "💰菠菜资金：2456.84 万" in msg
+
+
+def test_st_command_triggers_auto_yc_report(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5008"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "预设测算用户"},
+            "telegram": {"user_id": 5008},
+            "groups": {"admin_chat": 5008},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5008, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    cmd_event = SimpleNamespace(raw_text="st yc05", chat_id=5008, id=21)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert ctx.state.runtime.get("current_preset_name") == "yc05"
+    assert any("预设启动成功: yc05" in msg for msg in sent_messages)
+    assert any("🔮 已根据当前预设自动测算" in msg for msg in sent_messages)
+    assert any("📊 **测算结果: yc05**" in msg for msg in sent_messages)
+
+
+def test_xx_command_cleans_messages_in_config_groups(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5009"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "清理用户"},
+            "telegram": {"user_id": 5009},
+            "groups": {"admin_chat": 5009, "zq_group": [111], "monitor": [222]},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+
+    sent_messages = []
+    deleted_calls = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5009, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    class DummyClient:
+        def iter_messages(self, chat_id, from_user=None, limit=None):
+            async def _gen():
+                sample = {111: [1, 2, 3], 222: [10]}
+                for msg_id in sample.get(chat_id, []):
+                    yield SimpleNamespace(id=msg_id)
+
+            return _gen()
+
+        async def delete_messages(self, chat_id, message_ids):
+            deleted_calls.append((chat_id, list(message_ids)))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    cmd_event = SimpleNamespace(raw_text="xx", chat_id=5009, id=30)
+    asyncio.run(zm.process_user_command(DummyClient(), cmd_event, ctx, {}))
+
+    assert (111, [1, 2, 3]) in deleted_calls
+    assert (222, [10]) in deleted_calls
+    assert any("群组消息已清理" in msg for msg in sent_messages)
+    assert any("删除消息：4" in msg for msg in sent_messages)
+
+
+def test_process_red_packet_claim_success_sends_admin_notice(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5010"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "红包用户"},
+            "telegram": {"user_id": 5010},
+            "groups": {"admin_chat": 5010, "zq_bot": 9001},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent = {}
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent["message"] = message
+        return SimpleNamespace(chat_id=5010, id=1)
+
+    async def fake_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "sleep", fake_sleep)
+
+    class DummyClient:
+        async def __call__(self, request):
+            return SimpleNamespace(message="已获得 88 灵石")
+
+    class DummyButton:
+        data = b"red-packet"
+
+    class DummyRow:
+        buttons = [DummyButton()]
+
+    class DummyMarkup:
+        rows = [DummyRow()]
+
+    class DummyEvent:
+        sender_id = 9001
+        raw_text = "恭喜领取灵石红包"
+        text = "恭喜领取灵石红包"
+        chat_id = -10001
+        id = 99
+        reply_markup = DummyMarkup()
+
+        def __init__(self):
+            self.clicked = []
+
+        async def click(self, *args):
+            self.clicked.append(args)
+
+    event = DummyEvent()
+    asyncio.run(zm.process_red_packet(DummyClient(), event, ctx, {}))
+
+    assert event.clicked
+    assert sent.get("message") == "🎉 抢到红包 88 灵石！"

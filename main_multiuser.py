@@ -105,6 +105,13 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
         log_event(logging.DEBUG, 'settle', '收到结算消息',
                   user_id=user_ctx.user_id, msg_id=event.id)
         await zq_settle(client, event, user_ctx, global_config)
+
+    @client.on(events.NewMessage(
+        chats=config.groups.get("zq_group", []),
+        from_users=config.groups.get("zq_bot")
+    ))
+    async def red_packet_handler(event):
+        await zq_red_packet(client, event, user_ctx, global_config)
     
     @client.on(events.NewMessage(chats=config.groups.get("admin_chat")))
     async def user_handler(event):
@@ -126,6 +133,11 @@ async def zq_settle(client, event, user_ctx: UserContext, global_config: dict):
 async def zq_user(client, event, user_ctx: UserContext, global_config: dict):
     from zq_multiuser import process_user_command
     await process_user_command(client, event, user_ctx, global_config)
+
+
+async def zq_red_packet(client, event, user_ctx: UserContext, global_config: dict):
+    from zq_multiuser import process_red_packet
+    await process_red_packet(client, event, user_ctx, global_config)
 
 
 async def check_models_for_user(client, user_ctx: UserContext):
