@@ -18,8 +18,10 @@ import re
 import subprocess
 import sys
 import time
+import base64
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Dict, List, Optional
+from urllib.parse import urlparse
 
 import requests
 
@@ -28,6 +30,7 @@ DEFAULT_RELEASE_CHECK_INTERVAL = 30 * 60  # 30 分钟
 RELEASE_STATE_FILE = ".release_state.json"
 ROLLBACK_FILE = ".release_rollback.json"
 UPDATE_LOCK_FILE = ".update.lock"
+GITHUB_TOKEN_ENV_KEYS = ("YDXBOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
 
 
 def _repo_root(repo_root: Optional[str] = None) -> Path:
@@ -49,15 +52,154 @@ def _parse_repo_slug(remote_url: str) -> Optional[str]:
     if not remote_url:
         return None
 
-    ssh_match = re.match(r"git@github\.com:(?P<owner>[^/]+)/(?P<repo>.+?)(?:\.git)?$", remote_url)
+    raw = remote_url.strip()
+
+    # SCP-like SSH URL, e.g. git@github.com:owner/repo.git
+    ssh_match = re.match(
+        r"(?i)git@github\.com:(?P<owner>[^/\s]+)/(?P<repo>[^/\s]+?)(?:\.git)?/?$",
+        raw,
+    )
     if ssh_match:
         return f"{ssh_match.group('owner')}/{ssh_match.group('repo')}"
 
-    https_match = re.match(r"https?://github\.com/(?P<owner>[^/]+)/(?P<repo>.+?)(?:\.git)?$", remote_url)
-    if https_match:
-        return f"{https_match.group('owner')}/{https_match.group('repo')}"
+    # URL form, e.g.
+    # - https://github.com/owner/repo(.git)
+    # - https://token@github.com/owner/repo(.git)
+    # - ssh://git@github.com/owner/repo.git
+    # - git://github.com/owner/repo.git
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if host == "github.com" and parsed.path:
+        path = parsed.path.strip("/")
+        if path.endswith(".git"):
+            path = path[:-4]
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2:
+            owner, repo = parts[0], parts[1]
+            if owner and repo:
+                return f"{owner}/{repo}"
 
     return None
+
+
+def _load_json_with_comments(path: Path) -> Dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        raw_text = path.read_text(encoding="utf-8")
+    except Exception:
+        return {}
+
+    cleaned_lines: List[str] = []
+    for raw_line in raw_text.splitlines():
+        stripped = raw_line.lstrip()
+        if stripped.startswith("#") or stripped.startswith("//"):
+            continue
+
+        in_string = False
+        escaped = False
+        cleaned: List[str] = []
+        i = 0
+        while i < len(raw_line):
+            ch = raw_line[i]
+            if escaped:
+                cleaned.append(ch)
+                escaped = False
+                i += 1
+                continue
+            if ch == "\\":
+                cleaned.append(ch)
+                escaped = True
+                i += 1
+                continue
+            if ch == '"':
+                in_string = not in_string
+                cleaned.append(ch)
+                i += 1
+                continue
+            if not in_string:
+                if ch == "#":
+                    break
+                if ch == "/" and i + 1 < len(raw_line) and raw_line[i + 1] == "/":
+                    break
+            cleaned.append(ch)
+            i += 1
+
+        line = "".join(cleaned).rstrip()
+        if line:
+            cleaned_lines.append(line)
+
+    if not cleaned_lines:
+        return {}
+
+    try:
+        return json.loads("\n".join(cleaned_lines))
+    except Exception:
+        return {}
+
+
+def _looks_like_github_token(value: str) -> bool:
+    token = (value or "").strip()
+    if not token:
+        return False
+    prefixes = ("ghp_", "github_pat_", "gho_", "ghu_", "ghs_", "ghr_")
+    return token.startswith(prefixes)
+
+
+def _extract_github_token_from_remote(remote_url: str) -> str:
+    raw = (remote_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw)
+    host = (parsed.hostname or "").lower()
+    if host != "github.com":
+        return ""
+    if parsed.password:
+        return parsed.password
+    if parsed.username and _looks_like_github_token(parsed.username):
+        return parsed.username
+    return ""
+
+
+def resolve_github_token(repo_root: Optional[str] = None, remote_url: str = "") -> str:
+    for env_key in GITHUB_TOKEN_ENV_KEYS:
+        token = (os.getenv(env_key) or "").strip()
+        if token:
+            return token
+
+    root = _repo_root(repo_root)
+    shared_cfg = _load_json_with_comments(root / "shared" / "global.json")
+    update_cfg = shared_cfg.get("update", {}) if isinstance(shared_cfg.get("update", {}), dict) else {}
+
+    cfg_candidates = [
+        update_cfg.get("github_token"),
+        update_cfg.get("token"),
+        (update_cfg.get("github") or {}).get("token") if isinstance(update_cfg.get("github"), dict) else "",
+        (shared_cfg.get("github") or {}).get("token") if isinstance(shared_cfg.get("github"), dict) else "",
+    ]
+    for item in cfg_candidates:
+        token = (item or "").strip()
+        if token:
+            return token
+
+    return _extract_github_token_from_remote(remote_url)
+
+
+def _build_git_auth_header(token: str) -> str:
+    payload = f"x-access-token:{token}".encode("utf-8")
+    encoded = base64.b64encode(payload).decode("ascii")
+    return f"AUTHORIZATION: basic {encoded}"
+
+
+def _git_fetch_tags(root: Path, remote_name: str, github_token: str = "") -> subprocess.CompletedProcess:
+    if not remote_name:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    cmd = ["git"]
+    token = (github_token or "").strip()
+    if token:
+        cmd += ["-c", f"http.extraheader={_build_git_auth_header(token)}"]
+    cmd += ["fetch", "--tags", remote_name]
+    return _run_cmd(cmd, root, timeout=120)
 
 
 def detect_repo_slug(repo_root: Optional[str] = None) -> Optional[str]:
@@ -122,9 +264,12 @@ def get_current_repo_info(repo_root: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
-def get_latest_release(repo_slug: str, timeout: int = 10) -> Dict[str, Any]:
+def get_latest_release(repo_slug: str, timeout: int = 10, github_token: str = "") -> Dict[str, Any]:
     url = f"https://api.github.com/repos/{repo_slug}/releases/latest"
     headers = {"Accept": "application/vnd.github+json"}
+    token = (github_token or "").strip()
+    if token:
+        headers["Authorization"] = f"token {token}"
 
     try:
         response = requests.get(url, headers=headers, timeout=timeout)
@@ -136,9 +281,13 @@ def get_latest_release(repo_slug: str, timeout: int = 10) -> Dict[str, Any]:
         }
 
     if response.status_code != 200:
+        if response.status_code in {401, 403, 404}:
+            hint = "（私有仓库请配置 GitHub Token：环境变量 YDXBOT_GITHUB_TOKEN/GITHUB_TOKEN，或 shared/global.json -> update.github_token）"
+        else:
+            hint = ""
         return {
             "success": False,
-            "error": f"GitHub API 返回 {response.status_code}",
+            "error": f"GitHub API 返回 {response.status_code}{hint}",
             "url": url,
         }
 
@@ -190,7 +339,8 @@ def mark_release_applied(tag_name: str, repo_root: Optional[str] = None) -> None
 def check_release_update(repo_root: Optional[str] = None) -> Dict[str, Any]:
     root = _repo_root(repo_root)
     info = get_current_repo_info(root)
-    repo_slug = detect_repo_slug(root)
+    remote = detect_repo_remote(root)
+    repo_slug = remote.get("slug", "")
     if not repo_slug:
         return {
             "success": False,
@@ -198,7 +348,8 @@ def check_release_update(repo_root: Optional[str] = None) -> Dict[str, Any]:
             "current": info,
         }
 
-    latest = get_latest_release(repo_slug)
+    github_token = resolve_github_token(root, remote.get("url", ""))
+    latest = get_latest_release(repo_slug, github_token=github_token)
     if not latest.get("success"):
         return {
             "success": False,
@@ -225,6 +376,8 @@ def _is_runtime_file(path: str) -> bool:
         return True
     normalized = path.replace("\\", "/")
     filename = Path(normalized).name
+    if filename == ".DS_Store":
+        return True
     if normalized in {"state.json", "account_funds.json", "MULTIUSER_TEST_RESULTS.json"}:
         return True
     if normalized.endswith(".log"):
@@ -232,6 +385,8 @@ def _is_runtime_file(path: str) -> bool:
     if ".log." in filename:
         return True
     if normalized.endswith(".session") or normalized.endswith(".session-journal"):
+        return True
+    if normalized.startswith("tests_multiuser/users/"):
         return True
     if normalized.startswith("users/") and not normalized.startswith("users/_template/"):
         return True
@@ -386,6 +541,7 @@ def update_to_release(repo_root: Optional[str] = None, target_tag: Optional[str]
         remote = detect_repo_remote(root)
         remote_name = remote.get("name", "")
         repo_slug = remote.get("slug", "")
+        github_token = resolve_github_token(root, remote.get("url", ""))
 
         final_tag = (target_tag or "").strip()
         latest = None
@@ -397,19 +553,19 @@ def update_to_release(repo_root: Optional[str] = None, target_tag: Optional[str]
                     "detail": "请检查 git 远程配置，例如：git remote add origin https://github.com/<owner>/<repo>.git",
                 }
             if remote_name:
-                fetch_res = _run_cmd(["git", "fetch", "--tags", remote_name], root, timeout=120)
+                fetch_res = _git_fetch_tags(root, remote_name, github_token)
                 if fetch_res.returncode != 0:
                     return {
                         "success": False,
                         "error": f"git fetch --tags {remote_name} 失败",
                         "detail": (fetch_res.stderr or fetch_res.stdout).strip()[:600],
                     }
-            latest = get_latest_release(repo_slug)
+            latest = get_latest_release(repo_slug, github_token=github_token)
             if not latest.get("success"):
                 return {"success": False, "error": latest.get("error", "获取最新 release 失败")}
             final_tag = latest.get("tag_name", "").strip()
         elif remote_name:
-            fetch_res = _run_cmd(["git", "fetch", "--tags", remote_name], root, timeout=120)
+            fetch_res = _git_fetch_tags(root, remote_name, github_token)
             if fetch_res.returncode != 0:
                 return {
                     "success": False,
@@ -486,9 +642,10 @@ def update_to_ref(repo_root: Optional[str] = None, target_ref: Optional[str] = N
         current = get_current_repo_info(root)
         remote = detect_repo_remote(root)
         remote_name = remote.get("name", "")
+        github_token = resolve_github_token(root, remote.get("url", ""))
 
         if remote_name:
-            fetch_res = _run_cmd(["git", "fetch", "--tags", remote_name], root, timeout=120)
+            fetch_res = _git_fetch_tags(root, remote_name, github_token)
             if fetch_res.returncode != 0:
                 verify_local = _run_cmd(["git", "rev-parse", "--verify", f"{final_ref}^{{commit}}"], root, timeout=20)
                 if verify_local.returncode != 0:
