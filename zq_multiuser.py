@@ -190,12 +190,9 @@ async def send_message_v2(
     account_name = user_ctx.config.name.strip()
     account_prefix = f"【账号：{account_name}】"
     admin_message = _strip_account_prefix(message)
-    if msg_type == "lose_end":
-        priority_message = _strip_account_prefix(message)
-        priority_desp = _strip_account_prefix(desp if desp is not None else message)
-    else:
-        priority_message = _ensure_account_prefix(message, account_prefix)
-        priority_desp = _ensure_account_prefix(desp if desp is not None else message, account_prefix)
+    # 重点通道（IYUU/TG Bot）统一带账号前缀；管理员通道统一不带前缀。
+    priority_message = _ensure_account_prefix(message, account_prefix)
+    priority_desp = _ensure_account_prefix(desp if desp is not None else message, account_prefix)
 
     sent_message = None
     if "admin" in channels or "all" in channels:

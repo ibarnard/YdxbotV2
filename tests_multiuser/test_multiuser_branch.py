@@ -446,6 +446,60 @@ def test_send_message_v2_routes_and_account_prefix(tmp_path, monkeypatch):
     assert tg_payload["json"]["text"].startswith("【账号：路由用户】")
 
 
+def test_send_message_v2_lose_end_priority_keeps_account_prefix(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5011"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "回补用户"},
+            "telegram": {"user_id": 5011},
+            "groups": {"admin_chat": 5011},
+            "notification": {
+                "iyuu": {"enable": True, "url": "https://iyuu.test/send"},
+                "tg_bot": {"enable": True, "bot_token": "token", "chat_id": "chat"},
+            },
+        },
+    )
+    ctx = UserContext(str(user_dir))
+
+    requests_payloads = []
+
+    def fake_post(url, data=None, json=None, timeout=5):
+        requests_payloads.append({"url": url, "data": data, "json": json})
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setattr(zm.requests, "post", fake_post)
+
+    class DummyClient:
+        def __init__(self):
+            self.messages = []
+
+        async def send_message(self, target, message, parse_mode=None):
+            self.messages.append((target, message))
+            return SimpleNamespace(chat_id=target, id=8)
+
+    client = DummyClient()
+    asyncio.run(
+        zm.send_message_v2(
+            client,
+            "lose_end",
+            "【账号：回补用户】\n连输已终止",
+            ctx,
+            {},
+            title="标题",
+            desp="连输已终止",
+        )
+    )
+
+    # 管理员通道不带账号前缀
+    assert client.messages == [(5011, "连输已终止")]
+    # 重点通道必须带账号前缀
+    iyuu_payload = next(item for item in requests_payloads if "iyuu" in item["url"])
+    tg_payload = next(item for item in requests_payloads if "api.telegram.org" in item["url"])
+    assert iyuu_payload["data"]["desp"].startswith("【账号：回补用户】")
+    assert tg_payload["json"]["text"].startswith("【账号：回补用户】")
+
+
 def test_process_settle_open_ydx_supports_monitor_list(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "5002"
     _write_json(
