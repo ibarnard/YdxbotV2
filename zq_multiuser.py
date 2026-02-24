@@ -22,12 +22,10 @@ from user_manager import UserContext
 from typing import Dict, Any
 import constants
 from update_manager import (
-    check_release_update,
-    get_current_repo_info,
+    list_version_catalog,
+    reback_to_version,
     restart_process,
-    rollback_to_last_release,
-    update_to_ref,
-    update_to_release,
+    update_to_version,
 )
 
 # 日志配置
@@ -1655,12 +1653,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `xx` : 清理配置群中“我发送的消息”
 
 **发布更新**
-- `ver` : 查看当前版本/分支/提交
-- `upcheck` : 检查最新 GitHub Release
-- `upnow [tag]` : 更新到最新(或指定)发布版本并自动重启
-- `upref [ref]` : 更新到指定 git 引用(commit/tag/branch)并自动重启
-- `uprollback` : 回滚到上一个版本并自动重启
-- `restart` : 仅重启当前进程
+- `ver` : 查看版本列表/当前版本/待更新版本/摘要
+- `update [版本|提交]` : 更新到指定版本(留空默认最新)
+- `reback [版本|提交]` : 回退到指定版本
+- `restart` : 重启当前进程
 
 **预设管理**
 - `ys [名] ...` : 保存预设
@@ -1982,139 +1978,116 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
         # ========== 发布更新命令 ==========
         if cmd in ("ver", "version"):
-            info = await asyncio.to_thread(get_current_repo_info)
-            mes = (
-                "📦 版本信息\n"
-                f"当前版本：{info.get('display_version', 'unknown')}\n"
-                f"当前分支：{info.get('branch', 'detached') or 'detached'}\n"
-                f"当前提交：{info.get('short_commit', 'unknown')}\n"
-                f"当前Tag：{info.get('current_tag') or '无'}"
-            )
-            message = await send_to_admin(client, mes, user_ctx, global_config)
-            asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-            if message:
-                asyncio.create_task(delete_later(client, message.chat_id, message.id, 20))
-            return
-
-        if cmd == "upcheck":
-            result = await asyncio.to_thread(check_release_update)
+            result = await asyncio.to_thread(list_version_catalog, None, 20)
             if not result.get("success"):
-                mes = f"❌ 发布检查失败：{result.get('error', 'unknown')}"
+                mes = f"❌ 版本查询失败：{result.get('error', 'unknown')}"
             else:
                 current = result.get("current", {})
-                latest = result.get("latest", {})
-                if result.get("has_update"):
-                    mes = (
-                        "🆕 检测到新发布版本\n"
-                        f"当前：{current.get('display_version', 'unknown')}\n"
-                        f"最新：{latest.get('tag_name', 'unknown')}\n"
-                        f"发布时间：{latest.get('published_at', 'unknown')}\n"
-                        f"链接：{latest.get('html_url', '')}\n"
-                        "执行更新：`upnow`"
-                    )
+                current_display = current.get("display_version", "unknown")
+                current_tag = current.get("current_tag", "")
+                latest_tag = result.get("latest_tag", "")
+                pending_tags = result.get("pending_tags", [])
+                entries = result.get("entries", [])
+
+                lines = [
+                    "📦 版本列表",
+                    f"当前版本：{current_display}",
+                    f"当前提交：{current.get('short_commit', 'unknown')}",
+                    f"最新版本：{latest_tag or '无'}",
+                ]
+
+                if pending_tags:
+                    lines.append(f"未更新版本：{', '.join(pending_tags[:8])}")
                 else:
-                    mes = (
-                        "✅ 当前已是最新发布版本\n"
-                        f"当前：{current.get('display_version', 'unknown')}\n"
-                        f"最新：{latest.get('tag_name', 'unknown')}"
-                    )
+                    lines.append("未更新版本：无")
+
+                lines.append("")
+                lines.append("历史版本（新→旧）：")
+                if entries:
+                    pending_set = set(pending_tags)
+                    for item in entries:
+                        tag = item.get("tag", "")
+                        date = item.get("date", "")
+                        summary = item.get("summary", "") or "-"
+                        if current_tag and tag == current_tag:
+                            marker = "（当前）"
+                        elif tag in pending_set:
+                            marker = "（未更新）"
+                        else:
+                            marker = ""
+                        lines.append(f"- {tag}{marker} | {date} | {summary}")
+                else:
+                    lines.append("- 暂无版本标签")
+
+                fetch_warning = result.get("fetch_warning", "")
+                if fetch_warning:
+                    lines.append(f"⚠️ 标签拉取告警：{fetch_warning}")
+
+                lines.extend(
+                    [
+                        "",
+                        "命令：",
+                        "`update <版本号|提交>`",
+                        "`reback <版本号|提交>`",
+                        "`restart`",
+                    ]
+                )
+                mes = "\n".join(lines)
+
             message = await send_to_admin(client, mes, user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             if message:
-                asyncio.create_task(delete_later(client, message.chat_id, message.id, 25))
+                asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
             return
 
-        if cmd == "upnow":
-            target_tag = my[1].strip() if len(my) > 1 else None
-            await send_to_admin(client, f"🔄 开始更新到发布版本：{target_tag or 'latest'}", user_ctx, global_config)
-
-            result = await asyncio.to_thread(update_to_release, None, target_tag)
-            if result.get("success"):
-                if result.get("no_change"):
-                    await send_to_admin(client, f"✅ {result.get('message', '当前已是最新发布版本')}", user_ctx, global_config)
-                else:
-                    after = result.get("after", {})
-                    mes = (
-                        "✅ 发布更新成功\n"
-                        f"新版本：{after.get('display_version', result.get('target_tag', 'unknown'))}\n"
-                        "♻️ 2 秒后自动重启进程"
-                    )
-                    await send_to_admin(client, mes, user_ctx, global_config)
-                    asyncio.create_task(restart_process())
-            else:
-                blocking_paths = result.get("blocking_paths", [])
-                detail = result.get("detail", "")
-                mes_lines = [f"❌ 发布更新失败：{result.get('error', 'unknown')}"]
-                if blocking_paths:
-                    mes_lines.append("阻塞文件：")
-                    mes_lines.extend([f"- {path}" for path in blocking_paths[:10]])
-                if detail:
-                    mes_lines.append(f"详情：{detail[:200]}")
-
-                rollback = result.get("rollback", {})
-                if rollback.get("success"):
-                    mes_lines.append("⚠️ 已自动回滚到上一个版本，2 秒后自动重启")
-                    await send_to_admin(client, "\n".join(mes_lines), user_ctx, global_config)
-                    asyncio.create_task(restart_process())
-                else:
-                    await send_to_admin(client, "\n".join(mes_lines), user_ctx, global_config)
-            asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-            return
-
-        if cmd in ("upref", "upcommit"):
+        if cmd in ("update", "up", "upnow", "upref", "upcommit"):
             target_ref = my[1].strip() if len(my) > 1 else ""
-            if not target_ref:
-                await send_to_admin(client, "用法：`upref <commit|tag|branch>`", user_ctx, global_config)
-                return
-
-            await send_to_admin(client, f"🔄 开始更新到目标引用：{target_ref}", user_ctx, global_config)
-            result = await asyncio.to_thread(update_to_ref, None, target_ref)
-
+            await send_to_admin(client, f"🔄 开始更新：{target_ref or 'latest'}", user_ctx, global_config)
+            result = await asyncio.to_thread(update_to_version, None, target_ref)
             if result.get("success"):
                 if result.get("no_change"):
                     await send_to_admin(client, f"✅ {result.get('message', '当前已是目标版本')}", user_ctx, global_config)
                 else:
                     after = result.get("after", {})
+                    resolved = result.get("resolved_target", "") or result.get("target_ref", target_ref or "latest")
                     mes = (
-                        "✅ 引用更新成功\n"
-                        f"目标：{result.get('target_ref', target_ref)}\n"
+                        "✅ 更新成功\n"
+                        f"目标：{resolved}\n"
                         f"当前：{after.get('display_version', after.get('short_commit', 'unknown'))}\n"
-                        "♻️ 2 秒后自动重启进程"
+                        "请执行 `restart` 重启脚本使新版本生效"
                     )
                     await send_to_admin(client, mes, user_ctx, global_config)
-                    asyncio.create_task(restart_process())
             else:
                 blocking_paths = result.get("blocking_paths", [])
                 detail = result.get("detail", "")
-                mes_lines = [f"❌ 引用更新失败：{result.get('error', 'unknown')}"]
+                mes_lines = [f"❌ 更新失败：{result.get('error', 'unknown')}"]
                 if blocking_paths:
                     mes_lines.append("阻塞文件：")
                     mes_lines.extend([f"- {path}" for path in blocking_paths[:10]])
                 if detail:
                     mes_lines.append(f"详情：{detail[:200]}")
-
-                rollback = result.get("rollback", {})
-                if rollback.get("success"):
-                    mes_lines.append("⚠️ 已自动回滚到上一个版本，2 秒后自动重启")
-                    await send_to_admin(client, "\n".join(mes_lines), user_ctx, global_config)
-                    asyncio.create_task(restart_process())
-                else:
-                    await send_to_admin(client, "\n".join(mes_lines), user_ctx, global_config)
+                await send_to_admin(client, "\n".join(mes_lines), user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             return
 
-        if cmd == "uprollback":
-            await send_to_admin(client, "↩️ 开始回滚到上一个版本...", user_ctx, global_config)
-            result = await asyncio.to_thread(rollback_to_last_release)
+        if cmd in ("reback", "rollback", "uprollback"):
+            target_ref = my[1].strip() if len(my) > 1 else ""
+            if not target_ref:
+                await send_to_admin(client, "用法：`reback <版本号|commit|branch>`", user_ctx, global_config)
+                return
+
+            await send_to_admin(client, f"↩️ 开始回退到：{target_ref}", user_ctx, global_config)
+            result = await asyncio.to_thread(reback_to_version, None, target_ref)
             if result.get("success"):
-                current = result.get("current", {})
+                after = result.get("after", {})
+                resolved = result.get("resolved_target", target_ref)
                 mes = (
-                    "✅ 回滚成功\n"
-                    f"当前版本：{current.get('display_version', 'unknown')}\n"
-                    "♻️ 2 秒后自动重启进程"
+                    "✅ 回退成功\n"
+                    f"目标：{resolved}\n"
+                    f"当前：{after.get('display_version', after.get('short_commit', 'unknown'))}\n"
+                    "请执行 `restart` 重启脚本使回退生效"
                 )
                 await send_to_admin(client, mes, user_ctx, global_config)
-                asyncio.create_task(restart_process())
             else:
                 mes = f"❌ 回滚失败：{result.get('error', 'unknown')}"
                 if result.get("detail"):

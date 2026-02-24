@@ -89,3 +89,73 @@ def test_get_blocking_dirty_paths_ignores_runtime_artifacts(monkeypatch, tmp_pat
     monkeypatch.setattr(um, "_run_cmd", fake_run_cmd)
     blocking = um.get_blocking_dirty_paths(str(tmp_path))
     assert blocking == ["zq_multiuser.py"]
+
+
+def test_list_version_catalog_contains_pending_and_summary(monkeypatch, tmp_path):
+    summaries = {
+        "v1.0.9": "v1.0.9: fix updater command",
+        "v1.0.8": "v1.0.8: yc preset refresh",
+        "v1.0.7": "v1.0.7: lose-end style",
+    }
+    dates = {
+        "v1.0.9": "2026-02-24",
+        "v1.0.8": "2026-02-24",
+        "v1.0.7": "2026-02-23",
+    }
+
+    def fake_run_cmd(args, cwd, timeout=30):
+        if args == ["git", "config", "--get", "remote.origin.url"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="https://github.com/ibarnard/YdxbotV2.git\n", stderr="")
+        if args == ["git", "fetch", "--tags", "origin"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args == ["git", "rev-parse", "HEAD"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="abcdef1234567890\n", stderr="")
+        if args == ["git", "branch", "--show-current"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="main\n", stderr="")
+        if args == ["git", "describe", "--tags", "--exact-match"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="v1.0.7\n", stderr="")
+        if args == ["git", "describe", "--tags", "--abbrev=0"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="v1.0.7\n", stderr="")
+        if args == ["git", "tag", "--list", "v*", "--sort=-version:refname"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="v1.0.9\nv1.0.8\nv1.0.7\n", stderr="")
+        if len(args) == 5 and args[:4] == ["git", "log", "-1", "--format=%cs"]:
+            tag = args[4]
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=dates.get(tag, "") + "\n", stderr="")
+        if len(args) == 4 and args[:2] == ["git", "for-each-ref"] and args[3] == "--format=%(subject)":
+            tag = args[2].replace("refs/tags/", "")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=summaries.get(tag, "") + "\n", stderr="")
+        if len(args) == 5 and args[:4] == ["git", "log", "-1", "--format=%s"]:
+            tag = args[4]
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=summaries.get(tag, "") + "\n", stderr="")
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(um, "_run_cmd", fake_run_cmd)
+    catalog = um.list_version_catalog(str(tmp_path), limit=3)
+
+    assert catalog["success"] is True
+    assert catalog["latest_tag"] == "v1.0.9"
+    assert catalog["pending_tags"] == ["v1.0.9", "v1.0.8"]
+    assert catalog["entries"][0]["summary"] == "v1.0.9: fix updater command"
+
+
+def test_update_to_version_without_target_uses_latest_tag(monkeypatch):
+    monkeypatch.setattr(
+        um,
+        "list_version_catalog",
+        lambda repo_root=None, limit=1: {"success": True, "latest_tag": "v1.0.9"},
+    )
+    monkeypatch.setattr(
+        um,
+        "update_to_ref",
+        lambda repo_root=None, target_ref=None: {"success": True, "target_ref": target_ref, "after": {"display_version": "v1.0.9"}},
+    )
+
+    result = um.update_to_version("/tmp/repo", "")
+    assert result["success"] is True
+    assert result["resolved_target"] == "v1.0.9"
+
+
+def test_reback_to_version_requires_target():
+    result = um.reback_to_version("/tmp/repo", "")
+    assert result["success"] is False
+    assert "请提供目标版本号或提交" in result["error"]

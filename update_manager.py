@@ -275,6 +275,133 @@ def get_current_repo_info(repo_root: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+def _list_version_tags(root: Path, limit: int = 0) -> List[str]:
+    tags_res = _run_cmd(["git", "tag", "--list", "v*", "--sort=-version:refname"], root, timeout=20)
+    if tags_res.returncode != 0:
+        return []
+    tags = [line.strip() for line in tags_res.stdout.splitlines() if line.strip()]
+    if limit and limit > 0:
+        return tags[:limit]
+    return tags
+
+
+def _get_tag_date(root: Path, tag: str) -> str:
+    date_res = _run_cmd(["git", "log", "-1", "--format=%cs", tag], root, timeout=10)
+    if date_res.returncode != 0:
+        return ""
+    return date_res.stdout.strip()
+
+
+def _get_tag_summary(root: Path, tag: str) -> str:
+    summary_res = _run_cmd(["git", "for-each-ref", f"refs/tags/{tag}", "--format=%(subject)"], root, timeout=10)
+    summary = summary_res.stdout.strip() if summary_res.returncode == 0 else ""
+    if summary:
+        return summary
+    commit_subject_res = _run_cmd(["git", "log", "-1", "--format=%s", tag], root, timeout=10)
+    if commit_subject_res.returncode != 0:
+        return ""
+    return commit_subject_res.stdout.strip()
+
+
+def list_version_catalog(repo_root: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
+    """
+    版本目录（面向公开仓库）：
+    - 历史版本（tag）及摘要
+    - 当前版本
+    - 待更新版本（相对当前 tag）
+    """
+    root = _repo_root(repo_root)
+    current = get_current_repo_info(root)
+    remote = detect_repo_remote(root)
+    remote_name = remote.get("name", "")
+    github_token = resolve_github_token(root, remote.get("url", ""))
+
+    fetch_warning = ""
+    if remote_name:
+        fetch_res = _git_fetch_tags(root, remote_name, github_token)
+        if fetch_res.returncode != 0:
+            fetch_warning = (fetch_res.stderr or fetch_res.stdout).strip()[:200]
+
+    all_tags = _list_version_tags(root)
+    if not all_tags:
+        return {
+            "success": True,
+            "current": current,
+            "latest_tag": "",
+            "current_tag": current.get("current_tag", ""),
+            "pending_tags": [],
+            "entries": [],
+            "fetch_warning": fetch_warning,
+        }
+
+    max_entries = max(1, int(limit)) if isinstance(limit, int) else 20
+    display_tags = all_tags[:max_entries]
+
+    entries: List[Dict[str, str]] = []
+    for tag in display_tags:
+        entries.append(
+            {
+                "tag": tag,
+                "date": _get_tag_date(root, tag),
+                "summary": _get_tag_summary(root, tag),
+            }
+        )
+
+    current_tag = current.get("current_tag", "") or current.get("nearest_tag", "")
+    pending_tags: List[str] = []
+    if current_tag and current_tag in all_tags:
+        pending_tags = all_tags[: all_tags.index(current_tag)]
+    elif not current_tag:
+        pending_tags = list(all_tags)
+    else:
+        pending_tags = list(all_tags)
+
+    return {
+        "success": True,
+        "current": current,
+        "latest_tag": all_tags[0],
+        "current_tag": current.get("current_tag", ""),
+        "pending_tags": pending_tags,
+        "entries": entries,
+        "fetch_warning": fetch_warning,
+    }
+
+
+def update_to_version(repo_root: Optional[str] = None, target: Optional[str] = None) -> Dict[str, Any]:
+    """
+    更新到指定版本（tag/commit/branch），若未指定则更新到最新 tag。
+    公开仓库优先，不依赖 release API。
+    """
+    target_ref = (target or "").strip()
+    if target_ref:
+        return update_to_ref(repo_root, target_ref)
+
+    catalog = list_version_catalog(repo_root, limit=1)
+    if not catalog.get("success"):
+        return {"success": False, "error": catalog.get("error", "获取版本列表失败")}
+    latest_tag = catalog.get("latest_tag", "")
+    if not latest_tag:
+        return {"success": False, "error": "未找到可更新的版本标签"}
+
+    result = update_to_ref(repo_root, latest_tag)
+    if result.get("success"):
+        result["resolved_target"] = latest_tag
+    return result
+
+
+def reback_to_version(repo_root: Optional[str] = None, target: Optional[str] = None) -> Dict[str, Any]:
+    """
+    回退到指定版本（tag/commit/branch）。
+    """
+    target_ref = (target or "").strip()
+    if not target_ref:
+        return {"success": False, "error": "请提供目标版本号或提交"}
+    result = update_to_ref(repo_root, target_ref)
+    if result.get("success"):
+        result["resolved_target"] = target_ref
+    return result
+
+
 def get_latest_release(repo_slug: str, timeout: int = 10, github_token: str = "") -> Dict[str, Any]:
     url = f"https://api.github.com/repos/{repo_slug}/releases/latest"
     headers = {"Accept": "application/vnd.github+json"}
@@ -660,14 +787,15 @@ def update_to_ref(repo_root: Optional[str] = None, target_ref: Optional[str] = N
         github_token = resolve_github_token(root, remote.get("url", ""))
 
         if remote_name:
-            fetch_res = _git_fetch_tags(root, remote_name, github_token)
-            if fetch_res.returncode != 0:
+            fetch_main_res = _run_cmd(["git", "fetch", remote_name], root, timeout=120)
+            fetch_tag_res = _git_fetch_tags(root, remote_name, github_token)
+            if fetch_main_res.returncode != 0 and fetch_tag_res.returncode != 0:
                 verify_local = _run_cmd(["git", "rev-parse", "--verify", f"{final_ref}^{{commit}}"], root, timeout=20)
                 if verify_local.returncode != 0:
                     return {
                         "success": False,
                         "error": f"git fetch --tags {remote_name} 失败，且本地不存在目标 ref",
-                        "detail": (fetch_res.stderr or fetch_res.stdout).strip()[:600],
+                        "detail": ((fetch_main_res.stderr or fetch_main_res.stdout or fetch_tag_res.stderr or fetch_tag_res.stdout).strip())[:600],
                     }
 
         resolve_res = _run_cmd(["git", "rev-parse", "--verify", f"{final_ref}^{{commit}}"], root, timeout=20)
@@ -739,7 +867,7 @@ def build_release_update_message(check_result: Dict[str, Any]) -> str:
         f"最新版本：{latest.get('tag_name', 'unknown')}\n"
         f"发布时间：{latest.get('published_at', 'unknown')}\n"
         f"发布链接：{latest.get('html_url', '')}\n"
-        "可用命令：`upcheck` `upnow` `upref` `uprollback` `restart`"
+        "可用命令：`ver` `update` `reback` `restart`"
     )
 
 
