@@ -7,6 +7,7 @@ from types import SimpleNamespace
 
 from user_manager import UserContext, UserManager
 from model_manager import ModelManager
+import constants
 import zq_multiuser as zm
 
 
@@ -141,6 +142,32 @@ def test_user_context_supports_hash_comments_in_config(tmp_path):
     ctx = UserContext(str(user_dir))
     assert ctx.user_id == 778899
     assert ctx.config.name == "注释用户"
+
+
+def test_user_context_refreshes_builtin_presets_but_keeps_custom(tmp_path):
+    user_dir = tmp_path / "users" / "preset_user"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "预设用户"},
+            "telegram": {"user_id": 6123},
+        },
+    )
+    _write_json(
+        user_dir / "presets.json",
+        {
+            "yc05": ["1", "13", "3", "2.1", "2.1", "2.05", "500"],
+            "my_custom": ["1", "6", "2.2", "2.1", "2.0", "2.0", "800"],
+        },
+    )
+
+    ctx = UserContext(str(user_dir))
+    assert ctx.presets["yc05"] == constants.PRESETS["yc05"]
+    assert ctx.presets["my_custom"] == ["1", "6", "2.2", "2.1", "2.0", "2.0", "800"]
+
+    saved_presets = json.loads((user_dir / "presets.json").read_text(encoding="utf-8"))
+    assert saved_presets["yc05"] == constants.PRESETS["yc05"]
+    assert saved_presets["my_custom"] == ["1", "6", "2.2", "2.1", "2.0", "2.0", "800"]
 
 
 def test_main_multiuser_settle_regex_is_strict():
@@ -500,6 +527,26 @@ def test_send_message_v2_lose_end_priority_keeps_account_prefix(tmp_path, monkey
     assert tg_payload["json"]["text"].startswith("【账号：回补用户】")
 
 
+def test_build_yc_result_message_uses_codeblock_table():
+    params = {
+        "continuous": 1,
+        "lose_stop": 13,
+        "lose_once": 3.0,
+        "lose_twice": 2.1,
+        "lose_three": 2.1,
+        "lose_four": 2.05,
+        "initial_amount": 3000,
+    }
+    msg = zm._build_yc_result_message(params, "yc_demo", current_fund=30_000_000, auto_trigger=False)
+
+    assert msg.startswith("```")
+    assert "🎯 策略参数" in msg
+    assert "策略命令: 1 13 3.0 2.1 2.1 2.05 3000" in msg
+    assert "🎯 策略总结:" in msg
+    assert "连数|倍率|下注金额| 盈利 |累计损失" in msg
+    assert msg.count("```") == 2
+
+
 def test_process_settle_open_ydx_supports_monitor_list(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "5002"
     _write_json(
@@ -817,7 +864,8 @@ def test_st_command_triggers_auto_yc_report(tmp_path, monkeypatch):
     assert ctx.state.runtime.get("current_preset_name") == "yc05"
     assert any("预设启动成功: yc05" in msg for msg in sent_messages)
     assert any("🔮 已根据当前预设自动测算" in msg for msg in sent_messages)
-    assert any("📊 **测算结果: yc05**" in msg for msg in sent_messages)
+    assert any("🎯 策略参数" in msg for msg in sent_messages)
+    assert any("连数|倍率|下注金额| 盈利 |累计损失" in msg for msg in sent_messages)
 
 
 def test_xx_command_cleans_messages_in_config_groups(tmp_path, monkeypatch):

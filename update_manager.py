@@ -626,6 +626,7 @@ def _is_runtime_file(path: str) -> bool:
         return True
     normalized = path.replace("\\", "/")
     filename = Path(normalized).name
+    parts = [p for p in normalized.split("/") if p]
     if filename == ".DS_Store":
         return True
     if normalized in {"state.json", "account_funds.json", "MULTIUSER_TEST_RESULTS.json"}:
@@ -636,14 +637,26 @@ def _is_runtime_file(path: str) -> bool:
         return True
     if normalized.endswith(".session") or normalized.endswith(".session-journal"):
         return True
+    if normalized.endswith(".session-wal") or normalized.endswith(".session-shm"):
+        return True
     if normalized in {"global.json", "shared/global.json", "shared/global.local.json"}:
         return True
     if normalized.startswith("tests_multiuser/users/"):
         return True
     if normalized.startswith("user/"):
+        # legacy 单用户目录统一视为运行时数据
         return True
-    if normalized.startswith("users/") and not normalized.startswith("users/_template/"):
-        return True
+    if len(parts) >= 3 and parts[0] == "users" and not parts[1].startswith("_"):
+        user_sensitive = {"config.json", "state.json", "account_funds.json"}
+        if filename in user_sensitive:
+            return True
+        if filename.endswith(".session") or filename.endswith(".session-journal"):
+            return True
+        if filename.endswith(".session-wal") or filename.endswith(".session-shm"):
+            return True
+        # 账户目录里的日志属于运行时产物，避免阻塞更新。
+        if filename.endswith(".log") or ".log." in filename:
+            return True
     if normalized in {RELEASE_STATE_FILE, ROLLBACK_FILE, UPDATE_LOCK_FILE}:
         return True
     return False

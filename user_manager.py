@@ -351,16 +351,31 @@ class UserContext:
     def _load_presets(self):
         presets_path = os.path.join(self.user_dir, "presets.json")
         
-        # 先加载全局预设作为基础
+        # 内置预设作为权威基线（代码更新后应覆盖同名旧值）
         self.presets = dict(constants.PRESETS)
         
         if os.path.exists(presets_path):
             try:
                 with open(presets_path, 'r', encoding='utf-8') as f:
                     user_presets = json.load(f)
-                    # 合并用户预设（用户预设会覆盖全局预设）
-                    self.presets.update(user_presets)
-                log_event(logging.DEBUG, 'load_presets', '加载用户预设成功', f'user_id={self.user_id}')
+                    if not isinstance(user_presets, dict):
+                        raise ValueError("presets.json 必须是对象(dict)")
+
+                    overridden_builtins = 0
+                    custom_count = 0
+                    for key, value in user_presets.items():
+                        if key in constants.PRESETS:
+                            overridden_builtins += 1
+                            continue
+                        self.presets[key] = value
+                        custom_count += 1
+
+                log_event(
+                    logging.DEBUG,
+                    'load_presets',
+                    '加载用户预设成功',
+                    f'user_id={self.user_id}, custom={custom_count}, builtin_refreshed={overridden_builtins}'
+                )
             except Exception as e:
                 log_event(logging.ERROR, 'load_presets', '加载用户预设失败', f'user_id={self.user_id}, error={str(e)}')
         else:

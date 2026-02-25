@@ -74,9 +74,11 @@ def test_get_blocking_dirty_paths_ignores_runtime_artifacts(monkeypatch, tmp_pat
             "?? .DS_Store",
             "?? tests_multiuser/users/tim/config.json",
             "?? users/shuji/session.session",
+            " M users/shuji/state.json",
             "?? user/legacy_user/config.py",
             " M shared/global.json",
             "?? global.json",
+            " M users/shuji/presets.json",
             "?? zq_multiuser.py",
         ]
     )
@@ -88,7 +90,7 @@ def test_get_blocking_dirty_paths_ignores_runtime_artifacts(monkeypatch, tmp_pat
 
     monkeypatch.setattr(um, "_run_cmd", fake_run_cmd)
     blocking = um.get_blocking_dirty_paths(str(tmp_path))
-    assert blocking == ["zq_multiuser.py"]
+    assert blocking == ["users/shuji/presets.json", "zq_multiuser.py"]
 
 
 def test_list_version_catalog_contains_pending_and_summary(monkeypatch, tmp_path):

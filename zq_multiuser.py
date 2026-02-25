@@ -2381,50 +2381,125 @@ def _calculate_yc_sequence(params):
         float(params["lose_three"]),
         float(params["lose_four"]),
     ]
+    max_single_bet_limit = 50_000_000
+    start_streak = max(1, int(params["continuous"]))
 
-    sequence = [initial]
-    for i in range(1, lose_stop):
-        multiplier = multipliers[min(i - 1, 3)]
-        next_bet = int(sequence[-1] * multiplier)
-        sequence.append(next_bet)
+    rows = []
+    prev_bet = initial
+    cumulative_loss = 0
+    capped = False
 
-    total_investment = sum(sequence)
-    max_bet = max(sequence) if sequence else 0
-    return sequence, total_investment, max_bet
+    for i in range(lose_stop):
+        if i == 0:
+            multiplier = 1.0
+            bet = initial
+        else:
+            multiplier = multipliers[min(i - 1, 3)]
+            bet = int(prev_bet * multiplier)
+
+        if bet > max_single_bet_limit:
+            bet = max_single_bet_limit
+            capped = True
+
+        cumulative_loss += bet
+        profit_if_win = bet - (cumulative_loss - bet)
+        rows.append(
+            {
+                "streak": start_streak + i,
+                "multiplier": multiplier,
+                "bet": bet,
+                "profit_if_win": profit_if_win,
+                "cumulative_loss": cumulative_loss,
+            }
+        )
+        prev_bet = bet
+
+        if capped:
+            break
+
+    total_investment = rows[-1]["cumulative_loss"] if rows else 0
+    max_bet = max((row["bet"] for row in rows), default=0)
+    return {
+        "rows": rows,
+        "total_investment": total_investment,
+        "max_bet": max_bet,
+        "max_single_bet_limit": max_single_bet_limit,
+        "capped": capped,
+        "start_streak": start_streak,
+    }
 
 
 def _build_yc_result_message(params, preset_name: str, current_fund: int, auto_trigger: bool) -> str:
-    sequence, total_investment, max_bet = _calculate_yc_sequence(params)
+    calc = _calculate_yc_sequence(params)
+    rows = calc["rows"]
+    total_investment = calc["total_investment"]
+    max_single_bet_limit = calc["max_single_bet_limit"]
+    start_streak = calc["start_streak"]
 
-    header = "🔮 已根据当前预设自动测算\n\n" if auto_trigger else ""
-    result_msg = f"""{header}📊 **测算结果: {preset_name}**
+    def fmt_wan(value: int) -> str:
+        return f"{value / 10000:,.1f}"
 
-**参数:**
-- 连续: {params['continuous']}次
-- 止损: {params['lose_stop']}次
-- 倍率: {params['lose_once']}/{params['lose_twice']}/{params['lose_three']}/{params['lose_four']}
-- 首注: {params['initial_amount']}
+    def fmt_table_wan(value: int) -> str:
+        wan = value / 10000
+        if abs(wan) >= 1000:
+            return f"{wan:,.0f}"
+        return f"{wan:.1f}"
 
-**押注序列:**
-"""
-    for i, bet in enumerate(sequence[:10], 1):
-        result_msg += f"第{i}次: {format_number(bet)}\n"
-    if len(sequence) > 10:
-        result_msg += f"... (共{len(sequence)}次)\n"
+    header_line = "🔮 已根据当前预设自动测算\n" if auto_trigger else ""
+    command_text = (
+        f"{params['continuous']} {params['lose_stop']} "
+        f"{params['lose_once']} {params['lose_twice']} {params['lose_three']} {params['lose_four']} {params['initial_amount']}"
+    )
 
-    result_msg += f"""
-**统计:**
-- 总投入: {format_number(total_investment)}
-- 最大押注: {format_number(max_bet)}
-- 建议资金: {format_number(int(total_investment * 1.2))}
-"""
-    if current_fund > 0:
-        coverage = current_fund / total_investment if total_investment > 0 else 0
-        result_msg += (
-            f"- 菠菜资金: {format_number(current_fund)}\n"
-            f"- 覆盖倍数: {coverage:.2f}x"
+    effective_streak = start_streak + len(rows) - 1 if rows else start_streak
+    effective_profit = rows[-1]["profit_if_win"] if rows else 0
+    fund_text = f"{format_number(current_fund)} ({fmt_wan(current_fund)}万)" if current_fund > 0 else "未设置"
+
+    lines = []
+    if header_line:
+        lines.append(header_line.rstrip("\n"))
+    lines.append("```")
+    lines.extend(
+        [
+            "🎯 策略参数",
+            f"预设名称：{preset_name}",
+            f"菠菜资金：{fund_text}",
+            f"策略命令: {command_text}",
+            f"🏁 起始连数: {params['continuous']}",
+            f"🔢 下注次数: {params['lose_stop']}次",
+            f"💰 首注金额: {fmt_wan(int(params['initial_amount']))}万",
+            f"💰单注上限: {max_single_bet_limit / 10000:,.0f}万",
+            "",
+            "🎯 策略总结:",
+            f"菠菜资金：{fund_text}",
+            f"盈利有效连数: {effective_streak}连",
+            f"{effective_streak}连所需本金: {fmt_wan(total_investment)}万",
+            f"{effective_streak}连可获得盈利: {fmt_wan(effective_profit)}万",
+            "",
+            "连数|倍率|下注金额| 盈利 |累计损失",
+            "---|----|------|------|------",
+        ]
+    )
+
+    for row in rows:
+        multiplier_text = f"{row['multiplier']:.2f}".rstrip("0")
+        if multiplier_text.endswith("."):
+            multiplier_text += "0"
+        row_text = (
+            f"{str(row['streak']).center(3)}|"
+            f"{multiplier_text.center(4)}|"
+            f"{fmt_table_wan(row['bet']).center(6)}|"
+            f"{fmt_table_wan(row['profit_if_win']).center(6)}|"
+            f"{fmt_table_wan(row['cumulative_loss']).center(6)}"
         )
-    return result_msg
+        lines.append(row_text)
+
+    if calc["capped"]:
+        lines.append("")
+        lines.append("※ 注意: 后续连数已触发单注上限，测算仅供参考。")
+
+    lines.append("```")
+    return "\n".join(lines)
 
 
 async def yc_command_handler_multiuser(
