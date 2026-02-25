@@ -671,8 +671,17 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
 async def process_bet_on(client, event, user_ctx: UserContext, global_config: dict):
     state = user_ctx.state
     rt = state.runtime
-    
-    await asyncio.sleep(5)  # 与 master 一致：延迟等待消息稳定
+
+    timing_cfg = _read_timing_config(global_config)
+    prompt_wait_sec = timing_cfg["prompt_wait_sec"]
+    predict_timeout_sec = timing_cfg["predict_timeout_sec"]
+    click_interval_sec = timing_cfg["click_interval_sec"]
+    click_timeout_sec = timing_cfg["click_timeout_sec"]
+
+    # 固定长等待会错过下注窗口，改为轻量等待回调按钮就绪。
+    if not getattr(event, "reply_markup", None) and prompt_wait_sec > 0:
+        await asyncio.sleep(prompt_wait_sec)
+
     text = event.message.message
 
     if not rt.get("switch", True):
@@ -745,12 +754,32 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     log_event(logging.INFO, 'bet_on', '开始押注', user_id=user_ctx.user_id)
     try:
         rt["last_predict_info"] = "初始化预测"
-        prediction = await predict_next_bet_v10(user_ctx, global_config)
+        fallback_reason = ""
+        try:
+            prediction = await asyncio.wait_for(
+                predict_next_bet_v10(user_ctx, global_config),
+                timeout=predict_timeout_sec,
+            )
+        except asyncio.TimeoutError:
+            prediction = None
+            fallback_reason = "预测超时"
+            rt["last_predict_info"] = "预测超时 - 触发统计回补预测"
+            log_event(
+                logging.WARNING,
+                'bet_on',
+                '预测超时，触发回退',
+                user_id=user_ctx.user_id,
+                timeout=predict_timeout_sec,
+            )
+
         if prediction in (-1, None):
             recent_40 = state.history[-40:] if len(state.history) >= 40 else state.history
             recent_total = sum(recent_40)
             prediction = 1 if recent_total < len(recent_40) / 2 else 0
-            rt["last_predict_info"] = f"AI节点闪退 - 触发智能统计回补预测(补{'大' if prediction == 1 else '小'})"
+            if fallback_reason:
+                rt["last_predict_info"] = f"{fallback_reason} - 触发智能统计回补预测(补{'大' if prediction == 1 else '小'})"
+            else:
+                rt["last_predict_info"] = f"AI节点闪退 - 触发智能统计回补预测(补{'大' if prediction == 1 else '小'})"
 
         rt["bet_amount"] = int(bet_amount)
         direction = "大" if prediction == 1 else "小"
@@ -764,16 +793,18 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             user_ctx.save_state()
             return
 
-        rt["bet"] = True
-        rt["total"] = rt.get("total", 0) + 1
-        rt["bet_sequence_count"] = rt.get("bet_sequence_count", 0) + 1
-
         for amount in combination:
             button_data = buttons.get(amount)
             if button_data is not None:
-                await event.click(button_data)
-                await asyncio.sleep(1.5)
+                await asyncio.wait_for(
+                    _click_bet_button_with_recover(client, event, user_ctx, button_data),
+                    timeout=click_timeout_sec,
+                )
+                await asyncio.sleep(click_interval_sec)
 
+        rt["bet"] = True
+        rt["total"] = rt.get("total", 0) + 1
+        rt["bet_sequence_count"] = rt.get("bet_sequence_count", 0) + 1
         rt["bet_type"] = 1 if prediction == 1 else 0
         rt["bet_on"] = True
 
@@ -805,8 +836,12 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         rt["current_bet_seq"] = int(rt.get("current_bet_seq", 1)) + 1
         user_ctx.save_state()
     except Exception as e:
-        log_event(logging.ERROR, 'bet_on', '押注失败', user_id=user_ctx.user_id, data=str(e))
-        await send_to_admin(client, f"押注出错: {e}", user_ctx, global_config)
+        if _is_invalid_callback_message_error(e):
+            log_event(logging.WARNING, 'bet_on', '下注窗口失效，已跳过本轮', user_id=user_ctx.user_id, data=str(e))
+            await send_to_admin(client, "本轮下注窗口已失效，已自动跳过。", user_ctx, global_config)
+        else:
+            log_event(logging.ERROR, 'bet_on', '押注失败', user_id=user_ctx.user_id, data=str(e))
+            await send_to_admin(client, f"押注出错: {e}", user_ctx, global_config)
 
 
 # 结算处理
@@ -976,6 +1011,81 @@ def is_fund_available(user_ctx: UserContext, bet_amount: int = 0) -> bool:
     rt = user_ctx.state.runtime
     gambling_fund = rt.get("gambling_fund", 0)
     return gambling_fund > 0 and gambling_fund >= bet_amount
+
+
+def _is_invalid_callback_message_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    markers = (
+        "message id is invalid",
+        "getbotcallbackanswerrequest",
+        "can't do that operation on such message",
+        "messageidinvaliderror",
+    )
+    return any(marker in text for marker in markers)
+
+
+async def _find_latest_bet_prompt_message(client, event, user_ctx: UserContext):
+    """回溯最近可点击的下注提示消息，用于 message id 失效时恢复。"""
+    zq_bot = user_ctx.config.groups.get("zq_bot")
+    zq_bot_targets = {str(item) for item in _iter_targets(zq_bot)}
+    hints = ("[近 40 次结果]", "由近及远", "0 小 1 大")
+
+    try:
+        async for msg in client.iter_messages(event.chat_id, limit=20):
+            if zq_bot_targets and str(getattr(msg, "sender_id", None)) not in zq_bot_targets:
+                continue
+            if not getattr(msg, "reply_markup", None):
+                continue
+            raw = (getattr(msg, "message", None) or getattr(msg, "raw_text", None) or "").strip()
+            if any(hint in raw for hint in hints):
+                return msg
+    except Exception as e:
+        log_event(logging.DEBUG, "bet_on", "回溯下注提示消息失败", user_id=user_ctx.user_id, error=str(e))
+    return None
+
+
+async def _click_bet_button_with_recover(client, event, user_ctx: UserContext, button_data):
+    """点击下注按钮；若原消息失效，则回溯最新下注提示消息重试。"""
+    try:
+        await event.click(button_data)
+        return
+    except Exception as e:
+        if not _is_invalid_callback_message_error(e):
+            raise
+
+    latest_msg = await _find_latest_bet_prompt_message(client, event, user_ctx)
+    if latest_msg is None:
+        raise RuntimeError("下注窗口失效且未找到可用的最新下注消息")
+
+    await latest_msg.click(button_data)
+    log_event(
+        logging.WARNING,
+        "bet_on",
+        "原下注消息失效，已使用最新消息重试按钮点击",
+        user_id=user_ctx.user_id,
+        src_msg=getattr(event, "id", None),
+        retry_msg=getattr(latest_msg, "id", None),
+    )
+
+
+def _read_timing_config(global_config: dict) -> dict:
+    """读取下注时序参数，提供安全兜底。"""
+    cfg = global_config.get("betting") if isinstance(global_config.get("betting"), dict) else {}
+
+    def _to_float(name: str, default: float, minimum: float, maximum: float) -> float:
+        raw = cfg.get(name, default)
+        try:
+            val = float(raw)
+        except Exception:
+            return default
+        return max(minimum, min(maximum, val))
+
+    return {
+        "prompt_wait_sec": _to_float("prompt_wait_sec", 1.2, 0.0, 5.0),
+        "predict_timeout_sec": _to_float("predict_timeout_sec", 8.0, 1.0, 30.0),
+        "click_interval_sec": _to_float("click_interval_sec", 0.45, 0.05, 2.0),
+        "click_timeout_sec": _to_float("click_timeout_sec", 6.0, 1.0, 20.0),
+    }
 
 
 def calculate_bet_amount(rt: dict) -> int:
