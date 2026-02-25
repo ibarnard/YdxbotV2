@@ -25,6 +25,7 @@ from update_manager import (
     get_current_repo_info,
     list_version_catalog,
     reback_to_version,
+    resolve_systemd_service_name,
     restart_process,
     update_to_version,
 )
@@ -2278,7 +2279,12 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             return
 
         if cmd in ("restart", "reboot"):
-            await send_to_admin(client, "♻️ 收到重启指令，2 秒后自动重启进程...", user_ctx, global_config)
+            service_name = resolve_systemd_service_name()
+            if service_name:
+                mes = f"♻️ 收到重启指令，2 秒后通过 systemd 重启服务：{service_name}"
+            else:
+                mes = "♻️ 收到重启指令，2 秒后自动重启进程..."
+            await send_to_admin(client, mes, user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 3))
             asyncio.create_task(restart_process())
             return

@@ -15,6 +15,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -31,6 +32,7 @@ RELEASE_STATE_FILE = ".release_state.json"
 ROLLBACK_FILE = ".release_rollback.json"
 UPDATE_LOCK_FILE = ".update.lock"
 GITHUB_TOKEN_ENV_KEYS = ("YDXBOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
+SYSTEMD_SERVICE_ENV_KEYS = ("YDXBOT_SYSTEMD_SERVICE", "SYSTEMD_SERVICE")
 SHARED_GLOBAL_CANDIDATES = ("global.local.json", "global.json", "global.example.json")
 
 
@@ -194,6 +196,53 @@ def resolve_github_token(repo_root: Optional[str] = None, remote_url: str = "") 
             return token
 
     return _extract_github_token_from_remote(remote_url)
+
+
+def resolve_systemd_service_name(repo_root: Optional[str] = None) -> str:
+    """读取 systemd 服务名（环境变量优先，其次 shared 配置）。"""
+    for env_key in SYSTEMD_SERVICE_ENV_KEYS:
+        service_name = (os.getenv(env_key) or "").strip()
+        if service_name:
+            return service_name
+
+    root = _repo_root(repo_root)
+    shared_cfg = _load_shared_global_config(root)
+    update_cfg = shared_cfg.get("update", {}) if isinstance(shared_cfg.get("update", {}), dict) else {}
+
+    cfg_candidates = [
+        update_cfg.get("systemd_service"),
+        update_cfg.get("service_name"),
+        update_cfg.get("service"),
+        (shared_cfg.get("systemd") or {}).get("service") if isinstance(shared_cfg.get("systemd"), dict) else "",
+    ]
+    for item in cfg_candidates:
+        service_name = (item or "").strip()
+        if service_name:
+            return service_name
+    return ""
+
+
+def _run_systemd_restart(service_name: str) -> Dict[str, Any]:
+    if not service_name:
+        return {"success": False, "error": "未配置 systemd 服务名"}
+    if not shutil.which("systemctl"):
+        return {"success": False, "error": "当前环境不存在 systemctl"}
+
+    result = subprocess.run(
+        ["systemctl", "restart", service_name],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "").strip()
+        return {
+            "success": False,
+            "error": f"systemctl 重启失败: {service_name}",
+            "detail": detail[:600],
+        }
+    return {"success": True}
 
 
 def _build_git_auth_header(token: str) -> str:
@@ -983,6 +1032,11 @@ def update_to_ref(repo_root: Optional[str] = None, target_ref: Optional[str] = N
 
 async def restart_process(delay_seconds: float = 2.0) -> None:
     await asyncio.sleep(delay_seconds)
+    service_name = resolve_systemd_service_name()
+    if service_name:
+        restart_result = _run_systemd_restart(service_name)
+        if restart_result.get("success"):
+            return
     os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
