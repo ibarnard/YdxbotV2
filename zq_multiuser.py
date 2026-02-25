@@ -1650,7 +1650,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `xx` : 清理配置群中“我发送的消息”
 
 **发布更新**
-- `ver` : 查看版本列表/当前版本/待更新版本/摘要
+- `ver` : 查看版本概览（最近3个Tag + 最近3个Commit）
 - `update [版本|提交]` : 更新到指定版本(留空默认最新)
 - `reback [版本|提交]` : 回退到指定版本
 - `restart` : 重启当前进程
@@ -1975,60 +1975,72 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
         # ========== 发布更新命令 ==========
         if cmd in ("ver", "version"):
-            result = await asyncio.to_thread(list_version_catalog, None, 20)
+            result = await asyncio.to_thread(list_version_catalog, None, 3)
             if not result.get("success"):
                 mes = f"❌ 版本查询失败：{result.get('error', 'unknown')}"
             else:
                 current = result.get("current", {})
-                current_display = current.get("display_version", "unknown")
-                current_tag = current.get("current_tag", "")
-                latest_tag = result.get("latest_tag", "")
+                current_short = current.get("short_commit", "unknown") or "unknown"
+                current_tag_exact = current.get("current_tag", "") or ""
+                nearest_tag = current.get("nearest_tag", "") or ""
+                if current_tag_exact:
+                    current_tag_display = current_tag_exact
+                elif nearest_tag:
+                    current_tag_display = f"无（最近Tag: {nearest_tag}）"
+                else:
+                    current_tag_display = "无"
+
+                remote_head = result.get("remote_head", {}) or {}
+                remote_head_short = remote_head.get("short_commit", "-") or "-"
+                remote_head_tag = result.get("remote_head_tag", "") or ""
                 pending_tags = result.get("pending_tags", [])
-                entries = result.get("entries", [])
+                recent_tags = result.get("recent_tags", []) or []
+                recent_commits = result.get("recent_commits", []) or []
+
+                latest_updatable_tag = pending_tags[0] if pending_tags else "无（已是最新）"
+                if remote_head_short in {"", "-", "unknown"}:
+                    latest_test_commit = "无"
+                elif remote_head_short == current_short:
+                    latest_test_commit = f"{remote_head_short}（已是当前）"
+                elif remote_head_tag:
+                    latest_test_commit = f"{remote_head_short}（Tag: {remote_head_tag}）"
+                else:
+                    latest_test_commit = f"{remote_head_short}（未打 Tag）"
 
                 lines = [
-                    "📦 版本列表",
-                    f"当前版本：{current_display}",
-                    f"当前提交：{current.get('short_commit', 'unknown')}",
-                    f"最新版本：{latest_tag or '无'}",
+                    "📦 版本信息概览",
+                    f"当前版本（Tag）：{current_tag_display}",
+                    f"当前提交（Commit）：{current_short}",
+                    f"最新可更新 Tag：{latest_updatable_tag}",
+                    f"最新可测试 Commit：{latest_test_commit}",
+                    "",
+                    "⚠️  操作提示：",
+                    "- update <Tag版本号|Commit哈希>：更新到指定版本/提交",
+                    "- reback <Tag版本号|Commit哈希>：回滚到指定版本/提交",
+                    "- restart：重启应用（版本切换后生效）",
+                    "",
+                    "🔖 最近 3 个正式版本（Tag，新→旧）",
                 ]
 
-                if pending_tags:
-                    lines.append(f"未更新版本：{', '.join(pending_tags[:8])}")
-                else:
-                    lines.append("未更新版本：无")
-
-                lines.append("")
-                lines.append("历史版本（新→旧）：")
-                if entries:
-                    pending_set = set(pending_tags)
-                    for item in entries:
+                if recent_tags:
+                    for idx, item in enumerate(recent_tags[:3], 1):
                         tag = item.get("tag", "")
-                        date = item.get("date", "")
+                        date = item.get("date", "") or "-"
                         summary = item.get("summary", "") or "-"
-                        if current_tag and tag == current_tag:
-                            marker = "（当前）"
-                        elif tag in pending_set:
-                            marker = "（未更新）"
-                        else:
-                            marker = ""
-                        lines.append(f"- {tag}{marker} | {date} | {summary}")
+                        lines.append(f"{idx}. {tag} | {date} | {summary}")
                 else:
-                    lines.append("- 暂无版本标签")
+                    lines.append("1. 无")
 
-                fetch_warning = result.get("fetch_warning", "")
-                if fetch_warning:
-                    lines.append(f"⚠️ 标签拉取告警：{fetch_warning}")
-
-                lines.extend(
-                    [
-                        "",
-                        "命令：",
-                        "`update <版本号|提交>`",
-                        "`reback <版本号|提交>`",
-                        "`restart`",
-                    ]
-                )
+                lines.extend(["", "💻 最近 3 个开发提交（Commit，新→旧）"])
+                if recent_commits:
+                    for idx, item in enumerate(recent_commits[:3], 1):
+                        short_commit = item.get("short_commit", "") or "-"
+                        date = item.get("date", "") or "-"
+                        summary = item.get("summary", "") or "-"
+                        suffix = "（当前提交）" if short_commit == current_short else ""
+                        lines.append(f"{idx}. {short_commit} | {date} | {summary}{suffix}")
+                else:
+                    lines.append("1. 无")
                 mes = "\n".join(lines)
 
             message = await send_to_admin(client, mes, user_ctx, global_config)

@@ -209,7 +209,7 @@ def _git_fetch_tags(root: Path, remote_name: str, github_token: str = "") -> sub
     token = (github_token or "").strip()
     if token:
         cmd += ["-c", f"http.extraheader={_build_git_auth_header(token)}"]
-    cmd += ["fetch", "--tags", remote_name]
+    cmd += ["fetch", "--force", "--tags", remote_name]
     return _run_cmd(cmd, root, timeout=120)
 
 
@@ -275,6 +275,67 @@ def get_current_repo_info(repo_root: Optional[str] = None) -> Dict[str, Any]:
     }
 
 
+def _get_ref_date(root: Path, ref: str) -> str:
+    if not ref:
+        return ""
+    res = _run_cmd(["git", "show", "-s", "--format=%cs", ref], root, timeout=10)
+    if res.returncode != 0:
+        return ""
+    return res.stdout.strip()
+
+
+def _list_recent_commits(root: Path, ref: str, limit: int) -> List[Dict[str, str]]:
+    if not ref:
+        return []
+    max_items = max(1, int(limit))
+    fmt = "%H%x1f%cs%x1f%s"
+    res = _run_cmd(["git", "log", "-n", str(max_items), f"--format={fmt}", ref], root, timeout=20)
+    if res.returncode != 0:
+        return []
+
+    entries: List[Dict[str, str]] = []
+    for line in res.stdout.splitlines():
+        parts = line.split("\x1f", 2)
+        if len(parts) != 3:
+            continue
+        commit = parts[0].strip()
+        entries.append(
+            {
+                "commit": commit,
+                "short_commit": commit[:8] if commit else "",
+                "date": parts[1].strip(),
+                "summary": parts[2].strip(),
+            }
+        )
+    return entries
+
+
+def _resolve_remote_ref(root: Path, remote_name: str, preferred_branch: str = "") -> str:
+    if not remote_name:
+        return ""
+
+    candidates: List[str] = []
+
+    head_ref_res = _run_cmd(["git", "symbolic-ref", f"refs/remotes/{remote_name}/HEAD"], root, timeout=10)
+    if head_ref_res.returncode == 0 and head_ref_res.stdout.strip():
+        candidates.append(head_ref_res.stdout.strip())
+
+    if preferred_branch:
+        candidates.append(f"refs/remotes/{remote_name}/{preferred_branch}")
+    candidates.append(f"refs/remotes/{remote_name}/main")
+    candidates.append(f"refs/remotes/{remote_name}/master")
+
+    seen = set()
+    for ref in candidates:
+        if not ref or ref in seen:
+            continue
+        seen.add(ref)
+        verify = _run_cmd(["git", "rev-parse", "--verify", ref], root, timeout=10)
+        if verify.returncode == 0:
+            return ref
+    return ""
+
+
 def _list_version_tags(root: Path, limit: int = 0) -> List[str]:
     tags_res = _run_cmd(["git", "tag", "--list", "v*", "--sort=-version:refname"], root, timeout=20)
     if tags_res.returncode != 0:
@@ -303,6 +364,23 @@ def _get_tag_summary(root: Path, tag: str) -> str:
     return commit_subject_res.stdout.strip()
 
 
+def _get_commit_tag(root: Path, commit: str) -> str:
+    if not commit:
+        return ""
+    tag_res = _run_cmd(
+        ["git", "tag", "--list", "v*", "--points-at", commit, "--sort=-version:refname"],
+        root,
+        timeout=10,
+    )
+    if tag_res.returncode != 0:
+        return ""
+    for line in tag_res.stdout.splitlines():
+        tag = line.strip()
+        if tag:
+            return tag
+    return ""
+
+
 def list_version_catalog(repo_root: Optional[str] = None, limit: int = 20) -> Dict[str, Any]:
     """
     版本目录（面向公开仓库）：
@@ -318,19 +396,42 @@ def list_version_catalog(repo_root: Optional[str] = None, limit: int = 20) -> Di
 
     fetch_warning = ""
     if remote_name:
-        fetch_res = _git_fetch_tags(root, remote_name, github_token)
-        if fetch_res.returncode != 0:
-            fetch_warning = (fetch_res.stderr or fetch_res.stdout).strip()[:200]
+        fetch_main_res = _run_cmd(["git", "fetch", remote_name], root, timeout=120)
+        if fetch_main_res.returncode != 0:
+            fetch_warning = (fetch_main_res.stderr or fetch_main_res.stdout).strip()[:200]
+        fetch_tag_res = _git_fetch_tags(root, remote_name, github_token)
+        if fetch_tag_res.returncode != 0 and not fetch_warning:
+            fetch_warning = (fetch_tag_res.stderr or fetch_tag_res.stdout).strip()[:200]
 
     all_tags = _list_version_tags(root)
+    remote_ref = _resolve_remote_ref(root, remote_name, current.get("branch", ""))
+    remote_commits = _list_recent_commits(root, remote_ref, max(1, int(limit)) if isinstance(limit, int) else 20)
+    remote_head = remote_commits[0] if remote_commits else {}
+    remote_head_tag = _get_commit_tag(root, remote_head.get("commit", ""))
+    pending_commits_count = 0
+    if remote_ref:
+        pending_count_res = _run_cmd(["git", "rev-list", "--count", f"HEAD..{remote_ref}"], root, timeout=20)
+        if pending_count_res.returncode == 0:
+            try:
+                pending_commits_count = int((pending_count_res.stdout or "0").strip() or "0")
+            except ValueError:
+                pending_commits_count = 0
+
     if not all_tags:
         return {
             "success": True,
             "current": current,
+            "current_date": _get_ref_date(root, "HEAD"),
             "latest_tag": "",
             "current_tag": current.get("current_tag", ""),
             "pending_tags": [],
             "entries": [],
+            "recent_tags": [],
+            "recent_commits": remote_commits,
+            "remote_head": remote_head,
+            "remote_head_tag": remote_head_tag,
+            "pending_commits_count": pending_commits_count,
+            "remote_ref": remote_ref,
             "fetch_warning": fetch_warning,
         }
 
@@ -356,13 +457,24 @@ def list_version_catalog(repo_root: Optional[str] = None, limit: int = 20) -> Di
     else:
         pending_tags = list(all_tags)
 
+    remote_commits = _list_recent_commits(root, remote_ref, max_entries)
+    remote_head = remote_commits[0] if remote_commits else remote_head
+    remote_head_tag = _get_commit_tag(root, remote_head.get("commit", ""))
+
     return {
         "success": True,
         "current": current,
+        "current_date": _get_ref_date(root, "HEAD"),
         "latest_tag": all_tags[0],
         "current_tag": current.get("current_tag", ""),
         "pending_tags": pending_tags,
         "entries": entries,
+        "recent_tags": entries[:max_entries],
+        "recent_commits": remote_commits[:max_entries],
+        "remote_head": remote_head,
+        "remote_head_tag": remote_head_tag,
+        "pending_commits_count": pending_commits_count,
+        "remote_ref": remote_ref,
         "fetch_warning": fetch_warning,
     }
 
