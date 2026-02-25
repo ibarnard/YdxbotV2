@@ -1984,9 +1984,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 current_tag_exact = current.get("current_tag", "") or ""
                 nearest_tag = current.get("nearest_tag", "") or ""
                 if current_tag_exact:
-                    current_tag_display = current_tag_exact
+                    current_tag_display = current_tag_exact.upper()
                 elif nearest_tag:
-                    current_tag_display = f"无（最近Tag: {nearest_tag}）"
+                    current_tag_display = f"无（最近: {nearest_tag}）"
                 else:
                     current_tag_display = "无"
 
@@ -1997,27 +1997,33 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 recent_tags = result.get("recent_tags", []) or []
                 recent_commits = result.get("recent_commits", []) or []
 
-                latest_updatable_tag = pending_tags[0] if pending_tags else "无（已是最新）"
-                if remote_head_short in {"", "-", "unknown"}:
-                    latest_test_commit = "无"
-                elif remote_head_short == current_short:
-                    latest_test_commit = f"{remote_head_short}（已是当前）"
-                elif remote_head_tag:
-                    latest_test_commit = f"{remote_head_short}（Tag: {remote_head_tag}）"
+                latest_tag_target = pending_tags[0] if pending_tags else ""
+                if latest_tag_target:
+                    latest_tag_line = f"{latest_tag_target}（复制 `update {latest_tag_target}`）"
                 else:
-                    latest_test_commit = f"{remote_head_short}（未打 Tag）"
+                    latest_tag_line = "无（已是最新）"
+
+                latest_commit_target = ""
+                if remote_head_short not in {"", "-", "unknown"} and remote_head_short != current_short:
+                    latest_commit_target = remote_head_short
+
+                if latest_commit_target:
+                    extra_tag_note = f" | Tag:{remote_head_tag}" if remote_head_tag else " | 未打Tag"
+                    latest_commit_line = f"{latest_commit_target}{extra_tag_note}（复制 `update {latest_commit_target}`）"
+                else:
+                    latest_commit_line = "无（已是最新）"
 
                 lines = [
                     "📦 版本信息概览",
-                    f"当前版本（Tag）：{current_tag_display}",
-                    f"当前提交（Commit）：{current_short}",
-                    f"最新可更新 Tag：{latest_updatable_tag}",
-                    f"最新可测试 Commit：{latest_test_commit}",
+                    f"当前 Tag：{current_tag_display}",
+                    f"当前Commit：{current_short}",
+                    f"最新 Tag：{latest_tag_line}",
+                    f"最新Commit：{latest_commit_line}",
                     "",
                     "⚠️  操作提示：",
                     "- update <Tag版本号|Commit哈希>：更新到指定版本/提交",
                     "- reback <Tag版本号|Commit哈希>：回滚到指定版本/提交",
-                    "- restart：重启应用（版本切换后生效）",
+                    "- restart：重启应用",
                     "",
                     "🔖 最近 3 个正式版本（Tag，新→旧）",
                 ]
