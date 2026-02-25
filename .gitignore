@@ -42,6 +42,7 @@ ENV/
 
 # 日志文件
 *.log
+*.log.*
 .release_state.json
 .release_rollback.json
 .update.lock
@@ -53,3 +54,6 @@ ENV/
 # 会话文件
 *.session
 *.session-journal
+
+# macOS
+.DS_Store
