@@ -543,7 +543,8 @@ def test_build_yc_result_message_uses_codeblock_table():
     assert "🎯 策略参数" in msg
     assert "策略命令: 1 13 3.0 2.1 2.1 2.05 3000" in msg
     assert "🎯 策略总结:" in msg
-    assert "连数|倍率|下注金额| 盈利 |累计损失" in msg
+    assert "资金最多连数:" in msg
+    assert "连数|倍率|下注金额| 盈利 |累计损失|所需本金" in msg
     assert msg.count("```") == 2
 
 
@@ -865,7 +866,7 @@ def test_st_command_triggers_auto_yc_report(tmp_path, monkeypatch):
     assert any("预设启动成功: yc05" in msg for msg in sent_messages)
     assert any("🔮 已根据当前预设自动测算" in msg for msg in sent_messages)
     assert any("🎯 策略参数" in msg for msg in sent_messages)
-    assert any("连数|倍率|下注金额| 盈利 |累计损失" in msg for msg in sent_messages)
+    assert any("连数|倍率|下注金额| 盈利 |累计损失|所需本金" in msg for msg in sent_messages)
 
 
 def test_xx_command_cleans_messages_in_config_groups(tmp_path, monkeypatch):

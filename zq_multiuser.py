@@ -2401,6 +2401,7 @@ def _calculate_yc_sequence(params):
             bet = max_single_bet_limit
             capped = True
 
+        required_principal = cumulative_loss
         cumulative_loss += bet
         profit_if_win = bet - (cumulative_loss - bet)
         rows.append(
@@ -2410,6 +2411,7 @@ def _calculate_yc_sequence(params):
                 "bet": bet,
                 "profit_if_win": profit_if_win,
                 "cumulative_loss": cumulative_loss,
+                "required_principal": required_principal,
             }
         )
         prev_bet = bet
@@ -2454,6 +2456,20 @@ def _build_yc_result_message(params, preset_name: str, current_fund: int, auto_t
     effective_streak = start_streak + len(rows) - 1 if rows else start_streak
     effective_profit = rows[-1]["profit_if_win"] if rows else 0
     fund_text = f"{format_number(current_fund)} ({fmt_wan(current_fund)}万)" if current_fund > 0 else "未设置"
+    cover_streak = 0
+    cover_required = 0
+    cover_profit = 0
+    if current_fund > 0 and rows:
+        cover_rows = [row for row in rows if row["cumulative_loss"] <= current_fund]
+        if cover_rows:
+            cover_row = cover_rows[-1]
+            cover_streak = int(cover_row["streak"])
+            cover_required = int(cover_row["cumulative_loss"])
+            cover_profit = int(cover_row["profit_if_win"])
+    elif rows:
+        cover_streak = int(effective_streak)
+        cover_required = int(total_investment)
+        cover_profit = int(effective_profit)
 
     lines = []
     if header_line:
@@ -2468,16 +2484,16 @@ def _build_yc_result_message(params, preset_name: str, current_fund: int, auto_t
             f"🏁 起始连数: {params['continuous']}",
             f"🔢 下注次数: {params['lose_stop']}次",
             f"💰 首注金额: {fmt_wan(int(params['initial_amount']))}万",
-            f"💰单注上限: {max_single_bet_limit / 10000:,.0f}万",
+            f"💰 单注上限: {max_single_bet_limit / 10000:,.0f}万",
             "",
             "🎯 策略总结:",
             f"菠菜资金：{fund_text}",
-            f"盈利有效连数: {effective_streak}连",
-            f"{effective_streak}连所需本金: {fmt_wan(total_investment)}万",
-            f"{effective_streak}连可获得盈利: {fmt_wan(effective_profit)}万",
+            f"资金最多连数: {cover_streak}连",
+            f"{cover_streak}连所需本金: {fmt_wan(cover_required)}万",
+            f"{cover_streak}连获得盈利: {fmt_wan(cover_profit)}万",
             "",
-            "连数|倍率|下注金额| 盈利 |累计损失",
-            "---|----|------|------|------",
+            "连数|倍率|下注金额| 盈利 |累计损失|所需本金",
+            "---|----|------|------|------|------",
         ]
     )
 
@@ -2490,7 +2506,8 @@ def _build_yc_result_message(params, preset_name: str, current_fund: int, auto_t
             f"{multiplier_text.center(4)}|"
             f"{fmt_table_wan(row['bet']).center(6)}|"
             f"{fmt_table_wan(row['profit_if_win']).center(6)}|"
-            f"{fmt_table_wan(row['cumulative_loss']).center(6)}"
+            f"{fmt_table_wan(row['cumulative_loss']).center(6)}|"
+            f"{fmt_table_wan(row['required_principal']).center(6)}"
         )
         lines.append(row_text)
 
