@@ -735,6 +735,7 @@ def test_process_settle_lose_warning_matches_master_style(tmp_path, monkeypatch)
     rt["gambling_fund"] = 9_000_000
     rt["current_round"] = 1
     rt["current_bet_seq"] = 2
+    rt["current_preset_name"] = "yc10"
     ctx.state.bet_sequence_log = [{"bet_id": "20260223_1_1", "profit": None}]
 
     captured = {}
@@ -767,6 +768,7 @@ def test_process_settle_lose_warning_matches_master_style(tmp_path, monkeypatch)
     assert captured["type"] == "lose_streak"
     assert "⚠️ 1 连输告警 ⚠️" in captured["message"]
     assert "第 1 轮第 1 次" in captured["message"]
+    assert "📋 预设名称：yc10" in captured["message"]
     assert "💰 账户余额：" in captured["message"]
     assert "🤖 当局 AI 预测提示" not in captured["message"]
 
@@ -793,6 +795,7 @@ def test_process_settle_lose_end_message_contains_balance_lines(tmp_path, monkey
     rt["lose_start_info"] = {"round": 1, "seq": 5, "fund": 24_566_390}
     rt["current_round"] = 1
     rt["current_bet_seq"] = 10
+    rt["current_preset_name"] = "yc10"
     rt["account_balance"] = 24_634_900
     rt["gambling_fund"] = 24_567_390
     ctx.state.bet_sequence_log = [{"bet_id": "20260224_1_9", "profit": None}]
@@ -827,11 +830,43 @@ def test_process_settle_lose_end_message_contains_balance_lines(tmp_path, monkey
     msg = captured["message"]
     assert "✅ 连输已终止！✅" in msg
     assert "🔢 " in msg and "第 1 轮第 5 次 至 第 9 次" in msg
+    assert "📋 预设名称：yc10" in msg
     assert "😀 连续押注：4 次" in msg
     assert "⚠️本局连输： 3 次" in msg
     assert "💰 本局盈利： 1,990" in msg
     assert "💰 账户余额：2463.49 万" in msg
     assert "💰 菠菜资金剩余：2456.84 万" in msg
+
+
+def test_format_dashboard_shows_software_version_and_preset_lines(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5013"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "仪表盘用户"},
+            "telegram": {"user_id": 5013},
+            "groups": {"admin_chat": 5013},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["current_preset_name"] = "yc10"
+    rt["continuous"] = 1
+    rt["lose_stop"] = 11
+    rt["lose_once"] = 2.8
+    rt["lose_twice"] = 2.3
+    rt["lose_three"] = 2.2
+    rt["lose_four"] = 2.05
+    rt["initial_amount"] = 10000
+    ctx.state.history = [1, 0] * 20
+
+    monkeypatch.setattr(zm, "get_current_repo_info", lambda: {"current_tag": "v1.0.10", "nearest_tag": "v1.0.10", "short_commit": "abcd1234"})
+
+    msg = zm.format_dashboard(ctx)
+    assert "🔢 **软件版本：v1.0.10(abcd1234)**" in msg
+    assert "📋 **预设名称：yc10**" in msg
+    assert "🤖 **预设参数：1 11 2.8 2.3 2.2 2.05 10000**" in msg
 
 
 def test_st_command_triggers_auto_yc_report(tmp_path, monkeypatch):

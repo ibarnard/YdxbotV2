@@ -22,6 +22,7 @@ from user_manager import UserContext
 from typing import Dict, Any
 import constants
 from update_manager import (
+    get_current_repo_info,
     list_version_catalog,
     reback_to_version,
     restart_process,
@@ -62,6 +63,19 @@ def format_number(num):
     return f"{int(num):,}"
 
 
+def get_software_version_text() -> str:
+    """返回软件版本展示：tag(hash)。"""
+    try:
+        info = get_current_repo_info()
+        short_commit = info.get("short_commit", "") or "unknown"
+        tag = info.get("current_tag", "") or info.get("nearest_tag", "")
+        if tag:
+            return f"{tag}({short_commit})"
+        return short_commit
+    except Exception:
+        return "unknown"
+
+
 # 仪表盘格式化 - 与master版本保持一致
 def format_dashboard(user_ctx: UserContext) -> str:
     """生成并返回仪表盘信息 - 与master版本format_dashboard一致"""
@@ -74,9 +88,16 @@ def format_dashboard(user_ctx: UserContext) -> str:
         " ".join(map(str, reversed_data[i:i + 10])) 
         for i in range(0, len(reversed_data), 10)
     )}\n\n———————————————\n🎯 **策略设定**\n"""
-    mes += "🔢 **算法版本：V10**\n"
+    mes += f"🔢 **软件版本：{get_software_version_text()}**\n"
     mes += f"🤖 **模型 API：{rt.get('current_model_id', 'unknown')}**\n"
-    mes += f"📋 **当前预设：{rt.get('current_preset_name', 'none')} {rt.get('continuous', 1)} {rt.get('lose_stop', 13)} {rt.get('lose_once', 3.0)} {rt.get('lose_twice', 2.1)} {rt.get('lose_three', 2.05)} {rt.get('lose_four', 2.0)} {rt.get('initial_amount', 500)}**\n"
+    preset_name = rt.get("current_preset_name", "none")
+    preset_params = (
+        f"{rt.get('continuous', 1)} {rt.get('lose_stop', 13)} "
+        f"{rt.get('lose_once', 3.0)} {rt.get('lose_twice', 2.1)} "
+        f"{rt.get('lose_three', 2.05)} {rt.get('lose_four', 2.0)} {rt.get('initial_amount', 500)}"
+    )
+    mes += f"📋 **预设名称：{preset_name}**\n"
+    mes += f"🤖 **预设参数：{preset_params}**\n"
     mes += f"💰 **初始金额：{rt.get('initial_amount', 500)}**\n⏹ **押注 {rt.get('lose_stop', 13)} 次停止**\n"
     mes += f"💥 **炸 {rt.get('explode', 5)} 次，暂停 {rt.get('stop', 3)} 局**\n📚 **押注倍率：{rt.get('lose_once', 3.0)} / {rt.get('lose_twice', 2.1)} / {rt.get('lose_three', 2.05)} / {rt.get('lose_four', 2.0)}**\n\n"
     
@@ -1269,9 +1290,11 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
 
                                 date_str = datetime.now().strftime("%m月%d日")
                                 bet_dir_str = "大" if prediction == 1 else "小"
+                                preset_name = rt.get("current_preset_name", "none")
                                 warn_msg = (
                                     f"⚠️ {rt.get('lose_count', 0)} 连输告警 ⚠️\n"
                                     f"🔢 {date_str} 第 {settle_round} 轮第 {settle_seq} 次：\n"
+                                    f"📋 预设名称：{preset_name}\n"
                                     f"😀 连续押注：{rt.get('bet_sequence_count', 0)} 次\n"
                                     f"⚡️ 押注方向：{bet_dir_str}\n"
                                     f"💵 押注本金：{format_number(bet_amount)}\n"
@@ -1517,6 +1540,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             rec_msg = (
                 f"✅ 连输已终止！✅\n"
                 f"🔢 {range_text}\n"
+                f"📋 预设名称：{rt.get('current_preset_name', 'none')}\n"
                 f"😀 连续押注：{lose_end_payload.get('continuous_count', lose_end_payload.get('lose_count', 0) + 1)} 次\n"
                 f"⚠️本局连输： {lose_end_payload.get('lose_count', 0)} 次\n"
                 f"💰 本局盈利： {format_number(lose_end_payload.get('total_profit', 0))}\n"
