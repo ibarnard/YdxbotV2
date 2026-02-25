@@ -2375,6 +2375,7 @@ def _parse_yc_params(args, presets):
 def _calculate_yc_sequence(params):
     initial = max(0, int(params["initial_amount"]))
     lose_stop = max(1, int(params["lose_stop"]))
+    table_steps = 15
     multipliers = [
         float(params["lose_once"]),
         float(params["lose_twice"]),
@@ -2387,9 +2388,8 @@ def _calculate_yc_sequence(params):
     rows = []
     prev_bet = initial
     cumulative_loss = 0
-    capped = False
 
-    for i in range(lose_stop):
+    for i in range(table_steps):
         if i == 0:
             multiplier = 1.0
             bet = initial
@@ -2399,9 +2399,7 @@ def _calculate_yc_sequence(params):
 
         if bet > max_single_bet_limit:
             bet = max_single_bet_limit
-            capped = True
 
-        required_principal = cumulative_loss
         cumulative_loss += bet
         profit_if_win = bet - (cumulative_loss - bet)
         rows.append(
@@ -2411,32 +2409,39 @@ def _calculate_yc_sequence(params):
                 "bet": bet,
                 "profit_if_win": profit_if_win,
                 "cumulative_loss": cumulative_loss,
-                "required_principal": required_principal,
             }
         )
         prev_bet = bet
 
-        if capped:
-            break
-
     total_investment = rows[-1]["cumulative_loss"] if rows else 0
     max_bet = max((row["bet"] for row in rows), default=0)
+    effective_rows = rows[:lose_stop]
+    effective_streak = effective_rows[-1]["streak"] if effective_rows else start_streak
+    effective_investment = effective_rows[-1]["cumulative_loss"] if effective_rows else 0
+    effective_profit = effective_rows[-1]["profit_if_win"] if effective_rows else 0
     return {
         "rows": rows,
         "total_investment": total_investment,
         "max_bet": max_bet,
         "max_single_bet_limit": max_single_bet_limit,
-        "capped": capped,
         "start_streak": start_streak,
+        "lose_stop": lose_stop,
+        "table_steps": table_steps,
+        "effective_rows": effective_rows,
+        "effective_streak": effective_streak,
+        "effective_investment": effective_investment,
+        "effective_profit": effective_profit,
     }
 
 
 def _build_yc_result_message(params, preset_name: str, current_fund: int, auto_trigger: bool) -> str:
     calc = _calculate_yc_sequence(params)
     rows = calc["rows"]
-    total_investment = calc["total_investment"]
+    effective_rows = calc["effective_rows"]
+    effective_streak = calc["effective_streak"]
+    effective_investment = calc["effective_investment"]
+    effective_profit = calc["effective_profit"]
     max_single_bet_limit = calc["max_single_bet_limit"]
-    start_streak = calc["start_streak"]
 
     def fmt_wan(value: int) -> str:
         return f"{value / 10000:,.1f}"
@@ -2453,22 +2458,20 @@ def _build_yc_result_message(params, preset_name: str, current_fund: int, auto_t
         f"{params['lose_once']} {params['lose_twice']} {params['lose_three']} {params['lose_four']} {params['initial_amount']}"
     )
 
-    effective_streak = start_streak + len(rows) - 1 if rows else start_streak
-    effective_profit = rows[-1]["profit_if_win"] if rows else 0
-    fund_text = f"{format_number(current_fund)} ({fmt_wan(current_fund)}万)" if current_fund > 0 else "未设置"
+    fund_text = f"{fmt_wan(current_fund)}万" if current_fund > 0 else "未设置"
     cover_streak = 0
     cover_required = 0
     cover_profit = 0
-    if current_fund > 0 and rows:
-        cover_rows = [row for row in rows if row["cumulative_loss"] <= current_fund]
+    if current_fund > 0 and effective_rows:
+        cover_rows = [row for row in effective_rows if row["cumulative_loss"] <= current_fund]
         if cover_rows:
             cover_row = cover_rows[-1]
             cover_streak = int(cover_row["streak"])
             cover_required = int(cover_row["cumulative_loss"])
             cover_profit = int(cover_row["profit_if_win"])
-    elif rows:
+    elif effective_rows:
         cover_streak = int(effective_streak)
-        cover_required = int(total_investment)
+        cover_required = int(effective_investment)
         cover_profit = int(effective_profit)
 
     lines = []
@@ -2492,8 +2495,8 @@ def _build_yc_result_message(params, preset_name: str, current_fund: int, auto_t
             f"{cover_streak}连所需本金: {fmt_wan(cover_required)}万",
             f"{cover_streak}连获得盈利: {fmt_wan(cover_profit)}万",
             "",
-            "连数|倍率|下注金额| 盈利 |累计损失|所需本金",
-            "---|----|------|------|------|------",
+            "连数|倍率|下注| 盈利 |所需本金",
+            "---|----|------|------|------",
         ]
     )
 
@@ -2506,14 +2509,9 @@ def _build_yc_result_message(params, preset_name: str, current_fund: int, auto_t
             f"{multiplier_text.center(4)}|"
             f"{fmt_table_wan(row['bet']).center(6)}|"
             f"{fmt_table_wan(row['profit_if_win']).center(6)}|"
-            f"{fmt_table_wan(row['cumulative_loss']).center(6)}|"
-            f"{fmt_table_wan(row['required_principal']).center(6)}"
+            f"{fmt_table_wan(row['cumulative_loss']).center(6)}"
         )
         lines.append(row_text)
-
-    if calc["capped"]:
-        lines.append("")
-        lines.append("※ 注意: 后续连数已触发单注上限，测算仅供参考。")
 
     lines.append("```")
     return "\n".join(lines)
