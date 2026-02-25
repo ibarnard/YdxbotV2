@@ -14,7 +14,6 @@ Ydxbot 的多账号版本，面向同一进程管理多个 Telegram 账号的自
 - `zq_multiuser.py`：下注、结算、通知、命令处理
 - `user_manager.py`：用户配置加载、状态持久化
 - `update_manager.py`：版本检查、发布更新、回滚逻辑
-- `scripts/ydxbot_tmux.sh`：tmux 一键运维脚本（start/stop/restart/status/attach/logs）
 - `shared/global.example.json`：公开仓库可提交的脱敏共享配置模板
 - `users/_template/`：用户配置与状态模板
 
@@ -59,29 +58,12 @@ python3 main_multiuser.py
 ## 从空白 VPS 部署（推荐：tmux）
 以下步骤适用于 Ubuntu/Debian 新机器，目标目录为 `/opt/YdxbotV2`。
 
-1. 安装系统依赖（含 tmux）
+1. 一条命令安装（拉代码 + venv + 依赖 + tmux 会话）
 ```bash
-apt update
-apt install -y git python3 python3-venv python3-pip tmux curl
+bash -lc 'set -e; apt update; apt install -y git python3 python3-venv python3-pip tmux curl; if [ ! -d /opt/YdxbotV2/.git ]; then git clone https://github.com/ibarnard/YdxbotV2.git /opt/YdxbotV2; fi; cd /opt/YdxbotV2; git fetch origin --tags; git checkout main; git pull --ff-only origin main; [ -d venv ] || python3 -m venv venv; . venv/bin/activate; python -m pip install -U pip; pip install -r requirements.txt; tmux has-session -t ydxbot 2>/dev/null || tmux new-session -d -s ydxbot -c /opt/YdxbotV2'
 ```
 
-2. 拉取代码
-```bash
-cd /opt
-git clone https://github.com/ibarnard/YdxbotV2.git
-cd /opt/YdxbotV2
-```
-
-3. 创建虚拟环境并安装 Python 依赖
-```bash
-python3 -m venv venv
-source venv/bin/activate
-python -m pip install -U pip
-pip install -r requirements.txt
-chmod +x scripts/ydxbot_tmux.sh
-```
-
-4. 准备共享配置
+2. 准备共享配置
 ```bash
 cp shared/global.example.json shared/global.json
 ```
@@ -91,7 +73,7 @@ cp shared/global.example.json shared/global.json
 - `notification`
 - `proxy`（如需代理）
 
-5. 创建用户目录（示例：`shuji`）
+3. 创建用户目录（示例：`shuji`）
 ```bash
 mkdir -p users/shuji
 cp users/_template/config.json.template users/shuji/config.json
@@ -100,68 +82,72 @@ cp users/_template/presets.json.default users/shuji/presets.json
 ```
 然后编辑 `users/shuji/config.json`，填写 `api_id/api_hash/session_name/user_id/cookie/x_csrf` 等私有信息。
 
-6. 上传 session 文件
+4. 上传 session 文件
 - 将 `session_name` 对应的 `.session` 文件放入该用户目录，例如：`users/shuji/<session_name>.session`。
 
-7. 用一键脚本启动（tmux）
+5. 进入 tmux 并手动启动脚本（你要求的方式）
 ```bash
+tmux attach -t ydxbot
 cd /opt/YdxbotV2
-./scripts/ydxbot_tmux.sh start
+source venv/bin/activate
+python -u main_multiuser.py
 ```
 
-8. tmux/脚本常用操作
+6. tmux 常用操作
 ```bash
-# 查看运行状态
-./scripts/ydxbot_tmux.sh status
+# 退出 tmux 窗口但保持脚本运行
+# 按键: Ctrl+b 然后 d
 
-# 进入控制台（实时输出）
-./scripts/ydxbot_tmux.sh attach
+# 重新进入会话
+tmux attach -t ydxbot
 
-# 停止脚本
-./scripts/ydxbot_tmux.sh stop
-
-# 重启脚本
-./scripts/ydxbot_tmux.sh restart
+# 查看当前会话
+tmux ls
 ```
 
-9. 重启脚本（tmux 模式）
+7. 重启脚本（tmux 模式）
 ```bash
+tmux attach -t ydxbot
+# 在会话里按 Ctrl+C 停止
 cd /opt/YdxbotV2
-./scripts/ydxbot_tmux.sh restart
+source venv/bin/activate
+python -u main_multiuser.py
 ```
 
-10. 开机后启动（tmux）
+8. 开机后启动（tmux）
 ```bash
-cd /opt/YdxbotV2
-./scripts/ydxbot_tmux.sh start
+tmux has-session -t ydxbot 2>/dev/null || tmux new-session -d -s ydxbot -c /opt/YdxbotV2
+tmux send-keys -t ydxbot 'cd /opt/YdxbotV2 && source venv/bin/activate && python -u main_multiuser.py' C-m
 ```
 
 ## 代码更新流程（tmux）
 更新到最新 `main`：
 ```bash
-cd /opt/YdxbotV2
-./scripts/ydxbot_tmux.sh stop
+tmux attach -t ydxbot
+# 在 tmux 里 Ctrl+C 停止脚本
 
+cd /opt/YdxbotV2
 git fetch origin --tags
 git checkout main
 git pull --ff-only origin main
 
 source venv/bin/activate
 pip install -r requirements.txt
-./scripts/ydxbot_tmux.sh start
+python -u main_multiuser.py
 ```
 
 更新到指定版本/提交：
 ```bash
-cd /opt/YdxbotV2
-./scripts/ydxbot_tmux.sh stop
+tmux attach -t ydxbot
+# Ctrl+C
 
+cd /opt/YdxbotV2
 git fetch origin --tags
 git checkout <tag或commit>
 
 source venv/bin/activate
 pip install -r requirements.txt
-./scripts/ydxbot_tmux.sh start
+python -u main_multiuser.py
 ```
 
 如果更新时提示本地配置文件冲突，建议先备份后恢复：
@@ -256,11 +242,7 @@ systemctl restart ydxbot
 tmux 模式下：
 ```bash
 # 直接看实时控制台输出
-./scripts/ydxbot_tmux.sh attach
-
-# 脚本自带日志查看（bot/numai/user/all）
-./scripts/ydxbot_tmux.sh logs bot
-./scripts/ydxbot_tmux.sh logs all
+tmux attach -t ydxbot
 
 # 查看业务日志文件
 tail -f /opt/YdxbotV2/bot.log
@@ -314,9 +296,9 @@ PY
 
 4. tmux 会话找不到
 ```bash
-./scripts/ydxbot_tmux.sh status
-./scripts/ydxbot_tmux.sh start
-./scripts/ydxbot_tmux.sh attach
+tmux ls
+tmux new-session -d -s ydxbot -c /opt/YdxbotV2
+tmux attach -t ydxbot
 ```
 
 ## 公开仓库安全说明
