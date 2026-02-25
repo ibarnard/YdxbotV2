@@ -816,7 +816,7 @@ async def process_red_packet(client, event, user_ctx: UserContext, global_config
         return
 
     text = (getattr(event, "raw_text", None) or getattr(event, "text", None) or "").strip()
-    if "灵石" not in text:
+    if not text:
         return
 
     reply_markup = getattr(event, "reply_markup", None)
@@ -824,16 +824,46 @@ async def process_red_packet(client, event, user_ctx: UserContext, global_config
     if not rows:
         return
 
-    first_row = rows[0]
-    buttons = getattr(first_row, "buttons", None)
-    if not buttons:
+    red_keywords = ("红包", "领取", "抢红包", "red", "packet", "hongbao", "claim")
+    game_keywords = ("游戏", "对战", "闯关", "开局", "竞猜", "匹配", "挑战", "start game")
+    lower_text = text.lower()
+
+    callback_buttons = []
+    red_button_candidates = []
+    for row_idx, row in enumerate(rows):
+        for btn_idx, btn in enumerate(getattr(row, "buttons", None) or []):
+            btn_data = getattr(btn, "data", None)
+            if not btn_data:
+                continue
+            btn_text = str(getattr(btn, "text", "") or "")
+            try:
+                data_text = btn_data.decode("utf-8", errors="ignore") if isinstance(btn_data, (bytes, bytearray)) else str(btn_data)
+            except Exception:
+                data_text = str(btn_data)
+
+            text_l = btn_text.lower()
+            data_l = data_text.lower()
+            callback_buttons.append((row_idx, btn_idx, btn_data, text_l, data_l))
+
+            if any(k in text_l for k in red_keywords) or any(k in data_l for k in red_keywords):
+                red_button_candidates.append((row_idx, btn_idx, btn_data, text_l, data_l))
+
+    if not callback_buttons:
         return
 
-    button = buttons[0]
-    button_data = getattr(button, "data", None)
-    if not button_data:
-        log_event(logging.WARNING, "red_packet", "红包按钮无效", user_id=user_ctx.user_id)
+    has_red_text = ("灵石" in text and "红包" in text) or any(k in lower_text for k in ("抢红包", "领取红包"))
+    has_game_hint = any(k in lower_text for k in game_keywords)
+
+    # 仅处理明确红包消息；若是游戏提示且没有红包信号，直接忽略
+    if not has_red_text and not red_button_candidates:
         return
+    if has_game_hint and not has_red_text and not red_button_candidates:
+        return
+
+    # 优先红包候选按钮，否则回退第一个可点击按钮（兼容旧脚本）
+    target_row_idx, target_btn_idx, button_data, _, _ = (
+        red_button_candidates[0] if red_button_candidates else callback_buttons[0]
+    )
 
     log_event(
         logging.INFO,
@@ -846,14 +876,14 @@ async def process_red_packet(client, event, user_ctx: UserContext, global_config
     from telethon.tl import functions as tl_functions
     import re
 
-    max_attempts = 3
+    max_attempts = 30
     for attempt in range(max_attempts):
         try:
             try:
-                await event.click(0, 0)
+                await event.click(target_row_idx, target_btn_idx)
             except Exception:
                 await event.click(button_data)
-            await asyncio.sleep(random.uniform(0.5, 1.0))
+            await asyncio.sleep(1)
 
             response = await client(
                 tl_functions.messages.GetBotCallbackAnswerRequest(
@@ -867,7 +897,7 @@ async def process_red_packet(client, event, user_ctx: UserContext, global_config
             if "已获得" in response_msg:
                 bonus_match = re.search(r"已获得\s*(\d+)\s*灵石", response_msg)
                 bonus = bonus_match.group(1) if bonus_match else "未知数量"
-                mes = f"🎉 抢到红包 {bonus} 灵石！"
+                mes = f"🎉 抢到红包{bonus}灵石！"
                 log_event(
                     logging.INFO,
                     "red_packet",
@@ -879,6 +909,7 @@ async def process_red_packet(client, event, user_ctx: UserContext, global_config
                 return
 
             if any(flag in response_msg for flag in ("不能重复领取", "来晚了", "领过")):
+                mes = "⚠️ 抢到红包，但是没有获取到灵石数量！"
                 log_event(
                     logging.INFO,
                     "red_packet",
@@ -886,6 +917,7 @@ async def process_red_packet(client, event, user_ctx: UserContext, global_config
                     user_id=user_ctx.user_id,
                     response=response_msg,
                 )
+                await send_to_admin(client, mes, user_ctx, global_config)
                 return
 
             log_event(
@@ -907,7 +939,7 @@ async def process_red_packet(client, event, user_ctx: UserContext, global_config
             )
 
         if attempt < max_attempts - 1:
-            await asyncio.sleep(random.uniform(1.5, 2.5) * (attempt + 1))
+            await asyncio.sleep(1)
 
     log_event(
         logging.WARNING,

@@ -973,4 +973,59 @@ def test_process_red_packet_claim_success_sends_admin_notice(tmp_path, monkeypat
     asyncio.run(zm.process_red_packet(DummyClient(), event, ctx, {}))
 
     assert event.clicked
-    assert sent.get("message") == "🎉 抢到红包 88 灵石！"
+    assert sent.get("message") == "🎉 抢到红包88灵石！"
+
+
+def test_process_red_packet_ignores_game_message(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5012"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "游戏过滤用户"},
+            "telegram": {"user_id": 5012},
+            "groups": {"admin_chat": 5012, "zq_bot": 9001},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent = {"called": False}
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent["called"] = True
+        return SimpleNamespace(chat_id=5012, id=1)
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    class DummyClient:
+        async def __call__(self, request):
+            raise AssertionError("游戏消息不应触发红包回调请求")
+
+    class DummyButton:
+        data = b"game-start"
+        text = "开始游戏"
+
+    class DummyRow:
+        buttons = [DummyButton()]
+
+    class DummyMarkup:
+        rows = [DummyRow()]
+
+    class DummyEvent:
+        sender_id = 9001
+        raw_text = "灵石对战游戏开始啦"
+        text = "灵石对战游戏开始啦"
+        chat_id = -10001
+        id = 109
+        reply_markup = DummyMarkup()
+
+        def __init__(self):
+            self.clicked = []
+
+        async def click(self, *args):
+            self.clicked.append(args)
+
+    event = DummyEvent()
+    asyncio.run(zm.process_red_packet(DummyClient(), event, ctx, {}))
+
+    assert event.clicked == []
+    assert sent["called"] is False
