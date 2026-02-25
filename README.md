@@ -7,6 +7,7 @@ Ydxbot 的多账号版本，面向同一进程管理多个 Telegram 账号的自
 - 共享配置：代理、AI、群组、通知统一在 `shared` 下管理。
 - 风控能力：连输告警、炸号暂停、盈利暂停、手动暂停/恢复。
 - 在线更新：支持 `ver / update / reback / restart`（兼容旧命令别名）。
+- 运维方式：支持 `tmux`（推荐）与 `systemd`（可选）。
 
 ## 目录结构
 - `main_multiuser.py`：多用户主入口
@@ -54,7 +55,127 @@ cp users/_template/presets.json.default users/xu/presets.json
 python3 main_multiuser.py
 ```
 
-## 推荐运行方式（systemd）
+## 从空白 VPS 部署（推荐：tmux）
+以下步骤适用于 Ubuntu/Debian 新机器，目标目录为 `/opt/YdxbotV2`。
+
+1. 安装系统依赖（含 tmux）
+```bash
+apt update
+apt install -y git python3 python3-venv python3-pip tmux curl
+```
+
+2. 拉取代码
+```bash
+cd /opt
+git clone https://github.com/ibarnard/YdxbotV2.git
+cd /opt/YdxbotV2
+```
+
+3. 创建虚拟环境并安装 Python 依赖
+```bash
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -U pip
+pip install -r requirements.txt
+```
+
+4. 准备共享配置
+```bash
+cp shared/global.example.json shared/global.json
+```
+编辑 `shared/global.json`，重点填写：
+- `groups`（`zq_group` / `zq_bot` / `admin_chat` / `monitor`）
+- `ai`
+- `notification`
+- `proxy`（如需代理）
+
+5. 创建用户目录（示例：`shuji`）
+```bash
+mkdir -p users/shuji
+cp users/_template/config.json.template users/shuji/config.json
+cp users/_template/state.json.default users/shuji/state.json
+cp users/_template/presets.json.default users/shuji/presets.json
+```
+然后编辑 `users/shuji/config.json`，填写 `api_id/api_hash/session_name/user_id/cookie/x_csrf` 等私有信息。
+
+6. 上传 session 文件
+- 将 `session_name` 对应的 `.session` 文件放入该用户目录，例如：`users/shuji/<session_name>.session`。
+
+7. 用 tmux 启动脚本
+```bash
+cd /opt/YdxbotV2
+source venv/bin/activate
+tmux new -s ydxbot
+python -u main_multiuser.py
+```
+
+8. tmux 常用操作
+```bash
+# 退出 tmux 窗口但保持脚本运行
+# 按键: Ctrl+b 然后 d
+
+# 重新进入会话
+tmux attach -t ydxbot
+
+# 查看当前会话
+tmux ls
+```
+
+9. 重启脚本（tmux 模式）
+```bash
+tmux attach -t ydxbot
+# 在会话里按 Ctrl+C 停止
+cd /opt/YdxbotV2
+source venv/bin/activate
+python -u main_multiuser.py
+```
+
+10. 开机后启动（tmux）
+```bash
+cd /opt/YdxbotV2
+tmux kill-session -t ydxbot 2>/dev/null || true
+tmux new-session -d -s ydxbot 'cd /opt/YdxbotV2 && . venv/bin/activate && unset YDXBOT_SYSTEMD_SERVICE SYSTEMD_SERVICE && exec python -u main_multiuser.py'
+tmux attach -t ydxbot
+```
+
+## 代码更新流程（tmux）
+更新到最新 `main`：
+```bash
+tmux attach -t ydxbot
+# 在 tmux 里 Ctrl+C 停止脚本
+
+cd /opt/YdxbotV2
+git fetch origin --tags
+git checkout main
+git pull --ff-only origin main
+
+source venv/bin/activate
+pip install -r requirements.txt
+python -u main_multiuser.py
+```
+
+更新到指定版本/提交：
+```bash
+tmux attach -t ydxbot
+# Ctrl+C
+
+cd /opt/YdxbotV2
+git fetch origin --tags
+git checkout <tag或commit>
+
+source venv/bin/activate
+pip install -r requirements.txt
+python -u main_multiuser.py
+```
+
+如果更新时提示本地配置文件冲突，建议先备份后恢复：
+```bash
+cp -f shared/global.json /opt/ydxbot-global.backup.json
+# 执行 git 更新后再恢复
+cp -f /opt/ydxbot-global.backup.json shared/global.json
+```
+
+## 可选运行方式（systemd）
 不建议长期混用 `nohup` / `tmux`。生产环境建议只用 `systemd` 托管，避免多开、会话锁冲突和“进程在跑但看不到”。
 
 1. 创建服务文件 `/etc/systemd/system/ydxbot.service`
@@ -101,7 +222,7 @@ systemctl start ydxbot
 systemctl disable --now ydxbot
 ```
 
-## 代码更新流程（SSH）
+## 代码更新流程（systemd/SSH）
 ```bash
 cd /opt/YdxbotV2
 git fetch origin --tags
@@ -136,6 +257,17 @@ systemctl restart ydxbot
 - 更新：`ver` `update [版本|提交]` `reback [版本|提交]` `restart`
 
 ## 运行日志查看
+tmux 模式下：
+```bash
+# 直接看实时控制台输出
+tmux attach -t ydxbot
+
+# 查看业务日志文件
+tail -f /opt/YdxbotV2/bot.log
+tail -f /opt/YdxbotV2/numai.log
+tail -f /opt/YdxbotV2/user_manager.log
+```
+
 systemd 托管时，优先看 `journalctl`：
 ```bash
 # 实时日志
@@ -149,13 +281,6 @@ journalctl -u ydxbot --since "30 min ago" --no-pager
 
 # 只看错误
 journalctl -u ydxbot --since "2 hours ago" --no-pager | egrep "ERROR|Traceback|TimeoutError|database is locked"
-```
-
-业务文件日志（程序工作目录下）：
-```bash
-tail -f /opt/YdxbotV2/bot.log
-tail -f /opt/YdxbotV2/numai.log
-tail -f /opt/YdxbotV2/user_manager.log
 ```
 
 ## 常见故障排障
@@ -186,6 +311,13 @@ PY
 - 检查服务名是否与 `Environment=YDXBOT_SYSTEMD_SERVICE=ydxbot.service` 一致。
 - 检查 bot 进程是否由 systemd 启动：`systemctl status ydxbot`。
 - 不要混用 `nohup`/`tmux` 与 `systemd`。
+
+4. tmux 会话找不到
+```bash
+tmux ls
+tmux new-session -d -s ydxbot 'cd /opt/YdxbotV2 && . venv/bin/activate && unset YDXBOT_SYSTEMD_SERVICE SYSTEMD_SERVICE && exec python -u main_multiuser.py'
+tmux attach -t ydxbot
+```
 
 ## 公开仓库安全说明
 - 已默认忽略：`shared/global.json`、`shared/global.local.json`、`*.session`、日志文件。
