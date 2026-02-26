@@ -49,6 +49,17 @@ logger.addHandler(console_handler)
 AUTO_STATS_INTERVAL_ROUNDS = 30
 AUTO_STATS_DELETE_DELAY_SECONDS = 600
 
+# 风控节奏：以最近 30 笔实盘胜率为核心，做弹性暂停（盈利优先，其次控风险）。
+RISK_WINDOW_BETS = 30
+RISK_BASE_TRIGGER_WINS = 12          # 12/30=40%
+RISK_DEEP_TRIGGER_WINS = 13          # 13/30≈43.3%（第5手及以上）
+RISK_DEEP_SEQUENCE_THRESHOLD = 5
+RISK_PAUSE_LIGHT_ROUNDS = 2          # 12胜
+RISK_PAUSE_MID_ROUNDS = 3            # 11胜
+RISK_PAUSE_HEAVY_ROUNDS = 5          # <=10胜
+RISK_PAUSE_DEEP_ONLY_ROUNDS = 2      # 仅深度风控触发时
+RISK_PAUSE_ROUNDS_MAX = 5
+
 
 def log_event(level, module, event, message=None, **kwargs):
     # 兼容旧调用: log_event(level, event, message, user_id, data)
@@ -732,6 +743,40 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     if len(state.history) < 40:
         log_event(logging.INFO, 'bet_on', '历史数据低于40局，继续执行押注', user_id=user_ctx.user_id, data=f'len={len(state.history)}')
 
+    # 自动风控暂停：按最近30笔实盘胜率做弹性暂停；第5手及以上增加深度保护。
+    next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
+    risk_pause = _evaluate_auto_risk_pause(state, next_sequence)
+    if risk_pause.get("triggered"):
+        _apply_auto_risk_pause(rt, risk_pause.get("pause_rounds", RISK_PAUSE_LIGHT_ROUNDS))
+        user_ctx.save_state()
+
+        wins = risk_pause.get("wins", 0)
+        total = risk_pause.get("total", RISK_WINDOW_BETS)
+        win_rate = risk_pause.get("win_rate", 0.0) * 100
+        pause_rounds = risk_pause.get("pause_rounds", RISK_PAUSE_LIGHT_ROUNDS)
+        reason_text = "、".join(risk_pause.get("reasons", [])) or "盘面波动风控"
+        mes = (
+            "⛔ 自动风控暂停\n"
+            f"触发原因：{reason_text}\n"
+            f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
+            f"当前计划连押：第 {next_sequence} 手\n"
+            f"暂停局数：{pause_rounds} 局\n"
+            "动作：已重置到首注，等待盘面修复后自动恢复"
+        )
+        await send_to_admin(client, mes, user_ctx, global_config)
+        log_event(
+            logging.INFO,
+            'bet_on',
+            '触发自动风控暂停',
+            user_id=user_ctx.user_id,
+            data=(
+                f"wins={wins}/{total}, wr={win_rate:.2f}%, "
+                f"next_seq={next_sequence}, pause_rounds={pause_rounds}, "
+                f"deep_guard={risk_pause.get('deep_guard_hit', False)}"
+            ),
+        )
+        return
+
     bet_amount = calculate_bet_amount(rt)
     if bet_amount <= 0:
         rt["bet"] = False
@@ -1122,6 +1167,101 @@ def calculate_bet_amount(rt: dict) -> int:
 
     # 与 master 一致：补 1% 安全边际
     return constants.closest_multiple_of_500(target + target * 0.01)
+
+
+def _get_recent_settled_outcomes(state, window: int = RISK_WINDOW_BETS) -> list:
+    """提取最近 N 笔已结算结果（赢=1，输=0）。"""
+    if window <= 0:
+        return []
+    outcomes = []
+    for entry in reversed(state.bet_sequence_log):
+        result = entry.get("result")
+        if result == "赢":
+            outcomes.append(1)
+        elif result == "输":
+            outcomes.append(0)
+        if len(outcomes) >= window:
+            break
+    outcomes.reverse()
+    return outcomes
+
+
+def _calc_dynamic_pause_rounds(recent_wins: int, window_size: int = RISK_WINDOW_BETS) -> int:
+    """按最近胜场数计算弹性暂停局数。"""
+    if window_size <= 0:
+        return 0
+    if recent_wins <= 10:
+        return RISK_PAUSE_HEAVY_ROUNDS
+    if recent_wins <= 11:
+        return RISK_PAUSE_MID_ROUNDS
+    if recent_wins <= RISK_BASE_TRIGGER_WINS:
+        return RISK_PAUSE_LIGHT_ROUNDS
+    return 0
+
+
+def _evaluate_auto_risk_pause(state, next_sequence: int) -> dict:
+    """
+    评估是否触发自动风控暂停。
+    规则:
+    1) 最近30笔胜率 <=40% 触发基础暂停（2/3/5局）
+    2) 第5手及以上，最近30笔胜率 <=43.3% 触发深度风控
+    """
+    outcomes = _get_recent_settled_outcomes(state, RISK_WINDOW_BETS)
+    total = len(outcomes)
+    if total < RISK_WINDOW_BETS:
+        return {}
+
+    wins = int(sum(outcomes))
+    win_rate = wins / total if total > 0 else 0.0
+    base_pause_rounds = _calc_dynamic_pause_rounds(wins, total)
+    deep_guard_hit = (next_sequence >= RISK_DEEP_SEQUENCE_THRESHOLD and wins <= RISK_DEEP_TRIGGER_WINS)
+
+    if base_pause_rounds <= 0 and not deep_guard_hit:
+        return {}
+
+    if base_pause_rounds > 0 and deep_guard_hit:
+        pause_rounds = min(RISK_PAUSE_ROUNDS_MAX, base_pause_rounds + 1)
+    elif base_pause_rounds > 0:
+        pause_rounds = base_pause_rounds
+    else:
+        pause_rounds = RISK_PAUSE_DEEP_ONLY_ROUNDS
+
+    reasons = []
+    if base_pause_rounds > 0:
+        reasons.append("最近30笔胜率<=40%")
+    if deep_guard_hit:
+        reasons.append("第5手及以上触发深度风控")
+
+    return {
+        "triggered": True,
+        "wins": wins,
+        "total": total,
+        "win_rate": win_rate,
+        "next_sequence": next_sequence,
+        "pause_rounds": pause_rounds,
+        "deep_guard_hit": deep_guard_hit,
+        "reasons": reasons,
+    }
+
+
+def _apply_auto_risk_pause(rt: dict, pause_rounds: int) -> None:
+    """
+    执行自动风控暂停。
+    说明：stop_count 在下注入口每轮先减1，设为 (暂停局数+1) 才能真正停满指定局数。
+    """
+    pause_rounds = max(1, int(pause_rounds))
+    internal_stop_count = pause_rounds + 1
+
+    rt["stop_count"] = max(int(rt.get("stop_count", 0)), internal_stop_count)
+    rt["bet_on"] = False
+    rt["bet"] = False
+    rt["mode_stop"] = False
+    rt["bet_sequence_count"] = 0
+    rt["bet_amount"] = int(rt.get("initial_amount", 500))
+    rt["lose_count"] = 0
+    rt["win_count"] = 0
+    rt["lose_notify_pending"] = False
+    rt["lose_start_info"] = {}
 
 
 def count_consecutive(history):
