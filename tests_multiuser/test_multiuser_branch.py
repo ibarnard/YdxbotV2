@@ -925,7 +925,7 @@ def test_process_settle_lose_warning_matches_master_style(tmp_path, monkeypatch)
     asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
 
     assert captured["type"] == "lose_streak"
-    assert "⚠️ 1 连输告警 ⚠️" in captured["message"]
+    assert "⚠️⚠️  1 连输告警 ⚠️⚠️" in captured["message"]
     assert "第 1 轮第 1 次" in captured["message"]
     assert "📋 预设名称：yc10" in captured["message"]
     assert "💰 账户余额：" in captured["message"]
@@ -987,7 +987,7 @@ def test_process_settle_lose_end_message_contains_balance_lines(tmp_path, monkey
     asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
 
     msg = captured["message"]
-    assert "✅ 连输已终止！✅" in msg
+    assert "✅✅  3 连输已终止！✅✅" in msg
     assert "🔢 " in msg and "第 1 轮第 5 次 至 第 9 次" in msg
     assert "📋 预设名称：yc10" in msg
     assert "😀 连续押注：4 次" in msg

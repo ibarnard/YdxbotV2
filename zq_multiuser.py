@@ -1609,8 +1609,9 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                                 date_str = datetime.now().strftime("%m月%d日")
                                 bet_dir_str = "大" if prediction == 1 else "小"
                                 preset_name = rt.get("current_preset_name", "none")
+                                lose_count = int(rt.get("lose_count", 0))
                                 warn_msg = (
-                                    f"⚠️ {rt.get('lose_count', 0)} 连输告警 ⚠️\n"
+                                    f"⚠️⚠️  {lose_count} 连输告警 ⚠️⚠️\n\n"
                                     f"🔢 {date_str} 第 {settle_round} 轮第 {settle_seq} 次：\n"
                                     f"📋 预设名称：{preset_name}\n"
                                     f"😀 连续押注：{rt.get('bet_sequence_count', 0)} 次\n"
@@ -1628,7 +1629,12 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                                     user_id=user_ctx.user_id,
                                     data=f'lose_count={rt.get("lose_count", 0)}, total_loss={total_losses}'
                                 )
-                                await send_message_v2(
+
+                                # 刷新式提示：管理员窗口仅保留最后一条连输告警消息。
+                                if hasattr(user_ctx, "lose_streak_message") and user_ctx.lose_streak_message:
+                                    await cleanup_message(client, user_ctx.lose_streak_message)
+
+                                user_ctx.lose_streak_message = await send_message_v2(
                                     client,
                                     "lose_streak",
                                     warn_msg,
@@ -1913,21 +1919,25 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             start_seq = lose_end_payload.get("start_seq", "?")
             end_round = lose_end_payload.get("end_round", "?")
             end_seq = lose_end_payload.get("end_seq", "?")
+            lose_count = int(lose_end_payload.get("lose_count", 0))
             if str(start_round) == str(end_round):
                 range_text = f"{date_str} 第 {start_round} 轮第 {start_seq} 次 至 第 {end_seq} 次"
             else:
                 range_text = f"{date_str} 第 {start_round} 轮第 {start_seq} 次 至 第 {end_round} 轮第 {end_seq} 次"
 
             rec_msg = (
-                f"✅ 连输已终止！✅\n"
+                f"✅✅  {lose_count} 连输已终止！✅✅\n\n"
                 f"🔢 {range_text}\n"
                 f"📋 预设名称：{rt.get('current_preset_name', 'none')}\n"
-                f"😀 连续押注：{lose_end_payload.get('continuous_count', lose_end_payload.get('lose_count', 0) + 1)} 次\n"
-                f"⚠️本局连输： {lose_end_payload.get('lose_count', 0)} 次\n"
+                f"😀 连续押注：{lose_end_payload.get('continuous_count', lose_count + 1)} 次\n"
+                f"⚠️本局连输： {lose_count} 次\n"
                 f"💰 本局盈利： {format_number(lose_end_payload.get('total_profit', 0))}\n"
                 f"💰 账户余额：{rt.get('account_balance', 0) / 10000:.2f} 万\n"
                 f"💰 菠菜资金剩余：{rt.get('gambling_fund', 0) / 10000:.2f} 万"
             )
+            if hasattr(user_ctx, "lose_streak_message") and user_ctx.lose_streak_message:
+                await cleanup_message(client, user_ctx.lose_streak_message)
+                user_ctx.lose_streak_message = None
             await send_message_v2(client, "lose_end", rec_msg, user_ctx, global_config)
             log_event(
                 logging.INFO,
