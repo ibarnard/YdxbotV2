@@ -1788,7 +1788,14 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         if hasattr(user_ctx, 'dashboard_message') and user_ctx.dashboard_message:
             await cleanup_message(client, user_ctx.dashboard_message)
         
-        if len(state.history) > 5 and len(state.history) % AUTO_STATS_INTERVAL_ROUNDS == 0:
+        current_total = int(rt.get("total", 0))
+        last_stats_total = int(rt.get("stats_last_report_total", 0))
+        if (
+            len(state.history) > 5
+            and current_total > 0
+            and current_total % AUTO_STATS_INTERVAL_ROUNDS == 0
+            and current_total != last_stats_total
+        ):
             windows = [1000, 500, 200, 100]
             stats = {"连大": [], "连小": [], "连输": []}
             all_ns = set()
@@ -1832,10 +1839,11 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                 'settle',
                 '发送历史记录统计通知',
                 user_id=user_ctx.user_id,
-                data=f'interval={AUTO_STATS_INTERVAL_ROUNDS}, ttl={AUTO_STATS_DELETE_DELAY_SECONDS}'
+                data=f'interval={AUTO_STATS_INTERVAL_ROUNDS}, ttl={AUTO_STATS_DELETE_DELAY_SECONDS}, total={current_total}'
             )
             stats_message = await send_to_admin(client, mes, user_ctx, global_config)
             user_ctx.stats_message = stats_message
+            rt["stats_last_report_total"] = current_total
             if stats_message:
                 asyncio.create_task(
                     delete_later(
@@ -2559,6 +2567,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     # 重置统计
                     rt["win_total"] = 0
                     rt["total"] = 0
+                    rt["stats_last_report_total"] = 0
                     rt["earnings"] = 0
                     rt["period_profit"] = 0
                     rt["win_count"] = 0
@@ -2575,6 +2584,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     state.bet_type_history = []
                     rt["win_total"] = 0
                     rt["total"] = 0
+                    rt["stats_last_report_total"] = 0
                     rt["earnings"] = 0
                     rt["period_profit"] = 0
                     rt["win_count"] = 0

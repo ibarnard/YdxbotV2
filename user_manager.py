@@ -199,6 +199,7 @@ def get_default_runtime() -> Dict[str, Any]:
         
         # 统计和仪表盘变量
         "total": 0,
+        "stats_last_report_total": 0,
         "win_total": 0,
         "earnings": 0,
         "period_profit": 0,
