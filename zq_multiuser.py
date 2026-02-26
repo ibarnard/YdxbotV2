@@ -45,6 +45,10 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
 
+# 自动统计推送节奏：每 30 局一次，保留 10 分钟后自动删除
+AUTO_STATS_INTERVAL_ROUNDS = 30
+AUTO_STATS_DELETE_DELAY_SECONDS = 600
+
 
 def log_event(level, module, event, message=None, **kwargs):
     # 兼容旧调用: log_event(level, event, message, user_id, data)
@@ -1581,10 +1585,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         if hasattr(user_ctx, 'dashboard_message') and user_ctx.dashboard_message:
             await cleanup_message(client, user_ctx.dashboard_message)
         
-        if len(state.history) > 5 and len(state.history) % 10 == 0:
-            if hasattr(user_ctx, 'stats_message') and user_ctx.stats_message:
-                await cleanup_message(client, user_ctx.stats_message)
-            
+        if len(state.history) > 5 and len(state.history) % AUTO_STATS_INTERVAL_ROUNDS == 0:
             windows = [1000, 500, 200, 100]
             stats = {"连大": [], "连小": [], "连输": []}
             all_ns = set()
@@ -1623,8 +1624,24 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                 mes += "\n"
             mes += "```"
             
-            log_event(logging.INFO, 'settle', '发送历史记录统计通知', user_id=user_ctx.user_id)
-            user_ctx.stats_message = await send_to_admin(client, mes, user_ctx, global_config)
+            log_event(
+                logging.INFO,
+                'settle',
+                '发送历史记录统计通知',
+                user_id=user_ctx.user_id,
+                data=f'interval={AUTO_STATS_INTERVAL_ROUNDS}, ttl={AUTO_STATS_DELETE_DELAY_SECONDS}'
+            )
+            stats_message = await send_to_admin(client, mes, user_ctx, global_config)
+            user_ctx.stats_message = stats_message
+            if stats_message:
+                asyncio.create_task(
+                    delete_later(
+                        client,
+                        stats_message.chat_id,
+                        stats_message.id,
+                        AUTO_STATS_DELETE_DELAY_SECONDS
+                    )
+                )
         
         # 获取账户余额
         try:
