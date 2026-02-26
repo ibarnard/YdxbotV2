@@ -45,8 +45,8 @@ console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(console_handler)
 
-# 自动统计推送节奏：每 30 局一次，保留 10 分钟后自动删除
-AUTO_STATS_INTERVAL_ROUNDS = 30
+# 自动统计推送节奏：每 10 局一次，保留 10 分钟后自动删除
+AUTO_STATS_INTERVAL_ROUNDS = 10
 AUTO_STATS_DELETE_DELAY_SECONDS = 600
 
 # 风控节奏：以最近 30 笔实盘胜率为核心，做弹性暂停（盈利优先，其次控风险）。
@@ -167,6 +167,8 @@ MESSAGE_ROUTING_TABLE = {
     "explode": {"channels": ["admin", "priority"], "priority": True},
     "lose_streak": {"channels": ["admin", "priority"], "priority": True},
     "lose_end": {"channels": ["admin", "priority"], "priority": True},
+    "risk_pause": {"channels": ["admin", "priority"], "priority": True},
+    "risk_summary": {"channels": ["admin", "priority"], "priority": True},
     "pause": {"channels": ["admin"], "priority": False},
     "resume": {"channels": ["admin"], "priority": False},
     "settle": {"channels": ["admin"], "priority": False},
@@ -778,13 +780,15 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             _apply_auto_risk_pause(rt, pause_rounds)
             rt["risk_pause_acc_rounds"] = pause_acc_rounds + pause_rounds
             rt["risk_pause_snapshot_count"] = settled_count
+            rt["risk_pause_block_hits"] = int(rt.get("risk_pause_block_hits", 0)) + 1
+            rt["risk_pause_block_rounds"] = int(rt.get("risk_pause_block_rounds", 0)) + pause_rounds
             user_ctx.save_state()
 
             wins = risk_pause.get("wins", 0)
             total = risk_pause.get("total", RISK_WINDOW_BETS)
             win_rate = risk_pause.get("win_rate", 0.0) * 100
             reason_text = "、".join(risk_pause.get("reasons", [])) or "盘面波动风控"
-            mes = (
+            pause_msg = (
                 "⛔ 自动风控暂停\n"
                 f"触发原因：{reason_text}\n"
                 f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
@@ -792,7 +796,26 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 f"暂停局数：{pause_rounds} 局（累计 {rt.get('risk_pause_acc_rounds', 0)}/{RISK_PAUSE_TOTAL_CAP_ROUNDS}）\n"
                 "动作：保留当前倍投进度，等待盘面修复后继续下注"
             )
-            await send_to_admin(client, mes, user_ctx, global_config)
+
+            # 刷新式提示：管理员窗口仅保留最后一条风控暂停提示。
+            if hasattr(user_ctx, "risk_pause_message") and user_ctx.risk_pause_message:
+                await cleanup_message(client, user_ctx.risk_pause_message)
+
+            # 重点渠道（IYUU/TG Bot）同一风险周期只提醒一次，避免刷屏。
+            if not rt.get("risk_pause_priority_notified", False):
+                user_ctx.risk_pause_message = await send_message_v2(
+                    client,
+                    "risk_pause",
+                    pause_msg,
+                    user_ctx,
+                    global_config,
+                    title=f"菠菜机器人 {user_ctx.config.name} 自动风控暂停",
+                    desp=pause_msg,
+                )
+                rt["risk_pause_priority_notified"] = True
+            else:
+                user_ctx.risk_pause_message = await send_to_admin(client, pause_msg, user_ctx, global_config)
+
             log_event(
                 logging.INFO,
                 'bet_on',
@@ -811,6 +834,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         if pause_acc_rounds > 0 and not skip_same_snapshot:
             rt["risk_pause_acc_rounds"] = 0
             rt["risk_pause_snapshot_count"] = -1
+            rt["risk_pause_priority_notified"] = False
 
     bet_amount = calculate_bet_amount(rt)
     if bet_amount <= 0:
@@ -1831,6 +1855,48 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             log_event(logging.WARNING, 'settle', '获取账户余额失败，使用默认值', 
                       user_id=user_ctx.user_id, data=str(e))
             rt["balance_status"] = "network_error"
+
+        # 每 100 局输出一次风控暂停阶段总结，并同步到重点通道（IYUU/TG Bot）。
+        current_total = int(rt.get("total", 0))
+        last_report_total = int(rt.get("risk_pause_last_100_report_total", 0))
+        if current_total > 0 and current_total % 100 == 0 and current_total != last_report_total:
+            block_start = max(1, current_total - 99)
+            block_end = current_total
+            block_hits = int(rt.get("risk_pause_block_hits", 0))
+            block_rounds = int(rt.get("risk_pause_block_rounds", 0))
+            win_total = int(rt.get("win_total", 0))
+            overall_wr = (win_total / current_total * 100) if current_total > 0 else 0.0
+
+            summary_msg = (
+                "📌 风控暂停阶段总结（每100局）\n"
+                f"🔢 区间：第 {block_start} ~ {block_end} 局\n"
+                f"⛔ 风控暂停触发次数：{block_hits}\n"
+                f"⏸ 累计暂停局数：{block_rounds}\n"
+                f"🏆 当前总胜率：{overall_wr:.2f}%（{win_total}/{current_total}）\n"
+                f"💰 总盈利：{format_number(rt.get('earnings', 0))}\n"
+                f"💰 账户余额：{rt.get('account_balance', 0) / 10000:.2f} 万\n"
+                f"💰 菠菜资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万"
+            )
+
+            await send_message_v2(
+                client,
+                "risk_summary",
+                summary_msg,
+                user_ctx,
+                global_config,
+                title=f"菠菜机器人 {user_ctx.config.name} 风控暂停100局总结",
+                desp=summary_msg,
+            )
+            log_event(
+                logging.INFO,
+                'settle',
+                '发送风控暂停100局总结',
+                user_id=user_ctx.user_id,
+                data=f'block={block_start}-{block_end}, hits={block_hits}, pause_rounds={block_rounds}'
+            )
+            rt["risk_pause_last_100_report_total"] = current_total
+            rt["risk_pause_block_hits"] = 0
+            rt["risk_pause_block_rounds"] = 0
 
         # 连输终止播报延后到结算数据写入后，避免与结算通知时序错位
         if lose_end_payload:
