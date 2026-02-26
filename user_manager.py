@@ -176,6 +176,9 @@ def get_default_runtime() -> Dict[str, Any]:
         "lose_notify_pending": False,
         "lose_start_info": {},
         "last_logic_audit": "",
+        # 自动风控暂停周期状态
+        "risk_pause_acc_rounds": 0,
+        "risk_pause_snapshot_count": -1,
         "lose_once": 2.5,
         "lose_twice": 2.5,
         "lose_three": 2.5,

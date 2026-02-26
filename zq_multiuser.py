@@ -59,6 +59,7 @@ RISK_PAUSE_MID_ROUNDS = 3            # 11胜
 RISK_PAUSE_HEAVY_ROUNDS = 5          # <=10胜
 RISK_PAUSE_DEEP_ONLY_ROUNDS = 2      # 仅深度风控触发时
 RISK_PAUSE_ROUNDS_MAX = 5
+RISK_PAUSE_TOTAL_CAP_ROUNDS = 10     # 同一风险周期累计暂停不超过10局
 
 
 def log_event(level, module, event, message=None, **kwargs):
@@ -744,38 +745,72 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         log_event(logging.INFO, 'bet_on', '历史数据低于40局，继续执行押注', user_id=user_ctx.user_id, data=f'len={len(state.history)}')
 
     # 自动风控暂停：按最近30笔实盘胜率做弹性暂停；第5手及以上增加深度保护。
+    # 修复：同一已结算快照不重复触发，避免“永远暂停”；并限制同一风险周期累计暂停<=10局。
     next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
-    risk_pause = _evaluate_auto_risk_pause(state, next_sequence)
-    if risk_pause.get("triggered"):
-        _apply_auto_risk_pause(rt, risk_pause.get("pause_rounds", RISK_PAUSE_LIGHT_ROUNDS))
-        user_ctx.save_state()
+    settled_count = _count_settled_bets(state)
+    snapshot_count = int(rt.get("risk_pause_snapshot_count", -1))
+    pause_acc_rounds = int(rt.get("risk_pause_acc_rounds", 0))
 
-        wins = risk_pause.get("wins", 0)
-        total = risk_pause.get("total", RISK_WINDOW_BETS)
-        win_rate = risk_pause.get("win_rate", 0.0) * 100
-        pause_rounds = risk_pause.get("pause_rounds", RISK_PAUSE_LIGHT_ROUNDS)
-        reason_text = "、".join(risk_pause.get("reasons", [])) or "盘面波动风控"
-        mes = (
-            "⛔ 自动风控暂停\n"
-            f"触发原因：{reason_text}\n"
-            f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
-            f"当前计划连押：第 {next_sequence} 手\n"
-            f"暂停局数：{pause_rounds} 局\n"
-            "动作：已重置到首注，等待盘面修复后自动恢复"
-        )
-        await send_to_admin(client, mes, user_ctx, global_config)
-        log_event(
-            logging.INFO,
-            'bet_on',
-            '触发自动风控暂停',
-            user_id=user_ctx.user_id,
-            data=(
-                f"wins={wins}/{total}, wr={win_rate:.2f}%, "
-                f"next_seq={next_sequence}, pause_rounds={pause_rounds}, "
-                f"deep_guard={risk_pause.get('deep_guard_hit', False)}"
-            ),
-        )
-        return
+    skip_same_snapshot = (snapshot_count == settled_count)
+    risk_pause = {} if skip_same_snapshot else _evaluate_auto_risk_pause(state, next_sequence)
+
+    if risk_pause.get("triggered"):
+        remain_pause_budget = max(0, RISK_PAUSE_TOTAL_CAP_ROUNDS - pause_acc_rounds)
+        if remain_pause_budget <= 0:
+            rt["risk_pause_acc_rounds"] = 0
+            rt["risk_pause_snapshot_count"] = settled_count
+            warn_msg = (
+                "⚠️ 自动风控暂停已达上限\n"
+                f"累计暂停已达 {RISK_PAUSE_TOTAL_CAP_ROUNDS} 局，本局继续下注。\n"
+                "动作：保留当前倍投进度，后续按新结算数据继续评估风控。"
+            )
+            await send_to_admin(client, warn_msg, user_ctx, global_config)
+            log_event(
+                logging.INFO,
+                'bet_on',
+                '自动风控暂停达上限，放行下注',
+                user_id=user_ctx.user_id,
+                data=f'settled_count={settled_count}, cap={RISK_PAUSE_TOTAL_CAP_ROUNDS}'
+            )
+        else:
+            pause_rounds = int(risk_pause.get("pause_rounds", RISK_PAUSE_LIGHT_ROUNDS))
+            pause_rounds = max(1, min(pause_rounds, remain_pause_budget))
+            _apply_auto_risk_pause(rt, pause_rounds)
+            rt["risk_pause_acc_rounds"] = pause_acc_rounds + pause_rounds
+            rt["risk_pause_snapshot_count"] = settled_count
+            user_ctx.save_state()
+
+            wins = risk_pause.get("wins", 0)
+            total = risk_pause.get("total", RISK_WINDOW_BETS)
+            win_rate = risk_pause.get("win_rate", 0.0) * 100
+            reason_text = "、".join(risk_pause.get("reasons", [])) or "盘面波动风控"
+            mes = (
+                "⛔ 自动风控暂停\n"
+                f"触发原因：{reason_text}\n"
+                f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
+                f"当前计划连押：第 {next_sequence} 手\n"
+                f"暂停局数：{pause_rounds} 局（累计 {rt.get('risk_pause_acc_rounds', 0)}/{RISK_PAUSE_TOTAL_CAP_ROUNDS}）\n"
+                "动作：保留当前倍投进度，等待盘面修复后继续下注"
+            )
+            await send_to_admin(client, mes, user_ctx, global_config)
+            log_event(
+                logging.INFO,
+                'bet_on',
+                '触发自动风控暂停',
+                user_id=user_ctx.user_id,
+                data=(
+                    f"wins={wins}/{total}, wr={win_rate:.2f}%, "
+                    f"next_seq={next_sequence}, pause_rounds={pause_rounds}, "
+                    f"deep_guard={risk_pause.get('deep_guard_hit', False)}, "
+                    f"pause_acc={rt.get('risk_pause_acc_rounds', 0)}"
+                ),
+            )
+            return
+    else:
+        # 市场阶段恢复后，清理暂停周期累计，避免长尾影响后续判断。
+        if pause_acc_rounds > 0 and not skip_same_snapshot:
+            rt["risk_pause_acc_rounds"] = 0
+            rt["risk_pause_snapshot_count"] = -1
 
     bet_amount = calculate_bet_amount(rt)
     if bet_amount <= 0:
@@ -1186,6 +1221,16 @@ def _get_recent_settled_outcomes(state, window: int = RISK_WINDOW_BETS) -> list:
     return outcomes
 
 
+def _count_settled_bets(state) -> int:
+    """统计已结算押注笔数（赢/输）。"""
+    count = 0
+    for entry in state.bet_sequence_log:
+        result = entry.get("result")
+        if result in ("赢", "输"):
+            count += 1
+    return count
+
+
 def _calc_dynamic_pause_rounds(recent_wins: int, window_size: int = RISK_WINDOW_BETS) -> int:
     """按最近胜场数计算弹性暂停局数。"""
     if window_size <= 0:
@@ -1256,12 +1301,6 @@ def _apply_auto_risk_pause(rt: dict, pause_rounds: int) -> None:
     rt["bet_on"] = False
     rt["bet"] = False
     rt["mode_stop"] = False
-    rt["bet_sequence_count"] = 0
-    rt["bet_amount"] = int(rt.get("initial_amount", 500))
-    rt["lose_count"] = 0
-    rt["win_count"] = 0
-    rt["lose_notify_pending"] = False
-    rt["lose_start_info"] = {}
 
 
 def count_consecutive(history):
