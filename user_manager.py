@@ -179,6 +179,9 @@ def get_default_runtime() -> Dict[str, Any]:
         # 自动风控暂停周期状态
         "risk_pause_acc_rounds": 0,
         "risk_pause_snapshot_count": -1,
+        "risk_pause_cycle_active": False,
+        "risk_pause_recovery_passes": 0,
+        "risk_pause_level1_hit": False,
         "risk_pause_priority_notified": False,
         "risk_pause_block_hits": 0,
         "risk_pause_block_rounds": 0,

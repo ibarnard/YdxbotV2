@@ -49,17 +49,23 @@ logger.addHandler(console_handler)
 AUTO_STATS_INTERVAL_ROUNDS = 10
 AUTO_STATS_DELETE_DELAY_SECONDS = 600
 
-# 风控节奏：以最近 30 笔实盘胜率为核心，做弹性暂停（盈利优先，其次控风险）。
-RISK_WINDOW_BETS = 30
-RISK_BASE_TRIGGER_WINS = 12          # 12/30=40%
-RISK_DEEP_TRIGGER_WINS = 13          # 13/30≈43.3%（第5手及以上）
-RISK_DEEP_SEQUENCE_THRESHOLD = 5
-RISK_PAUSE_LIGHT_ROUNDS = 2          # 12胜
-RISK_PAUSE_MID_ROUNDS = 3            # 11胜
-RISK_PAUSE_HEAVY_ROUNDS = 5          # <=10胜
-RISK_PAUSE_DEEP_ONLY_ROUNDS = 2      # 仅深度风控触发时
-RISK_PAUSE_ROUNDS_MAX = 5
-RISK_PAUSE_TOTAL_CAP_ROUNDS = 10     # 同一风险周期累计暂停不超过10局
+# 风控节奏：以最近 40 笔实盘胜率为基础，结合连输深度做分层暂停。
+RISK_WINDOW_BETS = 40
+RISK_BASE_TRIGGER_WINS = 16          # 16/40=40%
+RISK_RECOVERY_WINS = 19              # >45% => 至少 19/40
+RISK_RECOVERY_PASS_NEEDED = 2         # 连续2次满足恢复条件才重置风险周期
+
+# 三层风控触发条件与单次暂停上限
+RISK_L1_LOSE_STREAK_TRIGGER = 4       # 一级深度风控：连输>=4
+RISK_L2_LOSE_STREAK_TRIGGER = 6       # 二级深度风控：一级后继续连输到>=6
+RISK_L2_SEQUENCE_THRESHOLD = 7        # 二级深度风控：下一手逼近第7手
+RISK_BASE_MAX_PAUSE_ROUNDS = 10
+RISK_L1_MAX_PAUSE_ROUNDS = 5
+RISK_L2_MAX_PAUSE_ROUNDS = 3
+
+# 共享预算：同一风险周期内基础+深度累计暂停不超过10局
+RISK_PAUSE_TOTAL_CAP_ROUNDS = 10
+RISK_PAUSE_MODEL_TIMEOUT_SEC = 3.5
 
 
 def log_event(level, module, event, message=None, **kwargs):
@@ -746,27 +752,62 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     if len(state.history) < 40:
         log_event(logging.INFO, 'bet_on', '历史数据低于40局，继续执行押注', user_id=user_ctx.user_id, data=f'len={len(state.history)}')
 
-    # 自动风控暂停：按最近30笔实盘胜率做弹性暂停；第5手及以上增加深度保护。
-    # 修复：同一已结算快照不重复触发，避免“永远暂停”；并限制同一风险周期累计暂停<=10局。
+    # 自动风控暂停：40局窗口 + 三层风控（基础/L1/L2）+ 共享10局预算。
+    # 同一已结算快照不重复触发，避免重复暂停。
     next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
     settled_count = _count_settled_bets(state)
     snapshot_count = int(rt.get("risk_pause_snapshot_count", -1))
     pause_acc_rounds = int(rt.get("risk_pause_acc_rounds", 0))
 
     skip_same_snapshot = (snapshot_count == settled_count)
-    risk_pause = {} if skip_same_snapshot else _evaluate_auto_risk_pause(state, next_sequence)
+    risk_pause = {} if skip_same_snapshot else _evaluate_auto_risk_pause(state, rt, next_sequence)
+
+    cycle_active = bool(rt.get("risk_pause_cycle_active", False))
+    recovery_passes = int(rt.get("risk_pause_recovery_passes", 0))
+
+    # 风险周期恢复判定：最近40笔胜率>45% 连续2次才重置预算。
+    if not skip_same_snapshot and risk_pause:
+        if risk_pause.get("recovery_hit", False):
+            if cycle_active:
+                recovery_passes += 1
+            else:
+                recovery_passes = 0
+        else:
+            recovery_passes = 0
+        rt["risk_pause_recovery_passes"] = recovery_passes
+
+    if cycle_active and recovery_passes >= RISK_RECOVERY_PASS_NEEDED:
+        rt["risk_pause_cycle_active"] = False
+        rt["risk_pause_acc_rounds"] = 0
+        rt["risk_pause_snapshot_count"] = -1
+        rt["risk_pause_level1_hit"] = False
+        rt["risk_pause_recovery_passes"] = 0
+        rt["risk_pause_priority_notified"] = False
+        log_event(
+            logging.INFO,
+            "risk_pause",
+            "风控周期恢复，已重置暂停预算",
+            user_id=user_ctx.user_id,
+            data=f"wins>45% pass={RISK_RECOVERY_PASS_NEEDED}",
+        )
+        pause_acc_rounds = 0
+        cycle_active = False
 
     if risk_pause.get("triggered"):
         remain_pause_budget = max(0, RISK_PAUSE_TOTAL_CAP_ROUNDS - pause_acc_rounds)
+        rt["risk_pause_cycle_active"] = True
+        rt["risk_pause_snapshot_count"] = settled_count
+        if risk_pause.get("level") in ("L1", "L2"):
+            rt["risk_pause_level1_hit"] = True
+
         if remain_pause_budget <= 0:
-            rt["risk_pause_acc_rounds"] = 0
-            rt["risk_pause_snapshot_count"] = settled_count
             warn_msg = (
                 "⚠️ 自动风控暂停已达上限\n"
                 f"累计暂停已达 {RISK_PAUSE_TOTAL_CAP_ROUNDS} 局，本局继续下注。\n"
                 "动作：保留当前倍投进度，后续按新结算数据继续评估风控。"
             )
             await send_to_admin(client, warn_msg, user_ctx, global_config)
+            user_ctx.save_state()
             log_event(
                 logging.INFO,
                 'bet_on',
@@ -775,8 +816,14 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 data=f'settled_count={settled_count}, cap={RISK_PAUSE_TOTAL_CAP_ROUNDS}'
             )
         else:
-            pause_rounds = int(risk_pause.get("pause_rounds", RISK_PAUSE_LIGHT_ROUNDS))
-            pause_rounds = max(1, min(pause_rounds, remain_pause_budget))
+            layer_cap = int(risk_pause.get("level_cap", RISK_BASE_MAX_PAUSE_ROUNDS))
+            max_allow_rounds = max(1, min(layer_cap, remain_pause_budget))
+            model_pause_rounds, model_reason, model_source = await _suggest_pause_rounds_by_model(
+                user_ctx,
+                risk_pause,
+                max_pause=max_allow_rounds,
+            )
+            pause_rounds = max(1, min(max_allow_rounds, int(model_pause_rounds)))
             _apply_auto_risk_pause(rt, pause_rounds)
             rt["risk_pause_acc_rounds"] = pause_acc_rounds + pause_rounds
             rt["risk_pause_snapshot_count"] = settled_count
@@ -788,12 +835,16 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             total = risk_pause.get("total", RISK_WINDOW_BETS)
             win_rate = risk_pause.get("win_rate", 0.0) * 100
             reason_text = "、".join(risk_pause.get("reasons", [])) or "盘面波动风控"
+            level_label = risk_pause.get("level_label", "基础风控")
             pause_msg = (
                 "⛔ 自动风控暂停\n"
+                f"触发层级：{level_label}\n"
                 f"触发原因：{reason_text}\n"
                 f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
                 f"当前计划连押：第 {next_sequence} 手\n"
-                f"暂停局数：{pause_rounds} 局（累计 {rt.get('risk_pause_acc_rounds', 0)}/{RISK_PAUSE_TOTAL_CAP_ROUNDS}）\n"
+                f"模型建议：{model_pause_rounds} 局（来源：{model_source}）\n"
+                f"暂停局数：{pause_rounds} 局（层级上限 {layer_cap}，累计 {rt.get('risk_pause_acc_rounds', 0)}/{RISK_PAUSE_TOTAL_CAP_ROUNDS}）\n"
+                f"模型依据：{model_reason}\n"
                 "动作：保留当前倍投进度，等待盘面修复后继续下注"
             )
 
@@ -801,20 +852,8 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             if hasattr(user_ctx, "risk_pause_message") and user_ctx.risk_pause_message:
                 await cleanup_message(client, user_ctx.risk_pause_message)
 
-            # 重点渠道（IYUU/TG Bot）同一风险周期只提醒一次，避免刷屏。
-            if not rt.get("risk_pause_priority_notified", False):
-                user_ctx.risk_pause_message = await send_message_v2(
-                    client,
-                    "risk_pause",
-                    pause_msg,
-                    user_ctx,
-                    global_config,
-                    title=f"菠菜机器人 {user_ctx.config.name} 自动风控暂停",
-                    desp=pause_msg,
-                )
-                rt["risk_pause_priority_notified"] = True
-            else:
-                user_ctx.risk_pause_message = await send_to_admin(client, pause_msg, user_ctx, global_config)
+            user_ctx.risk_pause_message = await send_to_admin(client, pause_msg, user_ctx, global_config)
+            rt["risk_pause_priority_notified"] = True
 
             log_event(
                 logging.INFO,
@@ -824,17 +863,11 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 data=(
                     f"wins={wins}/{total}, wr={win_rate:.2f}%, "
                     f"next_seq={next_sequence}, pause_rounds={pause_rounds}, "
-                    f"deep_guard={risk_pause.get('deep_guard_hit', False)}, "
+                    f"level={risk_pause.get('level', 'BASE')}, "
                     f"pause_acc={rt.get('risk_pause_acc_rounds', 0)}"
                 ),
             )
             return
-    else:
-        # 市场阶段恢复后，清理暂停周期累计，避免长尾影响后续判断。
-        if pause_acc_rounds > 0 and not skip_same_snapshot:
-            rt["risk_pause_acc_rounds"] = 0
-            rt["risk_pause_snapshot_count"] = -1
-            rt["risk_pause_priority_notified"] = False
 
     bet_amount = calculate_bet_amount(rt)
     if bet_amount <= 0:
@@ -1255,25 +1288,132 @@ def _count_settled_bets(state) -> int:
     return count
 
 
-def _calc_dynamic_pause_rounds(recent_wins: int, window_size: int = RISK_WINDOW_BETS) -> int:
-    """按最近胜场数计算弹性暂停局数。"""
-    if window_size <= 0:
-        return 0
-    if recent_wins <= 10:
-        return RISK_PAUSE_HEAVY_ROUNDS
-    if recent_wins <= 11:
-        return RISK_PAUSE_MID_ROUNDS
-    if recent_wins <= RISK_BASE_TRIGGER_WINS:
-        return RISK_PAUSE_LIGHT_ROUNDS
-    return 0
+def _fallback_pause_rounds(level: str, wins: int, total: int, lose_count: int, max_pause: int) -> int:
+    """模型不可用时的暂停局数兜底。"""
+    max_pause = max(1, int(max_pause))
+    if total <= 0:
+        return min(1, max_pause)
+
+    win_rate = wins / total
+    if level == "L2":
+        # 二级深度：更谨慎，但单次不宜过长
+        base = 2 if lose_count >= 7 else 1
+        return max(1, min(max_pause, base))
+    if level == "L1":
+        base = 3 if lose_count >= 5 else 2
+        return max(1, min(max_pause, base))
+
+    # BASE：根据40局胜率分层
+    if win_rate <= 0.30:
+        base = 4
+    elif win_rate <= 0.35:
+        base = 3
+    else:
+        base = 2
+    return max(1, min(max_pause, base))
 
 
-def _evaluate_auto_risk_pause(state, next_sequence: int) -> dict:
+def _parse_pause_rounds_response(raw_text: str, max_pause: int) -> tuple:
+    """解析模型返回的暂停建议，返回 (pause_rounds|None, reason)。"""
+    if not raw_text:
+        return None, ""
+
+    max_pause = max(1, int(max_pause))
+    candidates = [raw_text.strip()]
+    # 兼容模型返回前后包裹说明文字的情况
+    start = raw_text.find("{")
+    end = raw_text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidates.append(raw_text[start:end + 1].strip())
+
+    for candidate in candidates:
+        try:
+            data = json.loads(candidate)
+            if not isinstance(data, dict):
+                continue
+            pause_raw = data.get("pause_rounds", data.get("pause", data.get("rounds")))
+            if pause_raw is None:
+                continue
+            pause_rounds = int(float(str(pause_raw).strip()))
+            pause_rounds = max(1, min(max_pause, pause_rounds))
+            reason = str(data.get("reason", "")).strip()
+            return pause_rounds, reason
+        except Exception:
+            continue
+
+    return None, ""
+
+
+async def _suggest_pause_rounds_by_model(
+    user_ctx: UserContext,
+    risk_eval: dict,
+    max_pause: int,
+) -> tuple:
+    """调用大模型给出暂停局数建议，失败时自动降级到统计兜底。"""
+    state = user_ctx.state
+    rt = state.runtime
+    current_model_id = rt.get("current_model_id")
+    wins = int(risk_eval.get("wins", 0))
+    total = int(risk_eval.get("total", 0))
+    lose_count = int(risk_eval.get("lose_count", 0))
+    level = str(risk_eval.get("level", "BASE"))
+
+    fallback_rounds = _fallback_pause_rounds(level, wins, total, lose_count, max_pause)
+    fallback_reason = "模型异常，统计兜底"
+    if not current_model_id:
+        return fallback_rounds, fallback_reason, "fallback"
+
+    recent_tail = risk_eval.get("recent_outcomes", [])[-12:]
+    recent_text = "".join(str(x) for x in recent_tail) if recent_tail else "NA"
+    prompt = f"""你是一个只负责风险暂停局数的控制器。必须只输出JSON。
+
+当前风控层级：{risk_eval.get('level_label', level)}
+最近{total}笔胜率：{wins}/{total}（{risk_eval.get('win_rate', 0.0) * 100:.1f}%）
+当前连输：{lose_count}
+下一手：第{risk_eval.get('next_sequence', 1)}手
+最近12笔结算(赢1输0)：{recent_text}
+
+请给出暂停建议，范围必须在 1 到 {max_pause} 之间。
+输出格式：
+{{"pause_rounds": 1-{max_pause}之间整数, "reason": "20字内"}}
+"""
+
+    messages = [
+        {"role": "system", "content": "你是交易风控引擎，只返回JSON，不要解释。"},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        result = await asyncio.wait_for(
+            model_mgr.call_model(current_model_id, messages, temperature=0.0, max_tokens=120),
+            timeout=RISK_PAUSE_MODEL_TIMEOUT_SEC,
+        )
+        if not result.get("success"):
+            raise RuntimeError(str(result.get("error", "unknown")))
+
+        rounds, reason = _parse_pause_rounds_response(result.get("content", ""), max_pause=max_pause)
+        if rounds is None:
+            raise ValueError("pause_rounds parse failed")
+        reason = reason or "模型建议"
+        return rounds, reason, "model"
+    except Exception as e:
+        log_event(
+            logging.WARNING,
+            "risk_pause",
+            "风控暂停模型建议失败，使用统计兜底",
+            user_id=user_ctx.user_id,
+            error=str(e),
+            level=level,
+        )
+        return fallback_rounds, fallback_reason, "fallback"
+
+
+def _evaluate_auto_risk_pause(state, rt: dict, next_sequence: int) -> dict:
     """
-    评估是否触发自动风控暂停。
-    规则:
-    1) 最近30笔胜率 <=40% 触发基础暂停（2/3/5局）
-    2) 第5手及以上，最近30笔胜率 <=43.3% 触发深度风控
+    评估是否触发自动风控暂停（40局窗口 + 分层风控）。
+    1) BASE：最近40笔胜率<=40%
+    2) L1：连输>=4
+    3) L2：L1后继续连输>=6，且下一手逼近第7手
     """
     outcomes = _get_recent_settled_outcomes(state, RISK_WINDOW_BETS)
     total = len(outcomes)
@@ -1282,24 +1422,48 @@ def _evaluate_auto_risk_pause(state, next_sequence: int) -> dict:
 
     wins = int(sum(outcomes))
     win_rate = wins / total if total > 0 else 0.0
-    base_pause_rounds = _calc_dynamic_pause_rounds(wins, total)
-    deep_guard_hit = (next_sequence >= RISK_DEEP_SEQUENCE_THRESHOLD and wins <= RISK_DEEP_TRIGGER_WINS)
+    lose_count = int(rt.get("lose_count", 0))
 
-    if base_pause_rounds <= 0 and not deep_guard_hit:
-        return {}
+    base_trigger = wins <= RISK_BASE_TRIGGER_WINS
+    level1_trigger = lose_count >= RISK_L1_LOSE_STREAK_TRIGGER
+    level2_trigger = (
+        bool(rt.get("risk_pause_level1_hit", False))
+        and lose_count >= RISK_L2_LOSE_STREAK_TRIGGER
+        and next_sequence >= RISK_L2_SEQUENCE_THRESHOLD
+    )
 
-    if base_pause_rounds > 0 and deep_guard_hit:
-        pause_rounds = min(RISK_PAUSE_ROUNDS_MAX, base_pause_rounds + 1)
-    elif base_pause_rounds > 0:
-        pause_rounds = base_pause_rounds
-    else:
-        pause_rounds = RISK_PAUSE_DEEP_ONLY_ROUNDS
-
+    level = ""
+    level_label = ""
+    level_cap = 0
     reasons = []
-    if base_pause_rounds > 0:
-        reasons.append("最近30笔胜率<=40%")
-    if deep_guard_hit:
-        reasons.append("第5手及以上触发深度风控")
+
+    if level2_trigger:
+        level = "L2"
+        level_label = "二级深度风控"
+        level_cap = RISK_L2_MAX_PAUSE_ROUNDS
+        reasons.append("一级风控后继续连输，下一手逼近第7手")
+    elif level1_trigger:
+        level = "L1"
+        level_label = "一级深度风控"
+        level_cap = RISK_L1_MAX_PAUSE_ROUNDS
+        reasons.append("连输达到4局")
+    elif base_trigger:
+        level = "BASE"
+        level_label = "基础风控"
+        level_cap = RISK_BASE_MAX_PAUSE_ROUNDS
+        reasons.append("最近40笔胜率<=40%")
+    else:
+        return {
+            "triggered": False,
+            "wins": wins,
+            "total": total,
+            "win_rate": win_rate,
+            "lose_count": lose_count,
+            "recovery_hit": wins >= RISK_RECOVERY_WINS,
+        }
+
+    if base_trigger and level != "BASE":
+        reasons.append("最近40笔胜率<=40%")
 
     return {
         "triggered": True,
@@ -1307,9 +1471,13 @@ def _evaluate_auto_risk_pause(state, next_sequence: int) -> dict:
         "total": total,
         "win_rate": win_rate,
         "next_sequence": next_sequence,
-        "pause_rounds": pause_rounds,
-        "deep_guard_hit": deep_guard_hit,
+        "lose_count": lose_count,
+        "level": level,
+        "level_label": level_label,
+        "level_cap": level_cap,
+        "recovery_hit": wins >= RISK_RECOVERY_WINS,
         "reasons": reasons,
+        "recent_outcomes": outcomes[-20:],
     }
 
 
@@ -2585,6 +2753,11 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["bet_sequence_count"] = 0
                     rt["explode_count"] = 0
                     rt["bet_amount"] = int(rt.get("initial_amount", 500))
+                    rt["risk_pause_acc_rounds"] = 0
+                    rt["risk_pause_snapshot_count"] = -1
+                    rt["risk_pause_cycle_active"] = False
+                    rt["risk_pause_recovery_passes"] = 0
+                    rt["risk_pause_level1_hit"] = False
                     user_ctx.save_state()
                     mes = "统计数据已重置"
                     log_event(logging.INFO, 'user_cmd', '重置统计数据', user_id=user_ctx.user_id, action='completed')
@@ -2602,6 +2775,11 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["bet_sequence_count"] = 0
                     rt["explode_count"] = 0
                     rt["bet_amount"] = int(rt.get("initial_amount", 500))
+                    rt["risk_pause_acc_rounds"] = 0
+                    rt["risk_pause_snapshot_count"] = -1
+                    rt["risk_pause_cycle_active"] = False
+                    rt["risk_pause_recovery_passes"] = 0
+                    rt["risk_pause_level1_hit"] = False
                     user_ctx.save_state()
                     mes = "状态文件已重置"
                     log_event(logging.INFO, 'user_cmd', '重置状态文件', user_id=user_ctx.user_id, action='completed')
@@ -2621,6 +2799,11 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["manual_pause"] = False
                     rt["pause_count"] = 0
                     rt["current_bet_seq"] = 1
+                    rt["risk_pause_acc_rounds"] = 0
+                    rt["risk_pause_snapshot_count"] = -1
+                    rt["risk_pause_cycle_active"] = False
+                    rt["risk_pause_recovery_passes"] = 0
+                    rt["risk_pause_level1_hit"] = False
                     user_ctx.save_state()
                     mes = f"押注策略已重置: 初始金额={rt.get('initial_amount', 500)}"
                     log_event(logging.INFO, 'user_cmd', '重置押注策略', user_id=user_ctx.user_id, action='completed')
