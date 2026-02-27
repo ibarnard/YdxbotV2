@@ -1226,6 +1226,64 @@ def test_check_bet_status_does_not_resume_when_next_bet_amount_is_zero(tmp_path,
     assert not any("押注已恢复" in m for m in sent_messages)
 
 
+def test_process_settle_keeps_fund_pause_notified_when_next_bet_still_insufficient(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5021"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "结算资金不足用户"},
+            "telegram": {"user_id": 5021},
+            "groups": {"admin_chat": 5021},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["bet"] = True
+    rt["bet_type"] = 0  # 押小，下面开大 -> 输
+    rt["bet_amount"] = 730000
+    rt["lose_count"] = 4
+    rt["lose_stop"] = 9
+    rt["lose_four"] = 2.05
+    rt["current_round"] = 1
+    rt["current_bet_seq"] = 9
+    rt["account_balance"] = 2_200_000
+    rt["gambling_fund"] = 1_417_800
+    rt["fund_pause_notified"] = True
+    ctx.state.bet_sequence_log = [{"bet_id": "20260228_1_9", "profit": None}]
+
+    sent_messages = []
+
+    async def fake_send_message_v2(*args, **kwargs):
+        return None
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5021, id=len(sent_messages))
+
+    async def fake_fetch_balance(user_ctx):
+        return rt["account_balance"]
+
+    monkeypatch.setattr(zm, "send_message_v2", fake_send_message_v2)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "fetch_balance", fake_fetch_balance)
+
+    class DummyClient:
+        async def send_message(self, target, message, parse_mode=None):
+            return SimpleNamespace(chat_id=target, id=1)
+
+        async def delete_messages(self, chat_id, message_id):
+            return None
+
+    event = SimpleNamespace(id=44001, message=SimpleNamespace(message="已结算: 结果为 9 大"))
+    asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
+
+    assert rt["fund_pause_notified"] is True
+    assert rt["bet_on"] is False
+    assert rt["mode_stop"] is True
+    assert not any("菠菜资金不足，已暂停押注" in m for m in sent_messages)
+
+
 def test_process_settle_only_consumes_pending_bet_once(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "5015"
     _write_json(

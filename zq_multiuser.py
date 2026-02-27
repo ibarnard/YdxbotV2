@@ -1940,7 +1940,22 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             rt["bet_on"] = False
             rt["mode_stop"] = True
         else:
-            rt["fund_pause_notified"] = False
+            next_bet_amount = calculate_bet_amount(rt)
+            if next_bet_amount > 0 and not is_fund_available(user_ctx, next_bet_amount):
+                if not rt.get("fund_pause_notified", False):
+                    display_fund = max(0, rt.get("gambling_fund", 0))
+                    mes = (
+                        f"**菠菜资金不足，已暂停押注**\n"
+                        f"当前剩余：{display_fund / 10000:.2f} 万\n"
+                        "请使用 `gf [金额]` 恢复"
+                    )
+                    await send_to_admin(client, mes, user_ctx, global_config)
+                    rt["fund_pause_notified"] = True
+                rt["bet"] = False
+                rt["bet_on"] = False
+                rt["mode_stop"] = True
+            else:
+                rt["fund_pause_notified"] = False
             if rt.get("bet", False):
                 try:
                     if state.bet_sequence_log and state.bet_sequence_log[-1].get("result") in ("赢", "输"):
