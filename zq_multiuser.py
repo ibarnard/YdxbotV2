@@ -167,7 +167,7 @@ MESSAGE_ROUTING_TABLE = {
     "explode": {"channels": ["admin", "priority"], "priority": True},
     "lose_streak": {"channels": ["admin", "priority"], "priority": True},
     "lose_end": {"channels": ["admin", "priority"], "priority": True},
-    "risk_pause": {"channels": ["admin", "priority"], "priority": True},
+    "risk_pause": {"channels": ["admin"], "priority": False},
     "risk_summary": {"channels": ["admin", "priority"], "priority": True},
     "pause": {"channels": ["admin"], "priority": False},
     "resume": {"channels": ["admin"], "priority": False},
