@@ -1145,6 +1145,87 @@ def test_process_bet_on_pause_countdown_clears_on_resume(tmp_path, monkeypatch):
     assert any("恢复押注" in m for m in sent_messages)
 
 
+def test_process_bet_on_insufficient_fund_sends_pause_notice_even_without_pending_bet(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5019"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "资金不足用户"},
+            "telegram": {"user_id": 5019},
+            "groups": {"admin_chat": 5019},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["manual_pause"] = False
+    rt["stop_count"] = 0
+    rt["bet"] = False
+    rt["bet_on"] = True
+    rt["mode_stop"] = True
+    rt["initial_amount"] = 500
+    rt["lose_count"] = 0
+    rt["gambling_fund"] = 100
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5019, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    event = SimpleNamespace(reply_markup=object(), message=SimpleNamespace(message="unused"))
+    asyncio.run(zm.process_bet_on(SimpleNamespace(), event, ctx, {}))
+
+    assert any("菠菜资金不足，已暂停押注" in m for m in sent_messages)
+    assert rt["fund_pause_notified"] is True
+    assert rt["bet"] is False
+    assert rt["bet_on"] is False
+
+
+def test_check_bet_status_does_not_resume_when_next_bet_amount_is_zero(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5020"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "上限暂停用户"},
+            "telegram": {"user_id": 5020},
+            "groups": {"admin_chat": 5020},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["manual_pause"] = False
+    rt["bet"] = False
+    rt["bet_on"] = True
+    rt["mode_stop"] = True
+    rt["initial_amount"] = 10000
+    rt["bet_amount"] = 10000
+    rt["lose_stop"] = 3
+    rt["lose_count"] = 3  # 下一手将超过上限，calculate_bet_amount 返回0
+    rt["gambling_fund"] = 10_000_000
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5020, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    asyncio.run(zm.check_bet_status(SimpleNamespace(), ctx, {}))
+
+    assert any("已达到预设连投上限" in m for m in sent_messages)
+    assert rt["limit_stop_notified"] is True
+    assert rt["bet"] is False
+    assert rt["bet_on"] is False
+    assert not any("押注已恢复" in m for m in sent_messages)
+
+
 def test_process_settle_only_consumes_pending_bet_once(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "5015"
     _write_json(

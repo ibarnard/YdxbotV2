@@ -906,18 +906,34 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
 
     bet_amount = calculate_bet_amount(rt)
     if bet_amount <= 0:
+        if not rt.get("limit_stop_notified", False):
+            lose_stop = int(rt.get("lose_stop", 13))
+            mes = (
+                "⚠️ 已达到预设连投上限，已自动暂停\n"
+                f"当前预设最多连投：{lose_stop} 手\n"
+                "可等待新轮次或切换预设后继续"
+            )
+            await send_to_admin(client, mes, user_ctx, global_config)
+            rt["limit_stop_notified"] = True
         rt["bet"] = False
+        rt["bet_on"] = False
+        rt["mode_stop"] = True
         user_ctx.save_state()
         return
+    rt["limit_stop_notified"] = False
 
     if not is_fund_available(user_ctx, bet_amount):
-        if rt.get("bet", False):
+        if not rt.get("fund_pause_notified", False):
             display_fund = max(0, rt.get("gambling_fund", 0))
             mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
             await send_to_admin(client, mes, user_ctx, global_config)
+            rt["fund_pause_notified"] = True
         rt["bet"] = False
+        rt["bet_on"] = False
+        rt["mode_stop"] = True
         user_ctx.save_state()
         return
+    rt["fund_pause_notified"] = False
 
     if not (rt.get("bet_on", False) or rt.get("mode_stop", True)):
         log_event(logging.DEBUG, 'bet_on', '押注已暂停', user_id=user_ctx.user_id)
@@ -984,6 +1000,8 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         rt["bet_sequence_count"] = rt.get("bet_sequence_count", 0) + 1
         rt["bet_type"] = 1 if prediction == 1 else 0
         rt["bet_on"] = True
+        rt["fund_pause_notified"] = False
+        rt["limit_stop_notified"] = False
 
         bet_id = generate_bet_id(user_ctx)
         state.bet_sequence_log.append({
@@ -1915,10 +1933,14 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             mes = f"**菠菜资金耗尽，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
             log_event(logging.WARNING, 'settle', '资金耗尽暂停', 
                       user_id=user_ctx.user_id, data=f'fund={rt.get("gambling_fund", 0)}')
-            await send_to_admin(client, mes, user_ctx, global_config)
+            if not rt.get("fund_pause_notified", False):
+                await send_to_admin(client, mes, user_ctx, global_config)
+                rt["fund_pause_notified"] = True
             rt["bet"] = False
             rt["bet_on"] = False
+            rt["mode_stop"] = True
         else:
+            rt["fund_pause_notified"] = False
             if rt.get("bet", False):
                 try:
                     if state.bet_sequence_log and state.bet_sequence_log[-1].get("result") in ("赢", "输"):
@@ -1958,6 +1980,8 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     if not win:
                         # 如果连输刚开始（第1次），记录起始信息
                         if rt.get("lose_count", 0) == 1:
+                            # 新一轮连输起点，清理旧里程碑，防止深度风控误判为“已触发”
+                            rt["risk_deep_triggered_milestones"] = []
                             rt["lose_start_info"] = {
                                 "round": settle_round,
                                 "seq": settle_seq,
@@ -2087,6 +2111,22 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                             next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
                             settled_count = _count_settled_bets(state)
                             risk_pause_eval = _evaluate_auto_risk_pause(state, rt, next_sequence)
+                            if (
+                                int(rt.get("lose_count", 0)) % int(RISK_DEEP_TRIGGER_INTERVAL) == 0
+                                and int(rt.get("lose_count", 0)) < int(rt.get("lose_stop", 13))
+                                and not risk_pause_eval.get("deep_trigger", False)
+                            ):
+                                log_event(
+                                    logging.INFO,
+                                    'settle',
+                                    '深度风控本应触发但被跳过',
+                                    user_id=user_ctx.user_id,
+                                    data=(
+                                        f"lose_count={rt.get('lose_count', 0)}, "
+                                        f"lose_stop={rt.get('lose_stop', 13)}, "
+                                        f"triggered={rt.get('risk_deep_triggered_milestones', [])}"
+                                    ),
+                                )
                             await _trigger_deep_risk_pause_after_settle(
                                 client,
                                 user_ctx,
@@ -2635,6 +2675,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 rt["current_preset_name"] = preset_name
                 rt["bet_amount"] = int(preset[6])
                 rt["bet"] = False  # 修复：st命令不应直接设置bet=True
+                rt["risk_deep_triggered_milestones"] = []
+                rt["fund_pause_notified"] = False
+                rt["limit_stop_notified"] = False
                 user_ctx.save_state()
                 
                 mes = f"预设启动成功: {preset_name} ({preset[0]} {preset[1]} {preset[2]} {preset[3]} {preset[4]} {preset[5]} {preset[6]})"
@@ -3185,18 +3228,40 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
     if rt.get("manual_pause", False):
         return
     next_bet_amount = calculate_bet_amount(rt)
+    if next_bet_amount <= 0:
+        rt["bet"] = False
+        rt["bet_on"] = False
+        rt["mode_stop"] = True
+        if not rt.get("limit_stop_notified", False):
+            lose_stop = int(rt.get("lose_stop", 13))
+            await send_to_admin(
+                client,
+                f"⚠️ 已达到预设连投上限（{lose_stop} 手），已保持暂停",
+                user_ctx,
+                global_config,
+            )
+            rt["limit_stop_notified"] = True
+        user_ctx.save_state()
+        return
+
+    rt["limit_stop_notified"] = False
     if is_fund_available(user_ctx, next_bet_amount) and not rt.get("bet", False) and rt.get("switch", True) and rt.get("stop_count", 0) == 0:
         await _clear_pause_countdown_notice(client, user_ctx)
         rt["bet"] = True
+        rt["bet_on"] = True
+        rt["mode_stop"] = True
         rt["pause_count"] = 0
+        rt["fund_pause_notified"] = False
         user_ctx.save_state()
         mes = f"**押注已恢复**\n当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n接续倍投金额：{format_number(next_bet_amount)}"
         await send_to_admin(client, mes, user_ctx, global_config)
     elif not is_fund_available(user_ctx, next_bet_amount):
         rt["bet_on"] = False
         rt["mode_stop"] = True
+        if not rt.get("fund_pause_notified", False):
+            await send_to_admin(client, "⚠️ 菠菜资金不足，已自动暂停押注", user_ctx, global_config)
+            rt["fund_pause_notified"] = True
         user_ctx.save_state()
-        await send_to_admin(client, "⚠️ 菠菜资金不足，已自动暂停押注", user_ctx, global_config)
 
 
 def _parse_yc_params(args, presets):
