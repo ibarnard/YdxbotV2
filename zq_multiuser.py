@@ -730,9 +730,21 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     if stop_count > 0:
         rt["stop_count"] = stop_count - 1
         if rt["stop_count"] == 0:
+            if rt.get("manual_pause", False):
+                rt["bet"] = False
+                rt["bet_on"] = False
+                rt["mode_stop"] = True
+                rt["flag"] = True
+                user_ctx.save_state()
+                await send_to_admin(client, "**暂停结束**\n检测到手动暂停，保持暂停状态", user_ctx, global_config)
+                return
+
             rt["bet"] = True
             rt["bet_on"] = True
             rt["mode_stop"] = True
+            rt["flag"] = True
+            user_ctx.save_state()
+            await send_to_admin(client, "**恢复押注**\n暂停已结束，新轮次开始", user_ctx, global_config)
         else:
             user_ctx.save_state()
             log_event(logging.INFO, 'bet_on', '暂停中跳过押注', user_id=user_ctx.user_id, data=f"stop_count={rt['stop_count']}")
@@ -1740,6 +1752,14 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         if not match:
             log_event(logging.DEBUG, 'settle', '未匹配到结算消息', user_id=user_ctx.user_id, data='action=跳过')
             return
+
+        settle_msg_id = int(getattr(event, "id", 0) or 0)
+        last_settle_msg_id = int(rt.get("last_settle_message_id", 0) or 0)
+        if settle_msg_id > 0 and settle_msg_id == last_settle_msg_id:
+            log_event(logging.INFO, 'settle', '重复结算消息，已跳过', user_id=user_ctx.user_id, data=f'msg_id={settle_msg_id}')
+            return
+        if settle_msg_id > 0:
+            rt["last_settle_message_id"] = settle_msg_id
         
         result_num = int(match.group(1))
         result_type = match.group(2)
@@ -1793,6 +1813,13 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         else:
             if rt.get("bet", False):
                 try:
+                    if state.bet_sequence_log and state.bet_sequence_log[-1].get("result") in ("赢", "输"):
+                        # 异常兜底：如果最后一笔已结算但 bet 标记未清理，防止重复发送“押注结果”。
+                        rt["bet"] = False
+                        user_ctx.save_state()
+                        log_event(logging.WARNING, 'settle', '检测到已结算下注，跳过重复结算', user_id=user_ctx.user_id)
+                        return
+
                     prediction = int(rt.get("bet_type", -1))
                     win = (is_big and prediction == 1) or (not is_big and prediction == 0)
                     bet_amount = int(rt.get("bet_amount", 500))
@@ -1804,6 +1831,8 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     
                     direction = "大" if prediction == 1 else "小"
                     result_text = "赢" if win else "输"
+                    # 一笔下注只允许被结算一次；后续重复结算消息不再重复记账。
+                    rt["bet"] = False
                     state.bet_type_history.append(prediction)
                     rt["gambling_fund"] = rt.get("gambling_fund", 0) + profit
                     rt["earnings"] = rt.get("earnings", 0) + profit
@@ -1987,45 +2016,24 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     mes = f"**💥 本轮炸了**\n收益：{period_profit / 10000:.2f} 万"
                     await send_message_v2(client, "explode", mes, user_ctx, global_config)
                 
-                rt["stop_count"] = rt.get("stop", 3) if notify_type == "explode" else rt.get("profit_stop", 5)
-                rt["bet"] = False
-                rt["bet_sequence_count"] = 0
-                mes = f"**暂停押注**\n原因：{'被炸' if notify_type == 'explode' else '盈利达成'}\n剩余：{rt['stop_count']} 局"
-                log_event(logging.INFO, 'settle', '暂停押注', 
-                          user_id=user_ctx.user_id, data=f'type={notify_type}, stop_count={rt["stop_count"]}')
-                await send_to_admin(client, mes, user_ctx, global_config)
-            
-            if rt.get("stop_count", 0) > 1:
-                rt["stop_count"] = rt.get("stop_count", 0) - 1
+                # 使用内部计数（暂停局数+1），由下注入口统一扣减，避免同一局被重复扣减导致“秒恢复”。
+                configured_stop_rounds = int(rt.get("stop", 3) if notify_type == "explode" else rt.get("profit_stop", 5))
+                rt["stop_count"] = max(1, configured_stop_rounds) + 1
                 rt["bet"] = False
                 rt["bet_on"] = False
                 rt["mode_stop"] = False
-                mes = f"**暂停押注**\n剩余：{rt['stop_count']} 局"
-                log_event(logging.INFO, 'settle', '暂停中', 
-                          user_id=user_ctx.user_id, data=f'stop_count={rt["stop_count"]}')
-                await send_to_admin(client, mes, user_ctx, global_config)
-            else:
+                rt["bet_sequence_count"] = 0
                 if period_profit >= profit_target:
                     rt["current_round"] = rt.get("current_round", 1) + 1
                     rt["current_bet_seq"] = 1
                 rt["explode_count"] = 0
                 rt["period_profit"] = 0
-                rt["bet_sequence_count"] = 0
                 rt["lose_count"] = 0
                 rt["win_count"] = 0
                 rt["bet_amount"] = int(rt.get("initial_amount", 500))
-                rt["mode_stop"] = True
-                rt["flag"] = True
-                if rt.get("manual_pause", False):
-                    rt["bet_on"] = False
-                    rt["bet"] = False
-                    mes = "**暂停结束**\n检测到手动暂停，保持暂停状态"
-                else:
-                    rt["bet_on"] = True
-                    rt["bet"] = True
-                    mes = "**恢复押注**\n暂停已结束，新轮次开始"
-                log_event(logging.INFO, 'settle', '恢复押注', 
-                          user_id=user_ctx.user_id, data=f'round={rt.get("current_round", 1)}, bet_amount={rt.get("bet_amount", 500)}')
+                mes = f"**暂停押注**\n原因：{'被炸' if notify_type == 'explode' else '盈利达成'}\n剩余：{configured_stop_rounds} 局"
+                log_event(logging.INFO, 'settle', '暂停押注', 
+                          user_id=user_ctx.user_id, data=f'type={notify_type}, stop_count={configured_stop_rounds}')
                 await send_to_admin(client, mes, user_ctx, global_config)
         
         # 历史记录统计通知
