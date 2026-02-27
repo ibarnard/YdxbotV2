@@ -51,19 +51,21 @@ AUTO_STATS_DELETE_DELAY_SECONDS = 600
 
 # 风控节奏：以最近 40 笔实盘胜率为基础，结合连输深度做分层暂停。
 RISK_WINDOW_BETS = 40
-RISK_BASE_TRIGGER_WINS = 16          # 16/40=40%
+RISK_BASE_TRIGGER_WINS = 15          # 15/40=37.5%
+RISK_BASE_TRIGGER_STREAK_NEEDED = 2   # 连续2次命中基础风控才触发暂停
 RISK_RECOVERY_WINS = 19              # >45% => 至少 19/40
 RISK_RECOVERY_PASS_NEEDED = 2         # 连续2次满足恢复条件才重置风险周期
 
-# 三层风控触发条件与单次暂停上限
-RISK_L1_LOSE_STREAK_TRIGGER = 4       # 一级深度风控：连输>=4
-RISK_L2_LOSE_STREAK_TRIGGER = 6       # 二级深度风控：一级后继续连输到>=6
-RISK_L2_SEQUENCE_THRESHOLD = 7        # 二级深度风控：下一手逼近第7手
+# 深度风控触发档位（不占基础风控预算）：连输里程碑 -> 单次暂停上限
+RISK_DEEP_MILESTONE_CAPS = (
+    (3, 5),
+    (6, 3),
+    (9, 3),
+    (12, 3),
+)
 RISK_BASE_MAX_PAUSE_ROUNDS = 10
-RISK_L1_MAX_PAUSE_ROUNDS = 5
-RISK_L2_MAX_PAUSE_ROUNDS = 3
 
-# 共享预算：同一风险周期内基础+深度累计暂停不超过10局
+# 基础风控预算：同一基础风控周期累计暂停不超过10局（深度风控不占用）
 RISK_PAUSE_TOTAL_CAP_ROUNDS = 10
 RISK_PAUSE_MODEL_TIMEOUT_SEC = 3.5
 
@@ -752,7 +754,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     if len(state.history) < 40:
         log_event(logging.INFO, 'bet_on', '历史数据低于40局，继续执行押注', user_id=user_ctx.user_id, data=f'len={len(state.history)}')
 
-    # 自动风控暂停：40局窗口 + 三层风控（基础/L1/L2）+ 共享10局预算。
+    # 自动风控暂停：基础风控(40局窗口) + 深度风控(3/6/9/12里程碑)。
     # 同一已结算快照不重复触发，避免重复暂停。
     next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
     settled_count = _count_settled_bets(state)
@@ -764,9 +766,16 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
 
     cycle_active = bool(rt.get("risk_pause_cycle_active", False))
     recovery_passes = int(rt.get("risk_pause_recovery_passes", 0))
+    base_hit_streak = int(rt.get("risk_base_hit_streak", 0))
 
     # 风险周期恢复判定：最近40笔胜率>45% 连续2次才重置预算。
     if not skip_same_snapshot and risk_pause:
+        if risk_pause.get("base_trigger", False):
+            base_hit_streak += 1
+        else:
+            base_hit_streak = 0
+        rt["risk_base_hit_streak"] = base_hit_streak
+
         if risk_pause.get("recovery_hit", False):
             if cycle_active:
                 recovery_passes += 1
@@ -780,8 +789,8 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         rt["risk_pause_cycle_active"] = False
         rt["risk_pause_acc_rounds"] = 0
         rt["risk_pause_snapshot_count"] = -1
-        rt["risk_pause_level1_hit"] = False
         rt["risk_pause_recovery_passes"] = 0
+        rt["risk_base_hit_streak"] = 0
         rt["risk_pause_priority_notified"] = False
         log_event(
             logging.INFO,
@@ -793,17 +802,75 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         pause_acc_rounds = 0
         cycle_active = False
 
-    if risk_pause.get("triggered"):
+    # 深度风控优先：3/6/9/12 连输里程碑触发，不占基础风控预算。
+    if risk_pause.get("deep_trigger", False):
+        deep_milestone = int(risk_pause.get("deep_milestone", 0))
+        deep_cap = int(risk_pause.get("deep_level_cap", 3))
+        level_label = f"深度风控（{deep_milestone}连输档）"
+        model_eval = {
+            **risk_pause,
+            "level": f"DEEP_{deep_milestone}",
+            "level_label": level_label,
+        }
+        model_pause_rounds, model_reason, model_source = await _suggest_pause_rounds_by_model(
+            user_ctx,
+            model_eval,
+            max_pause=deep_cap,
+        )
+        pause_rounds = max(1, min(deep_cap, int(model_pause_rounds)))
+        _apply_auto_risk_pause(rt, pause_rounds)
+        rt["risk_pause_snapshot_count"] = settled_count
+        rt["risk_pause_block_hits"] = int(rt.get("risk_pause_block_hits", 0)) + 1
+        rt["risk_pause_block_rounds"] = int(rt.get("risk_pause_block_rounds", 0)) + pause_rounds
+
+        deep_triggered = _get_deep_triggered_milestones(rt)
+        if deep_milestone not in deep_triggered:
+            deep_triggered.append(deep_milestone)
+            rt["risk_deep_triggered_milestones"] = sorted(set(int(x) for x in deep_triggered))
+
+        wins = risk_pause.get("wins", 0)
+        total = risk_pause.get("total", 0)
+        win_rate = risk_pause.get("win_rate", 0.0) * 100
+        reason_text = "、".join(risk_pause.get("reasons", [])) or f"连输达到{deep_milestone}档位"
+        pause_msg = (
+            "⛔ 自动风控暂停\n"
+            f"触发层级：{level_label}\n"
+            f"触发原因：{reason_text}\n"
+            f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
+            f"当前计划连押：第 {next_sequence} 手\n"
+            f"模型建议：{model_pause_rounds} 局（来源：{model_source}）\n"
+            f"暂停局数：{pause_rounds} 局（该层上限 {deep_cap}，不占基础预算）\n"
+            f"模型依据：{model_reason}\n"
+            "动作：保留当前倍投进度，观察盘面后继续"
+        )
+
+        if hasattr(user_ctx, "risk_pause_message") and user_ctx.risk_pause_message:
+            await cleanup_message(client, user_ctx.risk_pause_message)
+        user_ctx.risk_pause_message = await send_to_admin(client, pause_msg, user_ctx, global_config)
+        rt["risk_pause_priority_notified"] = True
+        user_ctx.save_state()
+        log_event(
+            logging.INFO,
+            'bet_on',
+            '触发深度风控暂停',
+            user_id=user_ctx.user_id,
+            data=(
+                f"milestone={deep_milestone}, next_seq={next_sequence}, "
+                f"pause_rounds={pause_rounds}, source={model_source}"
+            ),
+        )
+        return
+
+    # 基础风控：40局<=37.5% 且连续2次命中后才触发，使用10局基础预算。
+    if risk_pause.get("base_trigger", False) and base_hit_streak >= RISK_BASE_TRIGGER_STREAK_NEEDED:
         remain_pause_budget = max(0, RISK_PAUSE_TOTAL_CAP_ROUNDS - pause_acc_rounds)
         rt["risk_pause_cycle_active"] = True
         rt["risk_pause_snapshot_count"] = settled_count
-        if risk_pause.get("level") in ("L1", "L2"):
-            rt["risk_pause_level1_hit"] = True
 
         if remain_pause_budget <= 0:
             warn_msg = (
-                "⚠️ 自动风控暂停已达上限\n"
-                f"累计暂停已达 {RISK_PAUSE_TOTAL_CAP_ROUNDS} 局，本局继续下注。\n"
+                "⚠️ 基础风控暂停已达上限\n"
+                f"基础风控累计暂停已达 {RISK_PAUSE_TOTAL_CAP_ROUNDS} 局，本局继续下注。\n"
                 "动作：保留当前倍投进度，后续按新结算数据继续评估风控。"
             )
             await send_to_admin(client, warn_msg, user_ctx, global_config)
@@ -811,16 +878,21 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             log_event(
                 logging.INFO,
                 'bet_on',
-                '自动风控暂停达上限，放行下注',
+                '基础风控暂停达上限，放行下注',
                 user_id=user_ctx.user_id,
                 data=f'settled_count={settled_count}, cap={RISK_PAUSE_TOTAL_CAP_ROUNDS}'
             )
         else:
-            layer_cap = int(risk_pause.get("level_cap", RISK_BASE_MAX_PAUSE_ROUNDS))
+            layer_cap = int(RISK_BASE_MAX_PAUSE_ROUNDS)
             max_allow_rounds = max(1, min(layer_cap, remain_pause_budget))
+            model_eval = {
+                **risk_pause,
+                "level": "BASE",
+                "level_label": "基础风控",
+            }
             model_pause_rounds, model_reason, model_source = await _suggest_pause_rounds_by_model(
                 user_ctx,
-                risk_pause,
+                model_eval,
                 max_pause=max_allow_rounds,
             )
             pause_rounds = max(1, min(max_allow_rounds, int(model_pause_rounds)))
@@ -835,15 +907,14 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             total = risk_pause.get("total", RISK_WINDOW_BETS)
             win_rate = risk_pause.get("win_rate", 0.0) * 100
             reason_text = "、".join(risk_pause.get("reasons", [])) or "盘面波动风控"
-            level_label = risk_pause.get("level_label", "基础风控")
             pause_msg = (
                 "⛔ 自动风控暂停\n"
-                f"触发层级：{level_label}\n"
+                "触发层级：基础风控\n"
                 f"触发原因：{reason_text}\n"
                 f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
                 f"当前计划连押：第 {next_sequence} 手\n"
                 f"模型建议：{model_pause_rounds} 局（来源：{model_source}）\n"
-                f"暂停局数：{pause_rounds} 局（层级上限 {layer_cap}，累计 {rt.get('risk_pause_acc_rounds', 0)}/{RISK_PAUSE_TOTAL_CAP_ROUNDS}）\n"
+                f"暂停局数：{pause_rounds} 局（连续命中 {base_hit_streak}/{RISK_BASE_TRIGGER_STREAK_NEEDED}，基础预算累计 {rt.get('risk_pause_acc_rounds', 0)}/{RISK_PAUSE_TOTAL_CAP_ROUNDS}）\n"
                 f"模型依据：{model_reason}\n"
                 "动作：保留当前倍投进度，等待盘面修复后继续下注"
             )
@@ -863,7 +934,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 data=(
                     f"wins={wins}/{total}, wr={win_rate:.2f}%, "
                     f"next_seq={next_sequence}, pause_rounds={pause_rounds}, "
-                    f"level={risk_pause.get('level', 'BASE')}, "
+                    "level=BASE, "
                     f"pause_acc={rt.get('risk_pause_acc_rounds', 0)}"
                 ),
             )
@@ -1295,12 +1366,13 @@ def _fallback_pause_rounds(level: str, wins: int, total: int, lose_count: int, m
         return min(1, max_pause)
 
     win_rate = wins / total
-    if level == "L2":
-        # 二级深度：更谨慎，但单次不宜过长
-        base = 2 if lose_count >= 7 else 1
-        return max(1, min(max_pause, base))
-    if level == "L1":
-        base = 3 if lose_count >= 5 else 2
+    if str(level).startswith("DEEP"):
+        if lose_count >= 9:
+            base = 2
+        elif lose_count >= 6:
+            base = 2
+        else:
+            base = 3
         return max(1, min(max_pause, base))
 
     # BASE：根据40局胜率分层
@@ -1408,74 +1480,68 @@ async def _suggest_pause_rounds_by_model(
         return fallback_rounds, fallback_reason, "fallback"
 
 
+def _get_deep_triggered_milestones(rt: dict) -> list:
+    """读取并规范化已触发的深度风控里程碑。"""
+    raw = rt.get("risk_deep_triggered_milestones", [])
+    if isinstance(raw, list):
+        items = raw
+    elif isinstance(raw, str):
+        items = [part.strip() for part in raw.split(",") if part.strip()]
+    else:
+        items = []
+
+    normalized = []
+    for item in items:
+        try:
+            normalized.append(int(item))
+        except Exception:
+            continue
+    return sorted(set(normalized))
+
+
 def _evaluate_auto_risk_pause(state, rt: dict, next_sequence: int) -> dict:
     """
-    评估是否触发自动风控暂停（40局窗口 + 分层风控）。
-    1) BASE：最近40笔胜率<=40%
-    2) L1：连输>=4
-    3) L2：L1后继续连输>=6，且下一手逼近第7手
+    评估自动风控状态（基础风控 + 深度风控里程碑）。
+    基础风控：最近40笔胜率阈值触发（连续命中由外层控制）
+    深度风控：连输达到 3/6/9/12 档位时触发（每档同一连输周期仅触发一次）
     """
     outcomes = _get_recent_settled_outcomes(state, RISK_WINDOW_BETS)
     total = len(outcomes)
-    if total < RISK_WINDOW_BETS:
-        return {}
-
     wins = int(sum(outcomes))
     win_rate = wins / total if total > 0 else 0.0
     lose_count = int(rt.get("lose_count", 0))
+    base_window_ready = total >= RISK_WINDOW_BETS
+    base_trigger = base_window_ready and wins <= RISK_BASE_TRIGGER_WINS
+    recovery_hit = base_window_ready and wins >= RISK_RECOVERY_WINS
 
-    base_trigger = wins <= RISK_BASE_TRIGGER_WINS
-    level1_trigger = lose_count >= RISK_L1_LOSE_STREAK_TRIGGER
-    level2_trigger = (
-        bool(rt.get("risk_pause_level1_hit", False))
-        and lose_count >= RISK_L2_LOSE_STREAK_TRIGGER
-        and next_sequence >= RISK_L2_SEQUENCE_THRESHOLD
-    )
+    triggered_milestones = _get_deep_triggered_milestones(rt)
+    deep_milestone = 0
+    deep_level_cap = 0
+    for milestone, cap in RISK_DEEP_MILESTONE_CAPS:
+        if lose_count >= milestone and milestone not in triggered_milestones:
+            deep_milestone = milestone
+            deep_level_cap = cap
 
-    level = ""
-    level_label = ""
-    level_cap = 0
     reasons = []
-
-    if level2_trigger:
-        level = "L2"
-        level_label = "二级深度风控"
-        level_cap = RISK_L2_MAX_PAUSE_ROUNDS
-        reasons.append("一级风控后继续连输，下一手逼近第7手")
-    elif level1_trigger:
-        level = "L1"
-        level_label = "一级深度风控"
-        level_cap = RISK_L1_MAX_PAUSE_ROUNDS
-        reasons.append("连输达到4局")
-    elif base_trigger:
-        level = "BASE"
-        level_label = "基础风控"
-        level_cap = RISK_BASE_MAX_PAUSE_ROUNDS
-        reasons.append("最近40笔胜率<=40%")
-    else:
-        return {
-            "triggered": False,
-            "wins": wins,
-            "total": total,
-            "win_rate": win_rate,
-            "lose_count": lose_count,
-            "recovery_hit": wins >= RISK_RECOVERY_WINS,
-        }
-
-    if base_trigger and level != "BASE":
-        reasons.append("最近40笔胜率<=40%")
+    if base_trigger:
+        reasons.append("最近40笔胜率<=37.5%")
+    if deep_milestone > 0:
+        reasons.append(f"连输达到{deep_milestone}局档位")
 
     return {
-        "triggered": True,
+        "triggered": bool(base_trigger or deep_milestone > 0),
         "wins": wins,
         "total": total,
         "win_rate": win_rate,
         "next_sequence": next_sequence,
         "lose_count": lose_count,
-        "level": level,
-        "level_label": level_label,
-        "level_cap": level_cap,
-        "recovery_hit": wins >= RISK_RECOVERY_WINS,
+        "base_window_ready": base_window_ready,
+        "base_trigger": base_trigger,
+        "recovery_hit": recovery_hit,
+        "deep_trigger": deep_milestone > 0,
+        "deep_milestone": deep_milestone,
+        "deep_level_cap": deep_level_cap,
+        "deep_triggered_milestones": triggered_milestones,
         "reasons": reasons,
         "recent_outcomes": outcomes[-20:],
     }
@@ -1746,6 +1812,10 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     rt["win_count"] = rt.get("win_count", 0) + 1 if win else 0
                     rt["lose_count"] = rt.get("lose_count", 0) + 1 if not win else 0
                     rt["status"] = 1 if win else 0
+                    if win:
+                        # 结束本轮连输后，重置深度风控里程碑触发记录
+                        rt["risk_deep_triggered_milestones"] = []
+                        rt["risk_pause_level1_hit"] = False
                     
                     # 连输逻辑处理
                     if not win:
@@ -2757,7 +2827,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["risk_pause_snapshot_count"] = -1
                     rt["risk_pause_cycle_active"] = False
                     rt["risk_pause_recovery_passes"] = 0
+                    rt["risk_base_hit_streak"] = 0
                     rt["risk_pause_level1_hit"] = False
+                    rt["risk_deep_triggered_milestones"] = []
                     user_ctx.save_state()
                     mes = "统计数据已重置"
                     log_event(logging.INFO, 'user_cmd', '重置统计数据', user_id=user_ctx.user_id, action='completed')
@@ -2779,7 +2851,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["risk_pause_snapshot_count"] = -1
                     rt["risk_pause_cycle_active"] = False
                     rt["risk_pause_recovery_passes"] = 0
+                    rt["risk_base_hit_streak"] = 0
                     rt["risk_pause_level1_hit"] = False
+                    rt["risk_deep_triggered_milestones"] = []
                     user_ctx.save_state()
                     mes = "状态文件已重置"
                     log_event(logging.INFO, 'user_cmd', '重置状态文件', user_id=user_ctx.user_id, action='completed')
@@ -2803,7 +2877,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["risk_pause_snapshot_count"] = -1
                     rt["risk_pause_cycle_active"] = False
                     rt["risk_pause_recovery_passes"] = 0
+                    rt["risk_base_hit_streak"] = 0
                     rt["risk_pause_level1_hit"] = False
+                    rt["risk_deep_triggered_milestones"] = []
                     user_ctx.save_state()
                     mes = f"押注策略已重置: 初始金额={rt.get('initial_amount', 500)}"
                     log_event(logging.INFO, 'user_cmd', '重置押注策略', user_id=user_ctx.user_id, action='completed')
