@@ -997,6 +997,130 @@ def test_process_settle_lose_end_message_contains_balance_lines(tmp_path, monkey
     assert "💰 菠菜资金剩余：2456.84 万" in msg
 
 
+def test_process_settle_skips_stale_lose_end_when_old_lose_count_zero(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5022"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "连输脏状态用户"},
+            "telegram": {"user_id": 5022},
+            "groups": {"admin_chat": 5022},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["bet"] = True
+    rt["bet_type"] = 1  # 押大，下面开大 -> 赢
+    rt["bet_amount"] = 1000
+    rt["warning_lose_count"] = 3
+    rt["lose_count"] = 0
+    rt["lose_notify_pending"] = True
+    rt["lose_start_info"] = {"round": 2, "seq": 56, "fund": 9_999_999}
+    rt["current_round"] = 1
+    rt["current_bet_seq"] = 1
+    rt["current_preset_name"] = "yc05"
+    rt["account_balance"] = 315_300
+    rt["gambling_fund"] = 314_800
+    ctx.state.bet_sequence_log = [{"bet_id": "20260228_1_1", "profit": None}]
+
+    sent_types = []
+    sent_msgs = []
+
+    async def fake_send_message_v2(client, msg_type, message, user_ctx, global_cfg, parse_mode="markdown", title=None, desp=None):
+        sent_types.append(msg_type)
+        sent_msgs.append(message)
+        return None
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_msgs.append(message)
+        return SimpleNamespace(chat_id=5022, id=len(sent_msgs))
+
+    async def fake_fetch_balance(user_ctx):
+        return rt["account_balance"]
+
+    monkeypatch.setattr(zm, "send_message_v2", fake_send_message_v2)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "fetch_balance", fake_fetch_balance)
+
+    class DummyClient:
+        async def send_message(self, target, message, parse_mode=None):
+            return SimpleNamespace(chat_id=target, id=1)
+
+        async def delete_messages(self, chat_id, message_id):
+            return None
+
+    event = SimpleNamespace(id=45001, message=SimpleNamespace(message="已结算: 结果为 9 大"))
+    asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
+
+    assert "lose_end" not in sent_types
+    assert not any("0 连输已终止" in m for m in sent_msgs)
+    assert rt["lose_notify_pending"] is False
+    assert rt["lose_start_info"] == {}
+
+
+def test_process_settle_skips_lose_end_when_range_is_invalid(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5023"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "连输区间异常用户"},
+            "telegram": {"user_id": 5023},
+            "groups": {"admin_chat": 5023},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["bet"] = True
+    rt["bet_type"] = 1  # 押大，下面开大 -> 赢
+    rt["bet_amount"] = 1000
+    rt["warning_lose_count"] = 3
+    rt["lose_count"] = 3
+    rt["lose_notify_pending"] = True
+    rt["lose_start_info"] = {"round": 2, "seq": 56, "fund": 9_999_999}
+    rt["current_round"] = 1
+    rt["current_bet_seq"] = 1
+    rt["current_preset_name"] = "yc05"
+    rt["account_balance"] = 315_300
+    rt["gambling_fund"] = 314_800
+    ctx.state.bet_sequence_log = [{"bet_id": "20260228_1_1", "profit": None}]
+
+    sent_types = []
+    sent_msgs = []
+
+    async def fake_send_message_v2(client, msg_type, message, user_ctx, global_cfg, parse_mode="markdown", title=None, desp=None):
+        sent_types.append(msg_type)
+        sent_msgs.append(message)
+        return None
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_msgs.append(message)
+        return SimpleNamespace(chat_id=5023, id=len(sent_msgs))
+
+    async def fake_fetch_balance(user_ctx):
+        return rt["account_balance"]
+
+    monkeypatch.setattr(zm, "send_message_v2", fake_send_message_v2)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "fetch_balance", fake_fetch_balance)
+
+    class DummyClient:
+        async def send_message(self, target, message, parse_mode=None):
+            return SimpleNamespace(chat_id=target, id=1)
+
+        async def delete_messages(self, chat_id, message_id):
+            return None
+
+    event = SimpleNamespace(id=45002, message=SimpleNamespace(message="已结算: 结果为 9 大"))
+    asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
+
+    assert "lose_end" not in sent_types
+    assert not any("连输已终止" in m for m in sent_msgs)
+    assert rt["lose_notify_pending"] is False
+    assert rt["lose_start_info"] == {}
+
+
 def test_process_settle_profit_pause_does_not_immediately_resume(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "5014"
     _write_json(

@@ -918,6 +918,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         rt["bet"] = False
         rt["bet_on"] = False
         rt["mode_stop"] = True
+        _clear_lose_recovery_tracking(rt)
         user_ctx.save_state()
         return
     rt["limit_stop_notified"] = False
@@ -931,6 +932,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         rt["bet"] = False
         rt["bet_on"] = False
         rt["mode_stop"] = True
+        _clear_lose_recovery_tracking(rt)
         user_ctx.save_state()
         return
     rt["fund_pause_notified"] = False
@@ -1740,6 +1742,29 @@ def count_lose_streaks(bet_sequence_log):
     return lose_streaks
 
 
+def _clear_lose_recovery_tracking(rt: dict) -> None:
+    """清理连输回补跟踪状态，避免跨轮次残留导致误发“连输已终止”消息。"""
+    rt["lose_notify_pending"] = False
+    rt["lose_start_info"] = {}
+
+
+def _is_valid_lose_range(start_round, start_seq, end_round, end_seq) -> bool:
+    """校验连输区间是否有效（起点不晚于终点）。"""
+    try:
+        sr = int(start_round)
+        ss = int(start_seq)
+        er = int(end_round)
+        es = int(end_seq)
+    except Exception:
+        return False
+
+    if sr > er:
+        return False
+    if sr == er and ss > es:
+        return False
+    return True
+
+
 def generate_bet_id(user_ctx: UserContext) -> str:
     """生成押注 ID（与 master 逻辑一致：按天重置轮次）。"""
     rt = user_ctx.state.runtime
@@ -1997,6 +2022,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                         if rt.get("lose_count", 0) == 1:
                             # 新一轮连输起点，清理旧里程碑，防止深度风控误判为“已触发”
                             rt["risk_deep_triggered_milestones"] = []
+                            _clear_lose_recovery_tracking(rt)
                             rt["lose_start_info"] = {
                                 "round": settle_round,
                                 "seq": settle_seq,
@@ -2069,30 +2095,48 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     # 连输终止处理（赢了）
                     if win and rt.get("lose_notify_pending", False):
                         try:
+                            warning_lose_count = int(rt.get("warning_lose_count", 3))
                             lose_start_info = rt.get("lose_start_info", {})
-                            total_profit = rt.get("gambling_fund", 0) - lose_start_info.get("fund", rt.get("gambling_fund", 0))
-                            
                             start_round = lose_start_info.get("round", "?")
                             start_seq = lose_start_info.get("seq", "?")
                             end_round = settle_round
                             end_seq = settle_seq
-                            continuous_count = max(int(rt.get("bet_sequence_count", 0)), old_lose_count + 1)
-                            lose_end_payload = {
-                                "start_round": start_round,
-                                "start_seq": start_seq,
-                                "end_round": end_round,
-                                "end_seq": end_seq,
-                                "lose_count": old_lose_count,
-                                "continuous_count": continuous_count,
-                                "total_profit": total_profit,
-                            }
+                            total_profit = rt.get("gambling_fund", 0) - lose_start_info.get("fund", rt.get("gambling_fund", 0))
+
+                            if (
+                                int(old_lose_count) >= warning_lose_count
+                                and _is_valid_lose_range(start_round, start_seq, end_round, end_seq)
+                            ):
+                                continuous_count = max(int(rt.get("bet_sequence_count", 0)), old_lose_count + 1)
+                                lose_end_payload = {
+                                    "start_round": start_round,
+                                    "start_seq": start_seq,
+                                    "end_round": end_round,
+                                    "end_seq": end_seq,
+                                    "lose_count": old_lose_count,
+                                    "continuous_count": continuous_count,
+                                    "total_profit": total_profit,
+                                }
+                            else:
+                                log_event(
+                                    logging.WARNING,
+                                    'settle',
+                                    '跳过异常连输终止通知',
+                                    user_id=user_ctx.user_id,
+                                    data=(
+                                        f"old_lose_count={old_lose_count}, warning={warning_lose_count}, "
+                                        f"start={start_round}-{start_seq}, end={end_round}-{end_seq}"
+                                    ),
+                                )
                         except Exception as e:
                             log_event(logging.ERROR, 'settle', '连输终止通知异常', 
                                       user_id=user_ctx.user_id, data=str(e))
                         
                         # 重置状态
-                        rt["lose_notify_pending"] = False
-                        rt["lose_start_info"] = {}
+                        _clear_lose_recovery_tracking(rt)
+                    elif win:
+                        # 防御式清理：赢单但不存在有效连输链，清理可能遗留的待回补状态。
+                        _clear_lose_recovery_tracking(rt)
                     
                     log_event(logging.INFO, 'settle', '结算结果', 
                               user_id=user_ctx.user_id, data=f'result={result_text}, profit={profit}, fund={rt.get("gambling_fund", 0)}')
@@ -2219,6 +2263,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                 rt["lose_count"] = 0
                 rt["win_count"] = 0
                 rt["bet_amount"] = int(rt.get("initial_amount", 500))
+                _clear_lose_recovery_tracking(rt)
                 mes = f"**暂停押注**\n原因：{'被炸' if notify_type == 'explode' else '盈利达成'}\n剩余：{configured_stop_rounds} 局"
                 log_event(logging.INFO, 'settle', '暂停押注', 
                           user_id=user_ctx.user_id, data=f'type={notify_type}, stop_count={configured_stop_rounds}')
@@ -2566,6 +2611,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             rt["bet_on"] = True
             rt["mode_stop"] = True
             rt["manual_pause"] = False
+            _clear_lose_recovery_tracking(rt)
             user_ctx.save_state()
             mes = "押注已启动"
             message = await send_to_admin(client, mes, user_ctx, global_config)
@@ -2580,6 +2626,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             rt["open_ydx"] = False
             rt["bet_on"] = False
             rt["manual_pause"] = False
+            _clear_lose_recovery_tracking(rt)
             user_ctx.save_state()
             mes = "押注已停止"
             message = await send_to_admin(client, mes, user_ctx, global_config)
@@ -2656,6 +2703,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             rt["bet"] = False
             rt["mode_stop"] = True
             rt["manual_pause"] = True
+            _clear_lose_recovery_tracking(rt)
             user_ctx.save_state()
             mes = "⏸ 已暂停当前账号押注"
             await send_to_admin(client, mes, user_ctx, global_config)
@@ -2693,6 +2741,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 rt["risk_deep_triggered_milestones"] = []
                 rt["fund_pause_notified"] = False
                 rt["limit_stop_notified"] = False
+                _clear_lose_recovery_tracking(rt)
                 user_ctx.save_state()
                 
                 mes = f"预设启动成功: {preset_name} ({preset[0]} {preset[1]} {preset[2]} {preset[3]} {preset[4]} {preset[5]} {preset[6]})"
@@ -3036,6 +3085,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["risk_base_hit_streak"] = 0
                     rt["risk_pause_level1_hit"] = False
                     rt["risk_deep_triggered_milestones"] = []
+                    _clear_lose_recovery_tracking(rt)
                     user_ctx.save_state()
                     mes = "统计数据已重置"
                     log_event(logging.INFO, 'user_cmd', '重置统计数据', user_id=user_ctx.user_id, action='completed')
@@ -3060,6 +3110,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["risk_base_hit_streak"] = 0
                     rt["risk_pause_level1_hit"] = False
                     rt["risk_deep_triggered_milestones"] = []
+                    _clear_lose_recovery_tracking(rt)
                     user_ctx.save_state()
                     mes = "状态文件已重置"
                     log_event(logging.INFO, 'user_cmd', '重置状态文件', user_id=user_ctx.user_id, action='completed')
@@ -3086,6 +3137,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["risk_base_hit_streak"] = 0
                     rt["risk_pause_level1_hit"] = False
                     rt["risk_deep_triggered_milestones"] = []
+                    _clear_lose_recovery_tracking(rt)
                     user_ctx.save_state()
                     mes = f"押注策略已重置: 初始金额={rt.get('initial_amount', 500)}"
                     log_event(logging.INFO, 'user_cmd', '重置押注策略', user_id=user_ctx.user_id, action='completed')
@@ -3247,6 +3299,7 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
         rt["bet"] = False
         rt["bet_on"] = False
         rt["mode_stop"] = True
+        _clear_lose_recovery_tracking(rt)
         if not rt.get("limit_stop_notified", False):
             lose_stop = int(rt.get("lose_stop", 13))
             await send_to_admin(
@@ -3273,6 +3326,7 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
     elif not is_fund_available(user_ctx, next_bet_amount):
         rt["bet_on"] = False
         rt["mode_stop"] = True
+        _clear_lose_recovery_tracking(rt)
         if not rt.get("fund_pause_notified", False):
             await send_to_admin(client, "⚠️ 菠菜资金不足，已自动暂停押注", user_ctx, global_config)
             rt["fund_pause_notified"] = True
