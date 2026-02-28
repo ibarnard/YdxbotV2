@@ -2542,8 +2542,32 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
     presets = user_ctx.presets
     
     text = event.raw_text.strip()
-    my = text.split(" ")
-    cmd = my[0].lower()
+    if not text:
+        return
+
+    my = text.split()
+    if not my:
+        return
+
+    raw_cmd = str(my[0]).strip()
+    if not raw_cmd:
+        return
+
+    # 仅解析“命令形态”文本，避免把通知正文(⚠️/🔢/📊开头)当成未知命令。
+    # 兼容 `/help` 与中文命令别名 `暂停/恢复`。
+    normalized_cmd = raw_cmd[1:] if raw_cmd.startswith("/") else raw_cmd
+    if not normalized_cmd:
+        return
+
+    allowed_cn_cmds = {"暂停", "恢复"}
+    is_ascii_cmd = (
+        normalized_cmd[0].isalpha()
+        and all(ch.isalnum() or ch in {"_", "-"} for ch in normalized_cmd)
+    )
+    if normalized_cmd not in allowed_cn_cmds and not is_ascii_cmd:
+        return
+
+    cmd = normalized_cmd.lower()
     
     log_event(logging.INFO, 'user_cmd', '处理用户命令', user_id=user_ctx.user_id, data=text[:50])
     
