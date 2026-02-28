@@ -237,6 +237,8 @@ class UserContext:
         self.client = None
         self._model_manager = None
         self._model_manager_ai_sig = ""
+        self._config_path = ""
+        self._config_data = {}
         self._lock = threading.Lock()
         self._load_all()
     
@@ -280,6 +282,8 @@ class UserContext:
         config_path = self._resolve_user_config_path()
 
         data = load_json_with_comments(config_path)
+        self._config_path = config_path
+        self._config_data = dict(data) if isinstance(data, dict) else {}
         global_cfg = self.global_config or {}
 
         account_cfg = merge_dict(global_cfg.get("account", {}), data.get("account", {}))
@@ -325,6 +329,50 @@ class UserContext:
             '加载用户配置成功',
             f'user_id={self.user_id}, name={self.config.name}, file={os.path.basename(config_path)}'
         )
+
+    def get_user_config_path(self) -> str:
+        return self._config_path or self._resolve_user_config_path()
+
+    def reload_user_config(self):
+        """重新加载账号配置并刷新模型配置。"""
+        with self._lock:
+            self._load_config()
+            self._model_manager_ai_sig = ""
+        if self._model_manager is not None:
+            self.get_model_manager().load_models()
+
+    def update_ai_config(self, new_ai_config: Dict[str, Any]) -> str:
+        """
+        更新并持久化账号 ai 配置到对应 *_config.json。
+        返回写入路径。
+        """
+        if not isinstance(new_ai_config, dict):
+            raise ValueError("ai 配置必须是对象(dict)")
+
+        with self._lock:
+            config_path = self.get_user_config_path()
+            data = load_json_with_comments(config_path)
+            if not isinstance(data, dict):
+                data = {}
+
+            # 统一使用 api_keys 字段，兼容迁移旧字段 api_key。
+            ai_data = dict(new_ai_config)
+            if "api_key" in ai_data and "api_keys" not in ai_data:
+                ai_data["api_keys"] = ai_data.pop("api_key")
+            ai_data.pop("api_key", None)
+            data["ai"] = ai_data
+
+            with open(config_path, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=4, ensure_ascii=False)
+
+            self._config_path = config_path
+            self._config_data = data
+            self.config.ai = ai_data
+            self._model_manager_ai_sig = ""
+
+        if self._model_manager is not None:
+            self.get_model_manager().load_models()
+        return config_path
     
     def _load_state(self):
         state_path = os.path.join(self.user_dir, "state.json")

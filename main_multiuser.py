@@ -117,6 +117,30 @@ def _get_user_event_lock(user_ctx: UserContext) -> asyncio.Lock:
     return lock
 
 
+def _normalize_ai_keys(ai_cfg: Any) -> List[str]:
+    if not isinstance(ai_cfg, dict):
+        return []
+    raw = ai_cfg.get("api_keys", ai_cfg.get("api_key", []))
+    if isinstance(raw, str):
+        key = raw.strip()
+        return [key] if key else []
+    if isinstance(raw, list):
+        keys: List[str] = []
+        for item in raw:
+            text = str(item).strip()
+            if text:
+                keys.append(text)
+        return keys
+    return []
+
+
+def _looks_like_ai_key_issue(error_text: str) -> bool:
+    text = str(error_text or "").lower()
+    if not text:
+        return False
+    return any(sig in text for sig in ("401", "unauthorized", "authentication", "invalid api key", "invalid token", "forbidden"))
+
+
 def _get_allowed_sender_ids(user_ctx: UserContext) -> set:
     """
     可选命令发送者白名单（默认关闭，保持兼容）。
@@ -182,8 +206,13 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
     
     @client.on(events.NewMessage(chats=admin_chat if admin_chat else []))
     async def user_handler(event):
+        raw_text = (event.raw_text or "").strip()
+        safe_cmd = raw_text[:50]
+        lower_text = raw_text.lower()
+        if lower_text.startswith("apikey ") or lower_text.startswith("/apikey "):
+            safe_cmd = "apikey ***"
         log_event(logging.DEBUG, 'user_cmd', '收到用户命令',
-                  user_id=user_ctx.user_id, cmd=event.raw_text[:50])
+                  user_id=user_ctx.user_id, cmd=safe_cmd)
         allowed_senders = _get_allowed_sender_ids(user_ctx)
         if allowed_senders:
             sender_id = getattr(event, "sender_id", None)
@@ -231,6 +260,7 @@ async def check_models_for_user(client, user_ctx: UserContext):
         
         total_models = sum(len(ms) for ms in models.values())
         success_count = 0
+        failure_errors: List[str] = []
         
         for provider, ms in models.items():
             report += f"📁 **{provider.upper()}**\n"
@@ -248,6 +278,7 @@ async def check_models_for_user(client, user_ctx: UserContext):
                 else:
                     status = f"❌ 失败"
                     latency = "-"
+                    failure_errors.append(str(res.get("error", "")))
                 
                 report += f"{status} `{mid}` ({latency}ms)\n"
             report += "\n"
@@ -258,6 +289,16 @@ async def check_models_for_user(client, user_ctx: UserContext):
         admin_chat = _resolve_admin_chat(user_ctx)
         if admin_chat:
             await client.send_message(admin_chat, report)
+
+            ai_cfg = user_ctx.config.ai if isinstance(user_ctx.config.ai, dict) else {}
+            has_keys = bool(_normalize_ai_keys(ai_cfg))
+            key_issue_detected = (not has_keys) or any(_looks_like_ai_key_issue(err) for err in failure_errors)
+            if key_issue_detected:
+                warn = (
+                    "⚠️ 大模型AI key 失效/缺失，请更新 key！！！\n"
+                    "请在管理员窗口执行：`apikey set <新key>`"
+                )
+                await client.send_message(admin_chat, warn)
         log_event(logging.INFO, 'model_check', '模型自检完成', user_id=user_ctx.user_id)
         
     except Exception as e:

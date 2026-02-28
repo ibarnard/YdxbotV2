@@ -18,7 +18,7 @@ from collections import Counter
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from user_manager import UserContext
-from typing import Dict, Any
+from typing import Dict, Any, List
 import constants
 from update_manager import (
     get_current_repo_info,
@@ -65,6 +65,7 @@ RISK_BASE_MAX_PAUSE_ROUNDS = 10
 # 基础风控预算：同一基础风控周期累计暂停不超过10局（深度风控不占用）
 RISK_PAUSE_TOTAL_CAP_ROUNDS = 10
 RISK_PAUSE_MODEL_TIMEOUT_SEC = 3.5
+AI_KEY_WARNING_TEXT = "⚠️ 大模型AI key 失效/缺失，请更新 key！！！"
 
 
 def log_event(level, module, event, message=None, **kwargs):
@@ -83,6 +84,76 @@ def log_event(level, module, event, message=None, **kwargs):
 def format_number(num):
     """与 master 版一致：使用千分位格式。"""
     return f"{int(num):,}"
+
+
+def _normalize_ai_keys(ai_cfg: Dict[str, Any]) -> List[str]:
+    """统一读取 ai api_keys，兼容旧字段 api_key。"""
+    if not isinstance(ai_cfg, dict):
+        return []
+    raw = ai_cfg.get("api_keys", ai_cfg.get("api_key", []))
+    if isinstance(raw, str):
+        key = raw.strip()
+        return [key] if key else []
+    if isinstance(raw, list):
+        keys: List[str] = []
+        for item in raw:
+            text = str(item).strip()
+            if text:
+                keys.append(text)
+        return keys
+    return []
+
+
+def _mask_api_key(key: str) -> str:
+    text = str(key or "")
+    if len(text) <= 8:
+        return "*" * len(text)
+    return f"{text[:4]}***{text[-4:]}"
+
+
+def _looks_like_ai_key_issue(error_text: str) -> bool:
+    text = str(error_text or "").lower()
+    if not text:
+        return False
+
+    # 明确排除非鉴权问题，避免误判。
+    non_auth_signals = ("rate limit", "429", "timeout", "connection", "network")
+    if any(sig in text for sig in non_auth_signals):
+        return False
+
+    auth_signals = (
+        "401",
+        "unauthorized",
+        "authentication",
+        "invalid api key",
+        "api key is invalid",
+        "invalid token",
+        "bad api key",
+        "incorrect api key",
+        "expired",
+        "forbidden",
+    )
+    return any(sig in text for sig in auth_signals)
+
+
+def _mark_ai_key_issue(rt: Dict[str, Any], reason: str):
+    rt["ai_key_issue_active"] = True
+    rt["ai_key_issue_reason"] = str(reason or "")[:200]
+
+
+def _clear_ai_key_issue(rt: Dict[str, Any]):
+    rt["ai_key_issue_active"] = False
+    rt["ai_key_issue_reason"] = ""
+
+
+def _build_ai_key_warning_message(rt: Dict[str, Any]) -> str:
+    reason = str(rt.get("ai_key_issue_reason", "")).strip()
+    reason_line = f"\n原因：{reason}" if reason else ""
+    return (
+        f"{AI_KEY_WARNING_TEXT}\n"
+        f"当前模型：{rt.get('current_model_id', 'unknown')}{reason_line}\n"
+        "请在管理员窗口执行：`apikey set <新key>`"
+    )
 
 
 def get_software_version_text() -> str:
@@ -635,8 +706,12 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
                   user_id=user_ctx.user_id, data=f'形态:{pattern_tag} 缺口:{gap:+d} 压力:{lose_count + 1}次')
         
         # ========== 第四步：调用模型与多层兜底 ==========
-        
+
         try:
+            configured_keys = _normalize_ai_keys(user_ctx.config.ai if isinstance(user_ctx.config.ai, dict) else {})
+            if not configured_keys:
+                raise Exception("AI_KEY_MISSING")
+
             result = await user_ctx.get_model_manager().call_model(
                 current_model_id,
                 messages,
@@ -645,13 +720,20 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
             )
             if not result['success']:
                 raise Exception(f"Model Error: {result['error']}")
+
+            _clear_ai_key_issue(rt)
             
             default_pred = trend_gap['regression_target']
             final_result = parse_analysis_result_insight(result['content'], default_prediction=default_pred)
             
         except Exception as model_error:
+            err_text = str(model_error)
+            if "AI_KEY_MISSING" in err_text:
+                _mark_ai_key_issue(rt, "未配置可用 api_keys")
+            elif _looks_like_ai_key_issue(err_text):
+                _mark_ai_key_issue(rt, err_text)
             log_event(logging.WARNING, 'predict_v10', '模型调用失败，统计兜底', 
-                      user_id=user_ctx.user_id, data=str(model_error))
+                      user_id=user_ctx.user_id, data=err_text)
             final_result = {
                 'prediction': trend_gap['regression_target'],
                 'confidence': 50,
@@ -1004,6 +1086,9 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 rt["last_predict_info"] = f"{fallback_reason} - 触发智能统计回补预测(补{'大' if prediction == 1 else '小'})"
             else:
                 rt["last_predict_info"] = f"AI节点闪退 - 触发智能统计回补预测(补{'大' if prediction == 1 else '小'})"
+
+        if rt.get("ai_key_issue_active", False):
+            await send_to_admin(client, _build_ai_key_warning_message(rt), user_ctx, global_config)
 
         rt["bet_amount"] = int(bet_amount)
         direction = "大" if prediction == 1 else "小"
@@ -2558,14 +2643,157 @@ async def handle_model_command_multiuser(event, args, user_ctx: UserContext, glo
             
     elif sub_cmd == "reload":
         await event.reply("🔄 重新加载模型配置...")
-        log_event(logging.INFO, 'model', '重新加载模型', user_id=user_ctx.user_id)
-        await event.reply("✅ 模型配置已重新加载")
+        try:
+            user_ctx.reload_user_config()
+            model_mgr = user_ctx.get_model_manager()
+            model_mgr.load_models()
+            models = model_mgr.list_models()
+            enabled_count = sum(
+                1
+                for provider_models in models.values()
+                for model in provider_models
+                if model.get("enabled", True)
+            )
+            log_event(logging.INFO, 'model', '重新加载模型', user_id=user_ctx.user_id, enabled=enabled_count)
+            await event.reply(f"✅ 模型配置已重新加载（可用模型：{enabled_count}）")
+        except Exception as e:
+            log_event(logging.ERROR, 'model', '重载模型配置失败', user_id=user_ctx.user_id, error=str(e))
+            await event.reply(f"❌ 模型配置重载失败：{str(e)[:120]}")
     else:
         await event.reply("未知命令。用法:\n`model list`\n`model select <id>`\n`model reload`")
 
 
+async def handle_apikey_command_multiuser(event, args, user_ctx: UserContext):
+    """处理 apikey 命令：show/set/add/del/test。"""
+    rt = user_ctx.state.runtime
+    sub_cmd = (args[0].lower() if args else "show")
+    ai_cfg = user_ctx.config.ai if isinstance(user_ctx.config.ai, dict) else {}
+    keys = _normalize_ai_keys(ai_cfg)
+
+    if sub_cmd in ("show", "list", "ls"):
+        if not keys:
+            await event.reply(
+                "当前未配置任何 AI key。\n"
+                "请执行：`apikey set <新key>`"
+            )
+            return
+        lines = ["🔐 当前账号 AI key 列表（已脱敏）"]
+        for idx, key in enumerate(keys, 1):
+            lines.append(f"{idx}. `{_mask_api_key(key)}`")
+        lines.append("\n用法：`apikey set <key>` / `apikey add <key>` / `apikey del <序号>` / `apikey test`")
+        await event.reply("\n".join(lines))
+        return
+
+    if sub_cmd in ("set", "add"):
+        if len(args) < 2:
+            await event.reply(f"用法：`apikey {sub_cmd} <新key>`")
+            return
+
+        new_key = str(args[1]).strip()
+        if not new_key:
+            await event.reply("❌ key 不能为空")
+            return
+
+        if sub_cmd == "set":
+            updated_keys = [new_key]
+        else:
+            updated_keys = list(keys)
+            if new_key in updated_keys:
+                await event.reply("⚠️ 该 key 已存在，无需重复添加")
+                return
+            updated_keys.append(new_key)
+
+        new_ai = dict(ai_cfg)
+        new_ai["api_keys"] = updated_keys
+        new_ai.pop("api_key", None)
+        try:
+            config_path = user_ctx.update_ai_config(new_ai)
+            _clear_ai_key_issue(rt)
+            user_ctx.save_state()
+            model_mgr = user_ctx.get_model_manager()
+            model_mgr.load_models()
+            await event.reply(
+                f"✅ AI key 已更新并写入配置\n"
+                f"文件：`{os.path.basename(config_path)}`\n"
+                f"当前 key 数量：{len(updated_keys)}"
+            )
+        except Exception as e:
+            log_event(logging.ERROR, 'apikey', '写入 key 失败', user_id=user_ctx.user_id, error=str(e))
+            await event.reply(f"❌ 更新失败：{str(e)[:160]}")
+        return
+
+    if sub_cmd in ("del", "rm", "remove"):
+        if len(args) < 2:
+            await event.reply("用法：`apikey del <序号>`")
+            return
+        try:
+            idx = int(str(args[1]).strip())
+        except ValueError:
+            await event.reply("❌ 序号必须是整数")
+            return
+
+        if idx < 1 or idx > len(keys):
+            await event.reply(f"❌ 序号超出范围，当前 key 数量：{len(keys)}")
+            return
+
+        updated_keys = list(keys)
+        updated_keys.pop(idx - 1)
+        new_ai = dict(ai_cfg)
+        new_ai["api_keys"] = updated_keys
+        new_ai.pop("api_key", None)
+        try:
+            config_path = user_ctx.update_ai_config(new_ai)
+            if not updated_keys:
+                _mark_ai_key_issue(rt, "管理员删除了全部 key")
+            user_ctx.save_state()
+            await event.reply(
+                f"✅ 已删除第 {idx} 个 key 并写入配置\n"
+                f"文件：`{os.path.basename(config_path)}`\n"
+                f"剩余 key 数量：{len(updated_keys)}"
+            )
+        except Exception as e:
+            log_event(logging.ERROR, 'apikey', '删除 key 失败', user_id=user_ctx.user_id, error=str(e))
+            await event.reply(f"❌ 删除失败：{str(e)[:160]}")
+        return
+
+    if sub_cmd in ("test", "check"):
+        model_id = rt.get("current_model_id", "qwen3-coder-plus")
+        try:
+            result = await user_ctx.get_model_manager().validate_model(model_id)
+            if result.get("success"):
+                _clear_ai_key_issue(rt)
+                user_ctx.save_state()
+                await event.reply(
+                    f"✅ 模型测试成功\n"
+                    f"模型：`{model_id}`\n"
+                    f"延迟：{result.get('latency', '-') }ms"
+                )
+            else:
+                err = str(result.get("error", "unknown"))
+                if _looks_like_ai_key_issue(err):
+                    _mark_ai_key_issue(rt, err)
+                    user_ctx.save_state()
+                await event.reply(
+                    f"❌ 模型测试失败\n"
+                    f"模型：`{model_id}`\n"
+                    f"错误：{err[:180]}"
+                )
+        except Exception as e:
+            await event.reply(f"❌ 测试失败：{str(e)[:180]}")
+        return
+
+    await event.reply(
+        "未知命令。用法：\n"
+        "`apikey show`\n"
+        "`apikey set <key>`\n"
+        "`apikey add <key>`\n"
+        "`apikey del <序号>`\n"
+        "`apikey test`"
+    )
+
+
 async def process_user_command(client, event, user_ctx: UserContext, global_config: dict):
-    """处理用户命令 - 与master版本完全一致"""
+    """处理用户命令。"""
     state = user_ctx.state
     rt = state.runtime
     presets = user_ctx.presets
@@ -2598,10 +2826,13 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
     cmd = normalized_cmd.lower()
     
-    log_event(logging.INFO, 'user_cmd', '处理用户命令', user_id=user_ctx.user_id, data=text[:50])
+    safe_log_text = text[:50]
+    if cmd in {"apikey", "ak"}:
+        safe_log_text = f"{raw_cmd} ***"
+    log_event(logging.INFO, 'user_cmd', '处理用户命令', user_id=user_ctx.user_id, data=safe_log_text)
     
     try:
-        # ========== help命令 - 与master版本完全一致 ==========
+        # ========== help命令 ==========
         if cmd == "help":
             mes = """**️ 命令列表 (Commands)**
 
@@ -2619,8 +2850,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `warn [次数]` : 设置连输告警阈值 (例: `warn 2`)
 - `wlc [次数]` : `warn` 的简写命令
 
-**策略调整**
+**模型与策略**
 - `model [list|select|reload]` : 模型管理 (例: `model select 1`)
+- `apikey [show|set|add|del|test]` : 管理当前账号 AI key (`ak` 同义)
 - `ms [模式]` : 切换模式 (0:反投, 1:预测, 2:追投)
 
 **测算功能**
@@ -2629,14 +2861,16 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
 **数据管理**
 - `res tj` : 重置统计数据
+- `res state` : 清空历史与状态
 - `res bet` : 重置押注策略
 - `explain` : 查看AI决策解释
 - `stats` : 查看连大、连小、连输统计
+- `balance` : 查询账户余额
 - `xx` : 清理配置群中“我发送的消息”
 
 **发布更新**
 - `ver` : 查看版本概览（最近3个Tag + 最近3个Commit）
-- `update [版本|提交]` : 更新到指定版本(留空默认最新)
+- `update [版本|提交]` : 更新到指定版本（留空默认最新）
 - `reback [版本|提交]` : 回退到指定版本
 - `restart` : 重启当前进程
 
@@ -2964,6 +3198,12 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 return
             await handle_model_command_multiuser(event, my[1:], user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+            return
+
+        if cmd in ("apikey", "ak"):
+            await handle_apikey_command_multiuser(event, my[1:], user_ctx)
+            # 防止 key 在命令消息中长期可见
+            asyncio.create_task(delete_later(client, event.chat_id, event.id, 3))
             return
 
         # ========== 发布更新命令 ==========
