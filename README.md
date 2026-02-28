@@ -4,7 +4,7 @@ Ydxbot 的多账号版本，面向同一进程管理多个 Telegram 账号的自
 
 ## 核心特性
 - 多账号隔离：每个账号独立 `state/presets/session`。
-- 共享配置：代理、AI、群组、通知统一在 `shared` 下管理。
+- 通用配置精简：仅保留群组与公共接口在 `config` 下管理。
 - 风控能力：连输告警、炸号暂停、盈利暂停、手动暂停/恢复。
 - 在线更新：支持 `ver / update / reback / restart`（兼容旧命令别名）。
 - 运维方式：支持 `tmux`（推荐）与 `systemd`（可选）。
@@ -14,7 +14,7 @@ Ydxbot 的多账号版本，面向同一进程管理多个 Telegram 账号的自
 - `zq_multiuser.py`：下注、结算、通知、命令处理
 - `user_manager.py`：用户配置加载、状态持久化
 - `update_manager.py`：版本检查、发布更新、回滚逻辑
-- `shared/global.example.json`：公开仓库可提交的脱敏共享配置模板
+- `config/global_config.example.json`：公开仓库可提交的通用配置模板
 - `users/_template/`：用户配置与状态模板
 
 ## 快速开始
@@ -23,29 +23,30 @@ Ydxbot 的多账号版本，面向同一进程管理多个 Telegram 账号的自
 pip install -r requirements.txt
 ```
 
-2. 准备共享配置（本地私有，不入库）
+2. 准备通用配置
 ```bash
-cp shared/global.example.json shared/global.json
+cp config/global_config.example.json config/global_config.json
 ```
-编辑 `shared/global.json`，填写共享配置：
-- `proxy`
-- `ai`（模型、API Key、降级链）
-- `groups`（`zq_group` / `zq_bot` / `admin_chat` / `monitor`）
-- `notification`（IYUU / TG Bot）
+编辑 `config/global_config.json`，填写通用配置：
+- `groups`（`zq_group` / `zq_bot` / `monitor`）
+- `zhuque.api_url`
 - `update.github_token`（私有仓库更新可选）
 
 3. 创建账号目录（示例 `xu`）
 ```bash
 mkdir -p users/xu
-cp users/_template/config.json.template users/xu/config.json
+cp users/_template/example_config.json users/xu/xu_config.json
 cp users/_template/state.json.default users/xu/state.json
 cp users/_template/presets.json.default users/xu/presets.json
 ```
 
-4. 填写账号私有配置 `users/xu/config.json`
+4. 填写账号私有配置 `users/xu/xu_config.json`
 - `telegram.api_id / telegram.api_hash / telegram.session_name / telegram.user_id`
 - `account.name`
 - `zhuque.cookie / zhuque.x_csrf`
+- `notification.admin_chat`（账号命令窗口）
+- `notification.iyuu / notification.tg_bot`（账号通知）
+- `ai`（账号模型、API Key、base_url、降级链）
 
 5. 放置 session 文件  
 将 `session_name` 对应的 `.session` 文件放到 `users/xu/` 下。
@@ -63,24 +64,22 @@ python3 main_multiuser.py
 bash -lc 'set -e; apt update; apt install -y git python3 python3-venv python3-pip tmux curl; if [ ! -d /opt/YdxbotV2/.git ]; then git clone https://github.com/ibarnard/YdxbotV2.git /opt/YdxbotV2; fi; cd /opt/YdxbotV2; git fetch origin --tags; git checkout main; git pull --ff-only origin main; [ -d venv ] || python3 -m venv venv; . venv/bin/activate; python -m pip install -U pip; pip install -r requirements.txt; tmux has-session -t ydxbot 2>/dev/null || tmux new-session -d -s ydxbot -c /opt/YdxbotV2'
 ```
 
-2. 准备共享配置
+2. 准备通用配置
 ```bash
-cp shared/global.example.json shared/global.json
+cp config/global_config.example.json config/global_config.json
 ```
-编辑 `shared/global.json`，重点填写：
-- `groups`（`zq_group` / `zq_bot` / `admin_chat` / `monitor`）
-- `ai`
-- `notification`
-- `proxy`（如需代理）
+编辑 `config/global_config.json`，重点填写：
+- `groups`（`zq_group` / `zq_bot` / `monitor`）
+- `zhuque.api_url`
 
 3. 创建用户目录（示例：`shuji`）
 ```bash
 mkdir -p users/shuji
-cp users/_template/config.json.template users/shuji/config.json
+cp users/_template/example_config.json users/shuji/shuji_config.json
 cp users/_template/state.json.default users/shuji/state.json
 cp users/_template/presets.json.default users/shuji/presets.json
 ```
-然后编辑 `users/shuji/config.json`，填写 `api_id/api_hash/session_name/user_id/cookie/x_csrf` 等私有信息。
+然后编辑 `users/shuji/shuji_config.json`，填写 `api_id/api_hash/session_name/user_id/cookie/x_csrf` 等私有信息。
 
 4. 上传 session 文件
 - 将 `session_name` 对应的 `.session` 文件放入该用户目录，例如：`users/shuji/<session_name>.session`。
@@ -152,9 +151,9 @@ python -u main_multiuser.py
 
 如果更新时提示本地配置文件冲突，建议先备份后恢复：
 ```bash
-cp -f shared/global.json /opt/ydxbot-global.backup.json
+cp -f config/global_config.json /opt/ydxbot-global.backup.json
 # 执行 git 更新后再恢复
-cp -f /opt/ydxbot-global.backup.json shared/global.json
+cp -f /opt/ydxbot-global.backup.json config/global_config.json
 ```
 
 ## 可选运行方式（systemd）
@@ -223,13 +222,11 @@ git reset --hard <tag或commit>
 systemctl restart ydxbot
 ```
 
-## 共享配置加载顺序
-程序按顺序读取共享配置（命中即停止）：
-1. `shared/global.local.json`
-2. `shared/global.json`
-3. `shared/global.example.json`
-
-说明：`global.example.json` 仅用于模板回退，不建议直接用于生产运行。
+## 通用配置加载顺序
+程序按顺序读取通用配置（命中即停止）：
+1. `config/global_config.json`
+2. `config/global_config.example.json`
+3. 兼容旧路径：`shared/global.json` / `shared/global.example.json`
 
 ## 常用命令
 - 基础：`open` `off` `pause` `resume` `status` `users`
@@ -278,16 +275,8 @@ systemctl start ydxbot
 ```bash
 # 检查网络连通
 curl -I --max-time 8 https://api.telegram.org
-
-# 检查共享配置中的 proxy 是否开启
-python - <<'PY'
-from pathlib import Path
-from update_manager import _load_json_with_comments
-cfg = _load_json_with_comments(Path("/opt/YdxbotV2/shared/global.local.json")) or _load_json_with_comments(Path("/opt/YdxbotV2/shared/global.json"))
-print(cfg.get("proxy"))
-PY
 ```
-说明：如果 `proxy.enabled=true`，必须保证代理服务可用；否则改为 `false`。
+说明：本版本已移除代理配置入口，默认直连 Telegram。
 
 3. Telegram 里执行 `restart` 没效果
 - 检查服务名是否与 `Environment=YDXBOT_SYSTEMD_SERVICE=ydxbot.service` 一致。
@@ -302,7 +291,7 @@ tmux attach -t ydxbot
 ```
 
 ## 公开仓库安全说明
-- 已默认忽略：`shared/global.json`、`shared/global.local.json`、`*.session`、日志文件。
+- 已默认忽略：`*.session`、日志文件。
 - 不要提交任何真实密钥、Cookie、Token、会话文件。
 - 建议把密钥放在本地配置或环境变量（如 `YDXBOT_GITHUB_TOKEN`）。
 

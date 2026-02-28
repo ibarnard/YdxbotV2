@@ -12,7 +12,6 @@ import time
 from telethon import TelegramClient, events
 from logging.handlers import TimedRotatingFileHandler
 from user_manager import UserManager, UserContext
-from model_manager import model_manager
 from update_manager import periodic_release_check_loop
 
 # 日志配置
@@ -52,19 +51,6 @@ def log_event(level, module, event=None, message='', **kwargs):
 
 
 async def create_client(user_ctx: UserContext, global_config: dict) -> TelegramClient:
-    proxy = None
-    proxy_cfg = global_config.get("proxy", {})
-    if proxy_cfg.get("enabled"):
-        proxy = {
-            'proxy_type': proxy_cfg.get("type", "socks5"),
-            'addr': proxy_cfg.get("host", "127.0.0.1"),
-            'port': proxy_cfg.get("port", 7890),
-            'username': proxy_cfg.get("username") or None,
-            'password': proxy_cfg.get("password") or None,
-            'rdns': True
-        }
-        log_event(logging.DEBUG, 'create_client', '使用代理', user_id=user_ctx.user_id)
-    
     session_path = os.path.join(
         user_ctx.user_dir, 
         user_ctx.config.telegram.get("session_name", "session")
@@ -73,10 +59,17 @@ async def create_client(user_ctx: UserContext, global_config: dict) -> TelegramC
     client = TelegramClient(
         session_path,
         user_ctx.config.telegram.get("api_id"),
-        user_ctx.config.telegram.get("api_hash"),
-        proxy=proxy
+        user_ctx.config.telegram.get("api_hash")
     )
     return client
+
+
+def _resolve_admin_chat(user_ctx: UserContext):
+    notification = user_ctx.config.notification if isinstance(user_ctx.config.notification, dict) else {}
+    admin_chat = notification.get("admin_chat")
+    if admin_chat in (None, ""):
+        admin_chat = user_ctx.config.groups.get("admin_chat")
+    return admin_chat
 
 
 def register_handlers(client: TelegramClient, user_ctx: UserContext, global_config: dict):
@@ -84,6 +77,7 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
     state = user_ctx.state
     presets = user_ctx.presets
     button_mapping = global_config.get("button_mapping", {})
+    admin_chat = _resolve_admin_chat(user_ctx)
     
     @client.on(events.NewMessage(
         chats=config.groups.get("zq_group", []),
@@ -113,7 +107,7 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
     async def red_packet_handler(event):
         await zq_red_packet(client, event, user_ctx, global_config)
     
-    @client.on(events.NewMessage(chats=config.groups.get("admin_chat")))
+    @client.on(events.NewMessage(chats=admin_chat if admin_chat else []))
     async def user_handler(event):
         log_event(logging.DEBUG, 'user_cmd', '收到用户命令',
                   user_id=user_ctx.user_id, cmd=event.raw_text[:50])
@@ -142,8 +136,9 @@ async def zq_red_packet(client, event, user_ctx: UserContext, global_config: dic
 
 async def check_models_for_user(client, user_ctx: UserContext):
     try:
-        model_manager.load_models()
-        models = model_manager.list_models()
+        user_model_mgr = user_ctx.get_model_manager()
+        user_model_mgr.load_models()
+        models = user_model_mgr.list_models()
         
         report = f"🚀 **Bot 启动模型自检报告**\n\n"
         report += f"👤 **用户**: {user_ctx.config.name}\n\n"
@@ -159,7 +154,7 @@ async def check_models_for_user(client, user_ctx: UserContext):
                     report += f"⚪ `{mid}`: 已禁用\n"
                     continue
                 
-                res = await model_manager.validate_model(mid)
+                res = await user_model_mgr.validate_model(mid)
                 if res['success']:
                     status = "✅ 正常"
                     latency = res.get('latency', 'N/A')
@@ -174,7 +169,9 @@ async def check_models_for_user(client, user_ctx: UserContext):
         report += f"📊 **汇总**: {success_count}/{total_models} 可用\n"
         report += f"🤖 **当前默认**: `{user_ctx.get_runtime('current_model_id', 'qwen3-coder-plus')}`"
         
-        await client.send_message(user_ctx.config.groups.get("admin_chat"), report)
+        admin_chat = _resolve_admin_chat(user_ctx)
+        if admin_chat:
+            await client.send_message(admin_chat, report)
         log_event(logging.INFO, 'model_check', '模型自检完成', user_id=user_ctx.user_id)
         
     except Exception as e:
@@ -323,7 +320,7 @@ async def main():
     async def notify_release(message: str):
         sent_admins = set()
         for user_ctx in user_manager.get_all_users().values():
-            admin_chat = user_ctx.config.groups.get("admin_chat")
+            admin_chat = _resolve_admin_chat(user_ctx)
             if not admin_chat or admin_chat in sent_admins or not user_ctx.client:
                 continue
             try:

@@ -9,6 +9,7 @@ import os
 import json
 import threading
 import logging
+import importlib.util
 from dataclasses import dataclass, field
 from typing import Dict, Any, Optional, List
 from logging.handlers import TimedRotatingFileHandler
@@ -103,9 +104,7 @@ class UserConfig:
     groups: Dict[str, Any] = field(default_factory=dict)
     zhuque: Dict[str, Any] = field(default_factory=dict)
     notification: Dict[str, Any] = field(default_factory=dict)
-    proxy: Dict[str, Any] = field(default_factory=dict)
     ai: Dict[str, Any] = field(default_factory=dict)
-    betting: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -236,6 +235,8 @@ class UserContext:
         self.state: Optional[UserState] = None
         self.presets: Dict[str, List] = {}
         self.client = None
+        self._model_manager = None
+        self._model_manager_ai_sig = ""
         self._lock = threading.Lock()
         self._load_all()
     
@@ -243,11 +244,40 @@ class UserContext:
         self._load_config()
         self._load_state()
         self._load_presets()
+
+    def _resolve_user_config_path(self) -> str:
+        """
+        优先读取 <账号目录名>_config.json；
+        兼容旧版 config.json（便于平滑迁移）。
+        """
+        dir_name = os.path.basename(os.path.normpath(self.user_dir))
+        preferred = os.path.join(self.user_dir, f"{dir_name}_config.json")
+        legacy = os.path.join(self.user_dir, "config.json")
+
+        if os.path.exists(preferred):
+            return preferred
+
+        # 兜底：若目录下仅存在一个 *_config.json，也可直接使用。
+        try:
+            matches = [
+                os.path.join(self.user_dir, name)
+                for name in os.listdir(self.user_dir)
+                if name.endswith("_config.json")
+            ]
+            if len(matches) == 1 and os.path.exists(matches[0]):
+                return matches[0]
+        except Exception:
+            pass
+
+        if os.path.exists(legacy):
+            return legacy
+
+        raise FileNotFoundError(
+            f"配置文件不存在，期望: {preferred} 或 {legacy}"
+        )
     
     def _load_config(self):
-        config_path = os.path.join(self.user_dir, "config.json")
-        if not os.path.exists(config_path):
-            raise FileNotFoundError(f"配置文件不存在: {config_path}")
+        config_path = self._resolve_user_config_path()
 
         data = load_json_with_comments(config_path)
         global_cfg = self.global_config or {}
@@ -256,10 +286,17 @@ class UserContext:
         telegram_cfg = merge_dict(global_cfg.get("telegram", {}), data.get("telegram", {}))
         groups_cfg = merge_dict(global_cfg.get("groups", {}), data.get("groups", {}))
         zhuque_cfg = merge_dict(global_cfg.get("zhuque", {}), data.get("zhuque", {}))
-        notification_cfg = merge_dict(global_cfg.get("notification", {}), data.get("notification", {}))
-        proxy_cfg = merge_dict(global_cfg.get("proxy", {}), data.get("proxy", {}))
-        ai_cfg = merge_dict(global_cfg.get("ai") or global_cfg.get("iflow", {}), data.get("ai", {}))
-        betting_cfg = merge_dict(global_cfg.get("betting", {}), data.get("betting", {}))
+        # 精简规则：通知和 AI 仅从账号配置读取（不走全局继承）
+        notification_cfg = data.get("notification", {}) if isinstance(data.get("notification", {}), dict) else {}
+        ai_cfg = data.get("ai", {}) if isinstance(data.get("ai", {}), dict) else {}
+
+        # 规范化：admin_chat 统一归类到 notification；兼容旧 groups.admin_chat 读取。
+        admin_chat = notification_cfg.get("admin_chat")
+        if admin_chat in (None, ""):
+            admin_chat = groups_cfg.get("admin_chat")
+        if admin_chat not in (None, ""):
+            notification_cfg["admin_chat"] = admin_chat
+            groups_cfg["admin_chat"] = admin_chat
         
         # 从配置中读取user_id，如果没有则使用目录名的哈希值
         self.user_id = telegram_cfg.get("user_id", 0)
@@ -280,11 +317,14 @@ class UserContext:
             groups=groups_cfg,
             zhuque=zhuque_cfg,
             notification=notification_cfg,
-            proxy=proxy_cfg,
             ai=ai_cfg,
-            betting=betting_cfg
         )
-        log_event(logging.INFO, 'load_config', f'加载用户配置成功', f'user_id={self.user_id}, name={self.config.name}')
+        log_event(
+            logging.INFO,
+            'load_config',
+            '加载用户配置成功',
+            f'user_id={self.user_id}, name={self.config.name}, file={os.path.basename(config_path)}'
+        )
     
     def _load_state(self):
         state_path = os.path.join(self.user_dir, "state.json")
@@ -326,7 +366,16 @@ class UserContext:
 
         # 仅导入与当前账号匹配的单用户状态，避免多账号串状态
         try:
-            import config as legacy_config
+            legacy_cfg_path = os.path.abspath("config.py")
+            if not os.path.exists(legacy_cfg_path):
+                return False
+
+            spec = importlib.util.spec_from_file_location("ydxbot_legacy_config", legacy_cfg_path)
+            if spec is None or spec.loader is None:
+                return False
+            legacy_config = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(legacy_config)
+
             if int(getattr(legacy_config, "user", 0)) != int(self.user_id):
                 return False
         except Exception:
@@ -431,21 +480,58 @@ class UserContext:
     def set_runtime(self, key: str, value: Any):
         self.state.runtime[key] = value
 
+    def get_model_manager(self):
+        """
+        获取账号独立模型管理器。
+        说明：每个账号持有独立实例，避免多账号并发时模型配置串号。
+        """
+        ai_cfg = self.config.ai if isinstance(self.config.ai, dict) else {}
+        ai_sig = json.dumps(ai_cfg, sort_keys=True, ensure_ascii=False)
+
+        if self._model_manager is None:
+            from model_manager import ModelManager
+            self._model_manager = ModelManager()
+
+        if ai_sig != self._model_manager_ai_sig:
+            self._model_manager.apply_shared_config({"ai": ai_cfg})
+            self._model_manager_ai_sig = ai_sig
+
+        return self._model_manager
+
 
 class UserManager:
-    def __init__(self, users_dir: str = "users", shared_dir: str = "shared"):
+    def __init__(self, users_dir: str = "users", config_dir: str = "config", shared_dir: Optional[str] = None):
         self.users_dir = users_dir
+        self.config_dir = config_dir
         self.shared_dir = shared_dir
         self.users: Dict[int, UserContext] = {}
         self.global_config: Dict[str, Any] = {}
         log_event(logging.INFO, 'init', '用户管理器初始化', f'users_dir={users_dir}')
     
     def _load_global_config(self):
-        candidates = [
-            os.path.join(self.shared_dir, "global.local.json"),
-            os.path.join(self.shared_dir, "global.json"),
-            os.path.join(self.shared_dir, "global.example.json"),
-        ]
+        candidates: List[str] = []
+        # 兼容旧测试/旧部署：若显式传入 shared_dir，则优先读取该路径。
+        if self.shared_dir:
+            candidates.extend(
+                [
+                    os.path.join(self.shared_dir, "global.local.json"),
+                    os.path.join(self.shared_dir, "global.json"),
+                    os.path.join(self.shared_dir, "global.example.json"),
+                ]
+            )
+
+        candidates.extend(
+            [
+                os.path.join(self.config_dir, "global_config.json"),
+                os.path.join(self.config_dir, "global_config.example.json"),
+                # 兼容旧命名
+                os.path.join(self.config_dir, "global.json"),
+                os.path.join(self.config_dir, "global.example.json"),
+                os.path.join("shared", "global.local.json"),
+                os.path.join("shared", "global.json"),
+                os.path.join("shared", "global.example.json"),
+            ]
+        )
 
         chosen_path = ""
         self.global_config = {}
@@ -456,14 +542,14 @@ class UserManager:
                 break
 
         if chosen_path:
-            if chosen_path.endswith("global.example.json"):
+            if chosen_path.endswith("global.example.json") or chosen_path.endswith("global_config.example.json"):
                 log_event(logging.WARNING, 'load_global', '使用示例全局配置（请复制为本地私有配置）', f'path={chosen_path}')
             else:
                 log_event(logging.INFO, 'load_global', '加载全局配置成功', f'path={chosen_path}')
         else:
             log_event(logging.WARNING, 'load_global', '全局配置文件不存在', f'checked={candidates}')
 
-        # 同步共享 AI 配置给模型管理器，确保多用户统一使用共享全局配置
+        # 同步共享 AI 配置给模型管理器，保证当前运行链路稳定。
         try:
             from model_manager import model_manager
             model_manager.apply_shared_config(self.global_config)
@@ -505,7 +591,8 @@ class UserManager:
         user_dir = os.path.join(self.users_dir, str(user_id))
         os.makedirs(user_dir, exist_ok=True)
         
-        config_path = os.path.join(user_dir, "config.json")
+        dir_name = os.path.basename(os.path.normpath(user_dir))
+        config_path = os.path.join(user_dir, f"{dir_name}_config.json")
         with open(config_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=4, ensure_ascii=False)
         
@@ -531,21 +618,8 @@ class UserManager:
             "big": {500: 15, 2000: 13, 20000: 11, 50000: 9, 250000: 7, 1000000: 5, 5000000: 3, 50000000: 1}
         })
     
-    def get_proxy_config(self) -> Optional[Dict]:
-        proxy_cfg = self.global_config.get("proxy", {})
-        if not proxy_cfg.get("enabled"):
-            return None
-        return {
-            'proxy_type': proxy_cfg.get("type", "socks5"),
-            'addr': proxy_cfg.get("host", "127.0.0.1"),
-            'port': proxy_cfg.get("port", 7890),
-            'username': proxy_cfg.get("username") or None,
-            'password': proxy_cfg.get("password") or None,
-            'rdns': True
-        }
-    
     def get_iflow_config(self) -> Dict:
-        # 修复：多用户分支 - global.json 当前使用 ai 键；兼容旧 iflow 键避免读取空配置。
+        # 兼容：通用配置仍可定义 ai（例如旧版 global/global_config 配置）
         return self.global_config.get("ai") or self.global_config.get("iflow", {})
 
 
@@ -568,13 +642,14 @@ def migrate_from_legacy(config_module, variable_module) -> UserContext:
         "groups": {
             "zq_group": config_module.zq_group,
             "zq_bot": config_module.zq_bot,
-            "admin_chat": config_module.user
+            "monitor": getattr(config_module, "monitor", [])
         },
         "zhuque": {
             "cookie": config_module.ZHUQUE_COOKIE,
             "csrf_token": config_module.ZHUQUE_X_CSRF
         },
         "notification": {
+            "admin_chat": config_module.user,
             "iyuu": {
                 "enable": config_module.iyuu_config.get("enable", False),
                 "token": config_module.iyuu_config.get("token", ""),
@@ -588,7 +663,8 @@ def migrate_from_legacy(config_module, variable_module) -> UserContext:
         }
     }
     
-    config_path = os.path.join(user_dir, "config.json")
+    dir_name = os.path.basename(os.path.normpath(user_dir))
+    config_path = os.path.join(user_dir, f"{dir_name}_config.json")
     with open(config_path, 'w', encoding='utf-8') as f:
         json.dump(config_data, f, indent=4, ensure_ascii=False)
     

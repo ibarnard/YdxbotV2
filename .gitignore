@@ -1,7 +1,5 @@
 # 配置文件（包含敏感信息）
 config.py
-shared/global.json
-shared/global.local.json
 
 # 用户数据目录（多用户版本）
 users/*

@@ -33,7 +33,13 @@ ROLLBACK_FILE = ".release_rollback.json"
 UPDATE_LOCK_FILE = ".update.lock"
 GITHUB_TOKEN_ENV_KEYS = ("YDXBOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
 SYSTEMD_SERVICE_ENV_KEYS = ("YDXBOT_SYSTEMD_SERVICE", "SYSTEMD_SERVICE")
-SHARED_GLOBAL_CANDIDATES = ("global.local.json", "global.json", "global.example.json")
+GLOBAL_CONFIG_CANDIDATES = (
+    "global_config.json",
+    "global_config.example.json",
+    # 兼容旧命名
+    "global.json",
+    "global.example.json",
+)
 
 
 def _repo_root(repo_root: Optional[str] = None) -> Path:
@@ -142,12 +148,18 @@ def _load_json_with_comments(path: Path) -> Dict[str, Any]:
 
 
 def _load_shared_global_config(repo_root: Path) -> Dict[str, Any]:
-    shared_dir = repo_root / "shared"
-    for filename in SHARED_GLOBAL_CANDIDATES:
-        path = shared_dir / filename
-        if not path.exists():
-            continue
-        return _load_json_with_comments(path)
+    # 新结构优先读取 config/，兼容旧版 shared/。
+    for base_dir in ("config", "shared"):
+        config_dir = repo_root / base_dir
+        candidates = (
+            GLOBAL_CONFIG_CANDIDATES if base_dir == "config"
+            else ("global.local.json", "global.json", "global.example.json")
+        )
+        for filename in candidates:
+            path = config_dir / filename
+            if not path.exists():
+                continue
+            return _load_json_with_comments(path)
     return {}
 
 
@@ -581,7 +593,7 @@ def get_latest_release(repo_slug: str, timeout: int = 10, github_token: str = ""
 
     if response.status_code != 200:
         if response.status_code in {401, 403, 404}:
-            hint = "（私有仓库请配置 GitHub Token：环境变量 YDXBOT_GITHUB_TOKEN/GITHUB_TOKEN，或 shared/global.json/shared/global.local.json -> update.github_token）"
+            hint = "（私有仓库请配置 GitHub Token：环境变量 YDXBOT_GITHUB_TOKEN/GITHUB_TOKEN，或 config/global_config.json -> update.github_token）"
         else:
             hint = ""
         return {
@@ -688,7 +700,7 @@ def _is_runtime_file(path: str) -> bool:
         return True
     if normalized.endswith(".session-wal") or normalized.endswith(".session-shm"):
         return True
-    if normalized in {"global.json", "shared/global.json", "shared/global.local.json"}:
+    if normalized in {"shared/global.local.json"}:
         return True
     if normalized.startswith("tests_multiuser/users/"):
         return True

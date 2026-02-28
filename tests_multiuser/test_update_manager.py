@@ -35,13 +35,13 @@ def test_resolve_github_token_prefers_env(monkeypatch, tmp_path):
     assert token == "token_env_value"
 
 
-def test_resolve_github_token_from_shared_global(monkeypatch, tmp_path):
+def test_resolve_github_token_from_global_config(monkeypatch, tmp_path):
     monkeypatch.delenv("YDXBOT_GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GITHUB_TOKEN", raising=False)
     monkeypatch.delenv("GH_TOKEN", raising=False)
-    shared_dir = tmp_path / "shared"
-    shared_dir.mkdir(parents=True, exist_ok=True)
-    (shared_dir / "global.json").write_text(
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "global_config.json").write_text(
         """{
   # release auth for private repo
   "update": {
@@ -76,7 +76,7 @@ def test_get_blocking_dirty_paths_ignores_runtime_artifacts(monkeypatch, tmp_pat
             "?? users/shuji/session.session",
             " M users/shuji/state.json",
             "?? user/legacy_user/config.py",
-            " M shared/global.json",
+            " M config/global_config.json",
             "?? global.json",
             " M users/shuji/presets.json",
             "?? zq_multiuser.py",
@@ -90,7 +90,7 @@ def test_get_blocking_dirty_paths_ignores_runtime_artifacts(monkeypatch, tmp_pat
 
     monkeypatch.setattr(um, "_run_cmd", fake_run_cmd)
     blocking = um.get_blocking_dirty_paths(str(tmp_path))
-    assert blocking == ["users/shuji/presets.json", "zq_multiuser.py"]
+    assert blocking == ["config/global_config.json", "global.json", "users/shuji/presets.json", "zq_multiuser.py"]
 
 
 def test_list_version_catalog_contains_pending_and_summary(monkeypatch, tmp_path):

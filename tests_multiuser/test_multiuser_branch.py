@@ -48,47 +48,53 @@ def test_user_context_user_id_fallback_hash_dir(tmp_path):
 
 def test_user_manager_get_iflow_config_compatible_with_ai_key(tmp_path):
     users_dir = tmp_path / "users"
-    shared_dir = tmp_path / "shared"
+    config_dir = tmp_path / "config"
     users_dir.mkdir(parents=True, exist_ok=True)
     _write_json(
-        shared_dir / "global.json",
+        config_dir / "global_config.json",
         {
             "ai": {"enabled": True, "base_url": "https://apis.iflow.cn/v1"},
         },
     )
 
-    mgr = UserManager(users_dir=str(users_dir), shared_dir=str(shared_dir))
+    mgr = UserManager(users_dir=str(users_dir), config_dir=str(config_dir))
     mgr.load_all_users()
     cfg = mgr.get_iflow_config()
     assert cfg.get("enabled") is True
     assert "base_url" in cfg
 
 
-def test_user_context_merges_shared_and_user_config(tmp_path):
+def test_user_context_merges_global_common_and_user_private_config(tmp_path):
     users_dir = tmp_path / "users"
-    shared_dir = tmp_path / "shared"
+    config_dir = tmp_path / "config"
     users_dir.mkdir(parents=True, exist_ok=True)
     _write_json(
-        shared_dir / "global.json",
+        config_dir / "global_config.json",
         {
-            "groups": {"monitor": [101, 102], "zq_group": [201], "admin_chat": 9, "zq_bot": 8},
+            "groups": {"monitor": [101, 102], "zq_group": [201], "zq_bot": 8},
             "zhuque": {"api_url": "https://zhuque.in/api/user/getInfo?"},
-            "notification": {"iyuu": {"enable": True}, "tg_bot": {"enable": True, "chat_id": "9"}},
-            "proxy": {"enabled": False, "host": "127.0.0.1", "port": 7890},
-            "ai": {"enabled": True, "base_url": "https://apis.iflow.cn/v1", "models": {"1": {"model_id": "m1", "enabled": True}}},
         },
     )
     _write_json(
-        users_dir / "6001" / "config.json",
+        users_dir / "6001" / "6001_config.json",
         {
             "account": {"name": "合并用户"},
             "telegram": {"user_id": 6001},
-            "groups": {"admin_chat": 6001},
             "zhuque": {"cookie": "c1", "x_csrf": "x1"},
+            "notification": {
+                "admin_chat": 6001,
+                "iyuu": {"enable": True},
+                "tg_bot": {"enable": True, "chat_id": "9"},
+            },
+            "ai": {
+                "enabled": True,
+                "base_url": "https://apis.iflow.cn/v1",
+                "models": {"1": {"model_id": "m1", "enabled": True}},
+            },
         },
     )
 
-    mgr = UserManager(users_dir=str(users_dir), shared_dir=str(shared_dir))
+    mgr = UserManager(users_dir=str(users_dir), config_dir=str(config_dir))
     assert mgr.load_all_users() == 1
 
     ctx = mgr.get_user(6001)
@@ -182,13 +188,13 @@ def test_main_multiuser_settle_regex_is_strict():
 
 def test_user_isolation_between_two_contexts(tmp_path):
     users_dir = tmp_path / "users"
-    shared_dir = tmp_path / "shared"
-    _write_json(shared_dir / "global.json", {"ai": {"enabled": True}})
+    config_dir = tmp_path / "config"
+    _write_json(config_dir / "global_config.json", {"groups": {"monitor": [1]}})
 
     _write_json(users_dir / "1001" / "config.json", {"account": {"name": "U1"}, "telegram": {"user_id": 1001}})
     _write_json(users_dir / "1002" / "config.json", {"account": {"name": "U2"}, "telegram": {"user_id": 1002}})
 
-    mgr = UserManager(users_dir=str(users_dir), shared_dir=str(shared_dir))
+    mgr = UserManager(users_dir=str(users_dir), config_dir=str(config_dir))
     assert mgr.load_all_users() == 2
 
     u1 = mgr.get_user(1001)

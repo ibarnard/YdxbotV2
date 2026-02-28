@@ -29,7 +29,7 @@ class ModelManager:
         self.load_models_from_config()
 
     def apply_shared_config(self, global_config: Dict[str, Any]):
-        """接收 shared/global.json 中的 AI 配置并生效。"""
+        """接收通用配置（config/global.json）的 AI 配置并生效。"""
         cfg = global_config or {}
         ai_cfg = cfg.get("ai") or cfg.get("iflow") or {}
         self.shared_ai_config = ai_cfg if isinstance(ai_cfg, dict) else {}

@@ -1,0 +1,61 @@
+{
+    # 账号配置版本
+    "version": "2.5.0",
+
+    # Telegram 登录参数（必填）
+    # api_id/api_hash 从 my.telegram.org 获取
+    # session_name 对应 .session 文件名（不带后缀）
+    "telegram": {
+        "api_id": 12345678,
+        "api_hash": "your_api_hash",
+        "session_name": "your_session_name",
+        "user_id": 1234567890
+    },
+
+    # 账号展示名称
+    "account": {
+        "name": "你的账号名",
+        "description": "账号备注"
+    },
+
+    # 账号私有朱雀认证（必填）
+    "zhuque": {
+        "cookie": "socute=请填你的cookie",
+        "x_csrf": "请填你的x_csrf"
+    },
+
+    # 通知配置（admin_chat 放这里）
+    "notification": {
+        "admin_chat": 1234567890,
+        "iyuu": {
+            "enable": false,
+            "url": "",
+            "token": ""
+        },
+        "tg_bot": {
+            "enable": false,
+            "bot_token": "",
+            "chat_id": ""
+        }
+    },
+
+    # AI 配置（OpenAI 兼容；可按账号独立设置）
+    "ai": {
+        "enabled": true,
+        "api_keys": [
+            "sk-your-openai-compatible-key"
+        ],
+        "base_url": "https://api.openai.com/v1",
+        "timeout": 30,
+        "max_retries": 3,
+        "models": {
+            "1": {
+                "model_id": "gpt-4o-mini",
+                "enabled": true
+            }
+        },
+        "fallback_chain": [
+            "1"
+        ]
+    }
+}

@@ -17,7 +17,6 @@ import math
 from collections import Counter
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
-from model_manager import model_manager as model_mgr
 from user_manager import UserContext
 from typing import Dict, Any
 import constants
@@ -211,6 +210,14 @@ def _iter_targets(target):
     return [target]
 
 
+def _resolve_admin_chat(user_ctx: UserContext):
+    notification = user_ctx.config.notification if isinstance(user_ctx.config.notification, dict) else {}
+    admin_chat = notification.get("admin_chat")
+    if admin_chat in (None, ""):
+        admin_chat = user_ctx.config.groups.get("admin_chat")
+    return admin_chat
+
+
 async def send_message_v2(
     client,
     msg_type: str,
@@ -239,7 +246,7 @@ async def send_message_v2(
     sent_message = None
     if "admin" in channels or "all" in channels:
         try:
-            admin_chat = user_ctx.config.groups.get("admin_chat")
+            admin_chat = _resolve_admin_chat(user_ctx)
             if admin_chat:
                 # 修复：多用户分支 - 返回管理员消息对象，确保仪表盘/统计可被后续刷新删除。
                 sent_message = await client.send_message(admin_chat, admin_message, parse_mode=parse_mode)
@@ -613,7 +620,12 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
         # ========== 第四步：调用模型与多层兜底 ==========
         
         try:
-            result = await model_mgr.call_model(current_model_id, messages, temperature=0.1, max_tokens=500)
+            result = await user_ctx.get_model_manager().call_model(
+                current_model_id,
+                messages,
+                temperature=0.1,
+                max_tokens=500
+            )
             if not result['success']:
                 raise Exception(f"Model Error: {result['error']}")
             
@@ -1441,7 +1453,7 @@ async def _suggest_pause_rounds_by_model(
 
     try:
         result = await asyncio.wait_for(
-            model_mgr.call_model(current_model_id, messages, temperature=0.0, max_tokens=120),
+            user_ctx.get_model_manager().call_model(current_model_id, messages, temperature=0.0, max_tokens=120),
             timeout=RISK_PAUSE_MODEL_TIMEOUT_SEC,
         )
         if not result.get("success"):
