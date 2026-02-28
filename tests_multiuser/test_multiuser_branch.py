@@ -789,7 +789,8 @@ def test_check_bet_status_can_resume_when_fund_sufficient(tmp_path, monkeypatch)
     monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
     asyncio.run(zm.check_bet_status(SimpleNamespace(), ctx, {}))
 
-    assert rt["bet"] is True
+    # 恢复可下注状态时不应提前标记为“已下注”，避免结算时序误判。
+    assert rt["bet"] is False
     assert rt["pause_count"] == 0
     assert "押注已恢复" in sent["message"]
 

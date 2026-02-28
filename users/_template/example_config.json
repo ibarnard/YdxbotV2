@@ -27,6 +27,9 @@
     # 通知配置（admin_chat 放这里）
     "notification": {
         "admin_chat": 1234567890,
+        # 可选：命令发送者白名单（不填=不启用白名单）
+        # 启用后，只有这些 sender_id 发出的命令才会被处理
+        "allowed_sender_ids": [],
         "iyuu": {
             "enable": false,
             "url": "",

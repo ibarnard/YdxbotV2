@@ -700,7 +700,14 @@ def _is_runtime_file(path: str) -> bool:
         return True
     if normalized.endswith(".session-wal") or normalized.endswith(".session-shm"):
         return True
-    if normalized in {"shared/global.local.json"}:
+    if normalized in {
+        "shared/global.local.json",
+        "shared/global.json",
+        "config/global.local.json",
+        "config/global.json",
+        "config/global_config.json",
+        "global.json",
+    }:
         return True
     if normalized.startswith("tests_multiuser/users/"):
         return True
@@ -710,6 +717,8 @@ def _is_runtime_file(path: str) -> bool:
     if len(parts) >= 3 and parts[0] == "users" and not parts[1].startswith("_"):
         user_sensitive = {"config.json", "state.json", "account_funds.json"}
         if filename in user_sensitive:
+            return True
+        if filename.endswith("_config.json"):
             return True
         if filename.endswith(".session") or filename.endswith(".session-journal"):
             return True

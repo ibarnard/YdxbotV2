@@ -9,6 +9,8 @@ import logging
 import asyncio
 import os
 import time
+import sys
+from typing import Any, List
 from telethon import TelegramClient, events
 from logging.handlers import TimedRotatingFileHandler
 from user_manager import UserManager, UserContext
@@ -69,7 +71,74 @@ def _resolve_admin_chat(user_ctx: UserContext):
     admin_chat = notification.get("admin_chat")
     if admin_chat in (None, ""):
         admin_chat = user_ctx.config.groups.get("admin_chat")
+    if isinstance(admin_chat, str):
+        text = admin_chat.strip()
+        if text.lstrip("-").isdigit():
+            try:
+                return int(text)
+            except Exception:
+                return admin_chat
     return admin_chat
+
+
+def _normalize_target(value: Any) -> Any:
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return ""
+        if text.lstrip("-").isdigit():
+            try:
+                return int(text)
+            except Exception:
+                return value
+        return text
+    return value
+
+
+def _iter_targets(target: Any) -> List[Any]:
+    if isinstance(target, (list, tuple, set)):
+        result: List[Any] = []
+        for item in target:
+            normalized = _normalize_target(item)
+            if normalized not in (None, ""):
+                result.append(normalized)
+        return result
+    normalized = _normalize_target(target)
+    if normalized in (None, ""):
+        return []
+    return [normalized]
+
+
+def _get_user_event_lock(user_ctx: UserContext) -> asyncio.Lock:
+    lock = getattr(user_ctx, "_event_lock", None)
+    if lock is None:
+        lock = asyncio.Lock()
+        setattr(user_ctx, "_event_lock", lock)
+    return lock
+
+
+def _get_allowed_sender_ids(user_ctx: UserContext) -> set:
+    """
+    可选命令发送者白名单（默认关闭，保持兼容）。
+    支持 notification.allowed_sender_ids / allowed_senders / admins。
+    """
+    notification = user_ctx.config.notification if isinstance(user_ctx.config.notification, dict) else {}
+    raw = (
+        notification.get("allowed_sender_ids")
+        or notification.get("allowed_senders")
+        or notification.get("admins")
+    )
+    if not raw:
+        return set()
+
+    items = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    result = set()
+    for item in items:
+        normalized = _normalize_target(item)
+        if normalized in (None, ""):
+            continue
+        result.add(str(normalized))
+    return result
 
 
 def register_handlers(client: TelegramClient, user_ctx: UserContext, global_config: dict):
@@ -78,31 +147,35 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
     presets = user_ctx.presets
     button_mapping = global_config.get("button_mapping", {})
     admin_chat = _resolve_admin_chat(user_ctx)
+    zq_group_targets = _iter_targets(config.groups.get("zq_group", []))
+    zq_bot_targets = _iter_targets(config.groups.get("zq_bot"))
     
     @client.on(events.NewMessage(
-        chats=config.groups.get("zq_group", []),
+        chats=zq_group_targets,
         pattern=r"\[近 40 次结果\]\[由近及远\]\[0 小 1 大\].*",
-        from_users=config.groups.get("zq_bot")
+        from_users=zq_bot_targets
     ))
     async def bet_on_handler(event):
         log_event(logging.DEBUG, 'bet_on', '收到押注触发消息', 
                   user_id=user_ctx.user_id, msg_id=event.id)
-        await zq_bet_on(client, event, user_ctx, global_config)
+        async with _get_user_event_lock(user_ctx):
+            await zq_bet_on(client, event, user_ctx, global_config)
     
     @client.on(events.NewMessage(
-        chats=config.groups.get("zq_group", []),
+        chats=zq_group_targets,
         # 修复：多用户分支 - 结算正则字符类误写会匹配到 `|`，导致异常消息也被当作结算。
         pattern=r"已结算: 结果为 (\d+) (大|小)",
-        from_users=config.groups.get("zq_bot")
+        from_users=zq_bot_targets
     ))
     async def settle_handler(event):
         log_event(logging.DEBUG, 'settle', '收到结算消息',
                   user_id=user_ctx.user_id, msg_id=event.id)
-        await zq_settle(client, event, user_ctx, global_config)
+        async with _get_user_event_lock(user_ctx):
+            await zq_settle(client, event, user_ctx, global_config)
 
     @client.on(events.NewMessage(
-        chats=config.groups.get("zq_group", []),
-        from_users=config.groups.get("zq_bot")
+        chats=zq_group_targets,
+        from_users=zq_bot_targets
     ))
     async def red_packet_handler(event):
         await zq_red_packet(client, event, user_ctx, global_config)
@@ -111,7 +184,20 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
     async def user_handler(event):
         log_event(logging.DEBUG, 'user_cmd', '收到用户命令',
                   user_id=user_ctx.user_id, cmd=event.raw_text[:50])
-        await zq_user(client, event, user_ctx, global_config)
+        allowed_senders = _get_allowed_sender_ids(user_ctx)
+        if allowed_senders:
+            sender_id = getattr(event, "sender_id", None)
+            if sender_id is None or str(sender_id) not in allowed_senders:
+                log_event(
+                    logging.WARNING,
+                    'user_cmd',
+                    '命令发送者不在白名单，已忽略',
+                    user_id=user_ctx.user_id,
+                    sender_id=sender_id,
+                )
+                return
+        async with _get_user_event_lock(user_ctx):
+            await zq_user(client, event, user_ctx, global_config)
 
 
 async def zq_bet_on(client, event, user_ctx: UserContext, global_config: dict):
@@ -236,6 +322,29 @@ async def fetch_account_balance(user_ctx: UserContext) -> int:
 
 async def start_user(user_ctx: UserContext, global_config: dict):
     try:
+        zq_group_targets = _iter_targets(user_ctx.config.groups.get("zq_group", []))
+        zq_bot_targets = _iter_targets(user_ctx.config.groups.get("zq_bot"))
+        admin_chat = _resolve_admin_chat(user_ctx)
+
+        # 启动前校验，避免“进程运行但账号无命令/无结算”的静默失败。
+        if not zq_group_targets or not zq_bot_targets:
+            log_event(
+                logging.ERROR,
+                'start',
+                '用户启动失败：缺少必要监听配置',
+                user_id=user_ctx.user_id,
+                zq_group=zq_group_targets,
+                zq_bot=zq_bot_targets,
+            )
+            return None
+        if not admin_chat:
+            log_event(
+                logging.WARNING,
+                'start',
+                '未配置 admin_chat，命令与仪表盘将不可用',
+                user_id=user_ctx.user_id,
+            )
+
         client = await create_client(user_ctx, global_config)
         user_ctx.client = client
         
@@ -244,6 +353,15 @@ async def start_user(user_ctx: UserContext, global_config: dict):
         if not await client.is_user_authorized():
             log_event(logging.WARNING, 'start', '用户未授权，开始登录流程',
                       user_id=user_ctx.user_id)
+            if not sys.stdin.isatty():
+                log_event(
+                    logging.ERROR,
+                    'start',
+                    '非交互环境无法执行登录，请先在交互终端完成账号授权',
+                    user_id=user_ctx.user_id,
+                    session=user_ctx.config.telegram.get("session_name", ""),
+                )
+                return None
             print(f"\n🔐 用户 {user_ctx.config.name} 需要登录 Telegram")
             print(f"   请按照提示输入手机号和验证码...\n")
             try:

@@ -215,7 +215,24 @@ def _resolve_admin_chat(user_ctx: UserContext):
     admin_chat = notification.get("admin_chat")
     if admin_chat in (None, ""):
         admin_chat = user_ctx.config.groups.get("admin_chat")
+    if isinstance(admin_chat, str):
+        text = admin_chat.strip()
+        if text.lstrip("-").isdigit():
+            try:
+                return int(text)
+            except Exception:
+                return admin_chat
     return admin_chat
+
+
+async def _post_form_async(url: str, payload: dict, timeout: int = 5):
+    """在异步上下文中安全发送 form 请求，避免阻塞事件循环。"""
+    return await asyncio.to_thread(requests.post, url, data=payload, timeout=timeout)
+
+
+async def _post_json_async(url: str, payload: dict, timeout: int = 5):
+    """在异步上下文中安全发送 json 请求，避免阻塞事件循环。"""
+    return await asyncio.to_thread(requests.post, url, json=payload, timeout=timeout)
 
 
 async def send_message_v2(
@@ -264,7 +281,7 @@ async def send_message_v2(
                     token = iyuu_cfg.get("token")
                     iyuu_url = f"https://iyuu.cn/{token}.send" if token else None
                 if iyuu_url:
-                    requests.post(iyuu_url, data=payload, timeout=5)
+                    await _post_form_async(iyuu_url, payload, timeout=5)
             except Exception as e:
                 log_event(logging.ERROR, 'send_msg', 'IYUU通知失败', user_id=user_ctx.user_id, data=str(e))
 
@@ -276,7 +293,7 @@ async def send_message_v2(
                 if bot_token and chat_id:
                     url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
                     payload = {"chat_id": chat_id, "text": priority_message}
-                    requests.post(url, json=payload, timeout=5)
+                    await _post_json_async(url, payload, timeout=5)
             except Exception as e:
                 log_event(logging.ERROR, 'send_msg', 'TG Bot通知失败', user_id=user_ctx.user_id, data=str(e))
 
@@ -327,7 +344,7 @@ async def send_message(
                 token = iyuu_cfg.get("token")
                 iyuu_url = f"https://iyuu.cn/{token}.send" if token else None
             if iyuu_url:
-                requests.post(iyuu_url, data=payload, timeout=5)
+                await _post_form_async(iyuu_url, payload, timeout=5)
     if to in ("priority", "tgbot"):
         tg_bot_cfg = user_ctx.config.notification.get("tg_bot", {})
         if tg_bot_cfg.get("enable"):
@@ -336,7 +353,7 @@ async def send_message(
             if bot_token and chat_id:
                 url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
                 payload = {"chat_id": chat_id, "text": priority_message}
-                requests.post(url, json=payload, timeout=5)
+                await _post_json_async(url, payload, timeout=5)
     return None
 
 
@@ -3351,7 +3368,9 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
     rt["limit_stop_notified"] = False
     if is_fund_available(user_ctx, next_bet_amount) and not rt.get("bet", False) and rt.get("switch", True) and rt.get("stop_count", 0) == 0:
         await _clear_pause_countdown_notice(client, user_ctx)
-        rt["bet"] = True
+        # 这里只恢复“可下注状态”，不应提前标记为“已下注”。
+        # bet=True 只能在真实点击下注成功后设置，避免结算时序误判。
+        rt["bet"] = False
         rt["bet_on"] = True
         rt["mode_stop"] = True
         rt["pause_count"] = 0
