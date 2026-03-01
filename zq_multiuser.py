@@ -86,6 +86,23 @@ def format_number(num):
     return f"{int(num):,}"
 
 
+def _align_account_balance_to_fund(rt: Dict[str, Any]) -> bool:
+    """
+    资金一致性修正：
+    若 菠菜资金 < 账户余额，则将账户余额下调到菠菜资金。
+    """
+    try:
+        fund = int(rt.get("gambling_fund", 0) or 0)
+        balance = int(rt.get("account_balance", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+
+    if fund < balance:
+        rt["account_balance"] = fund
+        return True
+    return False
+
+
 def _normalize_ai_keys(ai_cfg: Dict[str, Any]) -> List[str]:
     """统一读取 ai api_keys，兼容旧字段 api_key。"""
     if not isinstance(ai_cfg, dict):
@@ -2008,6 +2025,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
     """处理押注结算 - 与master版本zq_settle完全一致，包括连输告警、回补播报、资金安全等"""
     state = user_ctx.state
     rt = state.runtime
+    _align_account_balance_to_fund(rt)
     
     text = event.message.message
     
@@ -2119,6 +2137,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     rt["bet"] = False
                     state.bet_type_history.append(prediction)
                     rt["gambling_fund"] = rt.get("gambling_fund", 0) + profit
+                    _align_account_balance_to_fund(rt)
                     rt["earnings"] = rt.get("earnings", 0) + profit
                     rt["period_profit"] = rt.get("period_profit", 0) + profit
                     rt["win_total"] = rt.get("win_total", 0) + (1 if win else 0)
@@ -2463,6 +2482,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         try:
             balance = await fetch_balance(user_ctx)
             rt["account_balance"] = balance
+            _align_account_balance_to_fund(rt)
             rt["balance_status"] = "success"
         except Exception as e:
             log_event(logging.WARNING, 'settle', '获取账户余额失败，使用默认值', 
@@ -3113,6 +3133,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             old_fund = rt.get("gambling_fund", 0)
             if len(my) == 1:
                 rt["gambling_fund"] = rt.get("gambling_fund", 2000000)
+                _align_account_balance_to_fund(rt)
                 mes = f"菠菜资金已重置为 {rt['gambling_fund'] / 10000:.2f} 万"
             elif len(my) == 2:
                 try:
@@ -3127,6 +3148,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                         else:
                             mes = f"菠菜资金已设置为 {new_fund / 10000:.2f} 万"
                         rt["gambling_fund"] = new_fund
+                        _align_account_balance_to_fund(rt)
                 except ValueError:
                     mes = "无效的金额格式，请输入整数"
             else:
@@ -3463,6 +3485,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             try:
                 balance = await fetch_balance(user_ctx)
                 rt["account_balance"] = balance
+                _align_account_balance_to_fund(rt)
                 user_ctx.save_state()
                 mes = f"账户余额: {format_number(balance)}"
                 await send_to_admin(client, mes, user_ctx, global_config)

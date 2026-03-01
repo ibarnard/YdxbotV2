@@ -1000,7 +1000,7 @@ def test_process_settle_lose_end_message_contains_balance_lines(tmp_path, monkey
     assert "😀 连续押注：4 次" in msg
     assert "⚠️本局连输： 3 次" in msg
     assert "💰 本局盈利： 1,990" in msg
-    assert "💰 账户余额：2463.49 万" in msg
+    assert "💰 账户余额：2456.74 万" in msg
     assert "💰 菠菜资金剩余：2456.84 万" in msg
 
 
