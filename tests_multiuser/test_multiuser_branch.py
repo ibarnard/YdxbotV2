@@ -979,7 +979,7 @@ def test_check_bet_status_can_resume_when_fund_sufficient(tmp_path, monkeypatch)
     # 恢复可下注状态时不应提前标记为“已下注”，避免结算时序误判。
     assert rt["bet"] is False
     assert rt["pause_count"] == 0
-    assert "押注已恢复" in sent["message"]
+    assert "恢复可下注状态" in sent["message"]
 
 
 def test_pause_command_sets_manual_pause_and_blocks_bet_on(tmp_path, monkeypatch):
@@ -1467,6 +1467,8 @@ def test_process_bet_on_pause_countdown_clears_on_resume(tmp_path, monkeypatch):
         def __init__(self):
             self.reply_markup = object()
             self.message = SimpleNamespace(message="unused")
+            self.chat_id = 5018
+            self.id = 5018001
 
         async def click(self, _):
             return None
@@ -1477,7 +1479,7 @@ def test_process_bet_on_pause_countdown_clears_on_resume(tmp_path, monkeypatch):
     assert rt["stop_count"] == 0
     assert rt["pause_countdown_active"] is False
     assert ctx.pause_countdown_message is None
-    assert any("恢复押注" in m for m in sent_messages)
+    assert any("恢复押注（已执行）" in m for m in sent_messages)
 
 
 def test_process_bet_on_insufficient_fund_sends_pause_notice_even_without_pending_bet(tmp_path, monkeypatch):

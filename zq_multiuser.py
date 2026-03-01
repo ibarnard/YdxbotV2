@@ -503,6 +503,32 @@ async def send_to_admin(client, message: str, user_ctx: UserContext, global_conf
     return await send_message_v2(client, "info", message, user_ctx, global_config)
 
 
+async def _send_transient_admin_notice(
+    client,
+    user_ctx: UserContext,
+    global_config: dict,
+    message: str,
+    ttl_seconds: int = 120,
+    attr_name: str = "transient_notice_message",
+):
+    """
+    发送“短时说明通知”（用于暂停结束/恢复等状态提示）：
+    - 刷新式保留最后一条
+    - 到期自动删除，减少消息堆积
+    """
+    old_message = getattr(user_ctx, attr_name, None)
+    if old_message:
+        await cleanup_message(client, old_message)
+    sent = await send_to_admin(client, message, user_ctx, global_config)
+    if sent:
+        setattr(user_ctx, attr_name, sent)
+        chat_id = getattr(sent, "chat_id", None)
+        msg_id = getattr(sent, "id", None)
+        if chat_id is not None and msg_id is not None and ttl_seconds > 0:
+            asyncio.create_task(delete_later(client, chat_id, msg_id, ttl_seconds))
+    return sent
+
+
 # ==================== V10 M-SMP 核心算法函数 ====================
 
 def calculate_trend_gap(history, window=100):
@@ -935,15 +961,23 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 rt["mode_stop"] = True
                 rt["flag"] = True
                 user_ctx.save_state()
-                await send_to_admin(client, "**暂停结束**\n检测到手动暂停，保持暂停状态", user_ctx, global_config)
+                await _send_transient_admin_notice(
+                    client,
+                    user_ctx,
+                    global_config,
+                    "⏸️ 自动暂停倒计时结束\n当前处于手动暂停，保持暂停状态\n如需恢复请发送：resume",
+                    ttl_seconds=90,
+                    attr_name="pause_transition_message",
+                )
                 return
 
             rt["bet"] = True
             rt["bet_on"] = True
             rt["mode_stop"] = True
             rt["flag"] = True
+            rt["pause_resume_pending"] = True
+            rt["pause_resume_pending_reason"] = str(rt.get("pause_countdown_reason", "自动暂停")).strip() or "自动暂停"
             user_ctx.save_state()
-            await send_to_admin(client, "**恢复押注**\n暂停已结束，新轮次开始", user_ctx, global_config)
         else:
             await _refresh_pause_countdown_notice(
                 client,
@@ -1309,6 +1343,26 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
         if message:
             asyncio.create_task(delete_later(client, message.chat_id, message.id, 100))
+
+        # 仅在“暂停后首次真正下单”时发送恢复说明，避免倒计时结束后反复刷“恢复押注”。
+        if rt.get("pause_resume_pending", False):
+            reason_text = str(rt.get("pause_resume_pending_reason", "自动暂停")).strip() or "自动暂停"
+            resume_msg = (
+                "✅ 恢复押注（已执行）\n"
+                f"恢复原因：{reason_text} 倒计时结束\n"
+                f"当前动作：已执行第 {rt.get('bet_sequence_count', 1)} 手，方向 {direction}，金额 {format_number(rt['bet_amount'])}\n"
+                "提示：若盘面仍触发风控，会再次自动暂停"
+            )
+            await _send_transient_admin_notice(
+                client,
+                user_ctx,
+                global_config,
+                resume_msg,
+                ttl_seconds=120,
+                attr_name="pause_transition_message",
+            )
+            rt["pause_resume_pending"] = False
+            rt["pause_resume_pending_reason"] = ""
 
         rt["current_bet_seq"] = int(rt.get("current_bet_seq", 1)) + 1
         user_ctx.save_state()
@@ -3989,8 +4043,20 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
         rt["pause_count"] = 0
         rt["fund_pause_notified"] = False
         user_ctx.save_state()
-        mes = f"**押注已恢复**\n当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n接续倍投金额：{format_number(next_bet_amount)}"
-        await send_to_admin(client, mes, user_ctx, global_config)
+        mes = (
+            "✅ 资金条件已满足，恢复可下注状态\n"
+            f"当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n"
+            f"接续倍投金额：{format_number(next_bet_amount)}\n"
+            "说明：本提示仅表示“可下注”，实际下注仍以盘口事件触发为准"
+        )
+        await _send_transient_admin_notice(
+            client,
+            user_ctx,
+            global_config,
+            mes,
+            ttl_seconds=120,
+            attr_name="status_transition_message",
+        )
     elif not is_fund_available(user_ctx, next_bet_amount):
         if _sync_fund_from_account_when_insufficient(rt, next_bet_amount):
             log_event(
@@ -4013,8 +4079,20 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
             rt["pause_count"] = 0
             rt["fund_pause_notified"] = False
             user_ctx.save_state()
-            mes = f"**押注已恢复**\n当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n接续倍投金额：{format_number(next_bet_amount)}"
-            await send_to_admin(client, mes, user_ctx, global_config)
+            mes = (
+                "✅ 资金同步后已恢复可下注状态\n"
+                f"当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n"
+                f"接续倍投金额：{format_number(next_bet_amount)}\n"
+                "说明：本提示仅表示“可下注”，实际下注仍以盘口事件触发为准"
+            )
+            await _send_transient_admin_notice(
+                client,
+                user_ctx,
+                global_config,
+                mes,
+                ttl_seconds=120,
+                attr_name="status_transition_message",
+            )
             return
 
         rt["bet_on"] = False
