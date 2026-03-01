@@ -1000,7 +1000,7 @@ def test_process_settle_lose_end_message_contains_balance_lines(tmp_path, monkey
     assert "😀 连续押注：4 次" in msg
     assert "⚠️本局连输： 3 次" in msg
     assert "💰 本局盈利： 1,990" in msg
-    assert "💰 账户余额：2456.74 万" in msg
+    assert "💰 账户余额：2463.49 万" in msg
     assert "💰 菠菜资金剩余：2456.84 万" in msg
 
 
@@ -1360,7 +1360,7 @@ def test_check_bet_status_does_not_resume_when_next_bet_amount_is_zero(tmp_path,
     assert not any("押注已恢复" in m for m in sent_messages)
 
 
-def test_process_settle_keeps_fund_pause_notified_when_next_bet_still_insufficient(tmp_path, monkeypatch):
+def test_process_settle_syncs_fund_from_balance_before_next_bet_check(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "5021"
     _write_json(
         user_dir / "config.json",
@@ -1412,7 +1412,8 @@ def test_process_settle_keeps_fund_pause_notified_when_next_bet_still_insufficie
     event = SimpleNamespace(id=44001, message=SimpleNamespace(message="已结算: 结果为 9 大"))
     asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
 
-    assert rt["fund_pause_notified"] is True
+    assert rt["gambling_fund"] == 1_470_000
+    assert rt["fund_pause_notified"] is False
     assert rt["bet_on"] is False
     assert rt["mode_stop"] is True
     assert not any("菠菜资金不足，已暂停押注" in m for m in sent_messages)

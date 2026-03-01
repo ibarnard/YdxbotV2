@@ -86,19 +86,21 @@ def format_number(num):
     return f"{int(num):,}"
 
 
-def _align_account_balance_to_fund(rt: Dict[str, Any]) -> bool:
+def _sync_fund_from_account_when_insufficient(rt: Dict[str, Any], required_amount: int = 0) -> bool:
     """
-    资金一致性修正：
-    若 菠菜资金 < 账户余额，则将账户余额下调到菠菜资金。
+    仅在“资金不足”场景触发的修正：
+    若当前菠菜资金不足，且账户余额更高，则把菠菜资金同步为账户余额。
     """
     try:
         fund = int(rt.get("gambling_fund", 0) or 0)
         balance = int(rt.get("account_balance", 0) or 0)
+        need = max(0, int(required_amount or 0))
     except (TypeError, ValueError):
         return False
 
-    if fund < balance:
-        rt["account_balance"] = fund
+    threshold = max(1, need)
+    if fund < threshold and balance > fund:
+        rt["gambling_fund"] = balance
         return True
     return False
 
@@ -1064,25 +1066,36 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     rt["limit_stop_notified"] = False
 
     if not is_fund_available(user_ctx, bet_amount):
-        if not rt.get("fund_pause_notified", False):
-            display_fund = max(0, rt.get("gambling_fund", 0))
-            mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
-            await send_message_v2(
-                client,
-                "fund_pause",
-                mes,
-                user_ctx,
-                global_config,
-                title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
-                desp=mes,
+        if _sync_fund_from_account_when_insufficient(rt, bet_amount):
+            log_event(
+                logging.INFO,
+                'bet_on',
+                '资金不足触发资金同步',
+                user_id=user_ctx.user_id,
+                data=f"need={bet_amount}, fund={rt.get('gambling_fund', 0)}, account={rt.get('account_balance', 0)}",
             )
-            rt["fund_pause_notified"] = True
-        rt["bet"] = False
-        rt["bet_on"] = False
-        rt["mode_stop"] = True
-        _clear_lose_recovery_tracking(rt)
-        user_ctx.save_state()
-        return
+            user_ctx.save_state()
+
+        if not is_fund_available(user_ctx, bet_amount):
+            if not rt.get("fund_pause_notified", False):
+                display_fund = max(0, rt.get("gambling_fund", 0))
+                mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
+                await send_message_v2(
+                    client,
+                    "fund_pause",
+                    mes,
+                    user_ctx,
+                    global_config,
+                    title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                    desp=mes,
+                )
+                rt["fund_pause_notified"] = True
+            rt["bet"] = False
+            rt["bet_on"] = False
+            rt["mode_stop"] = True
+            _clear_lose_recovery_tracking(rt)
+            user_ctx.save_state()
+            return
     rt["fund_pause_notified"] = False
 
     if not (rt.get("bet_on", False) or rt.get("mode_stop", True)):
@@ -2145,7 +2158,6 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
     """处理押注结算 - 与master版本zq_settle完全一致，包括连输告警、回补播报、资金安全等"""
     state = user_ctx.state
     rt = state.runtime
-    _align_account_balance_to_fund(rt)
     
     text = event.message.message
     
@@ -2168,6 +2180,22 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         result_type = match.group(2)
         is_big = (result_type == "大")
         result = 1 if is_big else 0
+
+        # 账户余额刷新前置：确保本轮结算/告警/仪表盘使用最新余额，
+        # 避免消息里出现“上一轮余额”的体感延迟。
+        try:
+            balance = await fetch_balance(user_ctx)
+            rt["account_balance"] = balance
+            rt["balance_status"] = "success"
+        except Exception as e:
+            log_event(
+                logging.WARNING,
+                'settle',
+                '获取账户余额失败，使用默认值',
+                user_id=user_ctx.user_id,
+                data=str(e),
+            )
+            rt["balance_status"] = "network_error"
 
         if rt.get("open_ydx", False):
             monitor_targets = _iter_targets(user_ctx.config.groups.get("monitor", []))
@@ -2204,36 +2232,24 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         
         # 资金安全闸门
         if not is_fund_available(user_ctx):
-            if hasattr(user_ctx, 'dashboard_message') and user_ctx.dashboard_message:
-                await cleanup_message(client, user_ctx.dashboard_message)
-            display_fund = max(0, rt.get("gambling_fund", 0))
-            mes = f"**菠菜资金耗尽，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
-            log_event(logging.WARNING, 'settle', '资金耗尽暂停', 
-                      user_id=user_ctx.user_id, data=f'fund={rt.get("gambling_fund", 0)}')
-            if not rt.get("fund_pause_notified", False):
-                await send_message_v2(
-                    client,
-                    "fund_pause",
-                    mes,
-                    user_ctx,
-                    global_config,
-                    title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
-                    desp=mes,
+            if _sync_fund_from_account_when_insufficient(rt, 1):
+                log_event(
+                    logging.INFO,
+                    'settle',
+                    '资金耗尽前触发资金同步',
+                    user_id=user_ctx.user_id,
+                    data=f"fund={rt.get('gambling_fund', 0)}, account={rt.get('account_balance', 0)}",
                 )
-                rt["fund_pause_notified"] = True
-            rt["bet"] = False
-            rt["bet_on"] = False
-            rt["mode_stop"] = True
-        else:
-            next_bet_amount = calculate_bet_amount(rt)
-            if next_bet_amount > 0 and not is_fund_available(user_ctx, next_bet_amount):
+                user_ctx.save_state()
+
+            if not is_fund_available(user_ctx):
+                if hasattr(user_ctx, 'dashboard_message') and user_ctx.dashboard_message:
+                    await cleanup_message(client, user_ctx.dashboard_message)
+                display_fund = max(0, rt.get("gambling_fund", 0))
+                mes = f"**菠菜资金耗尽，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
+                log_event(logging.WARNING, 'settle', '资金耗尽暂停', 
+                          user_id=user_ctx.user_id, data=f'fund={rt.get("gambling_fund", 0)}')
                 if not rt.get("fund_pause_notified", False):
-                    display_fund = max(0, rt.get("gambling_fund", 0))
-                    mes = (
-                        f"**菠菜资金不足，已暂停押注**\n"
-                        f"当前剩余：{display_fund / 10000:.2f} 万\n"
-                        "请使用 `gf [金额]` 恢复"
-                    )
                     await send_message_v2(
                         client,
                         "fund_pause",
@@ -2247,6 +2263,47 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                 rt["bet"] = False
                 rt["bet_on"] = False
                 rt["mode_stop"] = True
+            else:
+                rt["fund_pause_notified"] = False
+        else:
+            next_bet_amount = calculate_bet_amount(rt)
+            if next_bet_amount > 0 and not is_fund_available(user_ctx, next_bet_amount):
+                if _sync_fund_from_account_when_insufficient(rt, next_bet_amount):
+                    log_event(
+                        logging.INFO,
+                        'settle',
+                        '资金不足前触发资金同步',
+                        user_id=user_ctx.user_id,
+                        data=(
+                            f"need={next_bet_amount}, fund={rt.get('gambling_fund', 0)}, "
+                            f"account={rt.get('account_balance', 0)}"
+                        ),
+                    )
+                    user_ctx.save_state()
+
+                if not is_fund_available(user_ctx, next_bet_amount):
+                    if not rt.get("fund_pause_notified", False):
+                        display_fund = max(0, rt.get("gambling_fund", 0))
+                        mes = (
+                            f"**菠菜资金不足，已暂停押注**\n"
+                            f"当前剩余：{display_fund / 10000:.2f} 万\n"
+                            "请使用 `gf [金额]` 恢复"
+                        )
+                        await send_message_v2(
+                            client,
+                            "fund_pause",
+                            mes,
+                            user_ctx,
+                            global_config,
+                            title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                            desp=mes,
+                        )
+                        rt["fund_pause_notified"] = True
+                    rt["bet"] = False
+                    rt["bet_on"] = False
+                    rt["mode_stop"] = True
+                else:
+                    rt["fund_pause_notified"] = False
             else:
                 rt["fund_pause_notified"] = False
             if rt.get("bet", False):
@@ -2273,7 +2330,6 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     rt["bet"] = False
                     state.bet_type_history.append(prediction)
                     rt["gambling_fund"] = rt.get("gambling_fund", 0) + profit
-                    _align_account_balance_to_fund(rt)
                     rt["earnings"] = rt.get("earnings", 0) + profit
                     rt["period_profit"] = rt.get("period_profit", 0) + profit
                     rt["win_total"] = rt.get("win_total", 0) + (1 if win else 0)
@@ -2560,17 +2616,6 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     )
                 )
         
-        # 获取账户余额
-        try:
-            balance = await fetch_balance(user_ctx)
-            rt["account_balance"] = balance
-            _align_account_balance_to_fund(rt)
-            rt["balance_status"] = "success"
-        except Exception as e:
-            log_event(logging.WARNING, 'settle', '获取账户余额失败，使用默认值', 
-                      user_id=user_ctx.user_id, data=str(e))
-            rt["balance_status"] = "network_error"
-
         # 每 100 局输出一次风控暂停阶段总结，并同步到重点通道（IYUU/TG Bot）。
         current_total = int(rt.get("total", 0))
         last_report_total = int(rt.get("risk_pause_last_100_report_total", 0))
@@ -3215,7 +3260,6 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             old_fund = rt.get("gambling_fund", 0)
             if len(my) == 1:
                 rt["gambling_fund"] = rt.get("gambling_fund", 2000000)
-                _align_account_balance_to_fund(rt)
                 mes = f"菠菜资金已重置为 {rt['gambling_fund'] / 10000:.2f} 万"
             elif len(my) == 2:
                 try:
@@ -3230,7 +3274,6 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                         else:
                             mes = f"菠菜资金已设置为 {new_fund / 10000:.2f} 万"
                         rt["gambling_fund"] = new_fund
-                        _align_account_balance_to_fund(rt)
                 except ValueError:
                     mes = "无效的金额格式，请输入整数"
             else:
@@ -3567,7 +3610,6 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             try:
                 balance = await fetch_balance(user_ctx)
                 rt["account_balance"] = balance
-                _align_account_balance_to_fund(rt)
                 user_ctx.save_state()
                 mes = f"账户余额: {format_number(balance)}"
                 await send_to_admin(client, mes, user_ctx, global_config)
@@ -3724,6 +3766,31 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
         mes = f"**押注已恢复**\n当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n接续倍投金额：{format_number(next_bet_amount)}"
         await send_to_admin(client, mes, user_ctx, global_config)
     elif not is_fund_available(user_ctx, next_bet_amount):
+        if _sync_fund_from_account_when_insufficient(rt, next_bet_amount):
+            log_event(
+                logging.INFO,
+                'status',
+                '检查状态时资金不足触发资金同步',
+                user_id=user_ctx.user_id,
+                data=(
+                    f"need={next_bet_amount}, fund={rt.get('gambling_fund', 0)}, "
+                    f"account={rt.get('account_balance', 0)}"
+                ),
+            )
+            user_ctx.save_state()
+
+        if is_fund_available(user_ctx, next_bet_amount):
+            await _clear_pause_countdown_notice(client, user_ctx)
+            rt["bet"] = False
+            rt["bet_on"] = True
+            rt["mode_stop"] = True
+            rt["pause_count"] = 0
+            rt["fund_pause_notified"] = False
+            user_ctx.save_state()
+            mes = f"**押注已恢复**\n当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n接续倍投金额：{format_number(next_bet_amount)}"
+            await send_to_admin(client, mes, user_ctx, global_config)
+            return
+
         rt["bet_on"] = False
         rt["mode_stop"] = True
         _clear_lose_recovery_tracking(rt)
