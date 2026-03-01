@@ -423,7 +423,43 @@ async def start_user(user_ctx: UserContext, global_config: dict):
         balance = await fetch_account_balance(user_ctx)
         user_ctx.set_runtime("gambling_fund", balance)
         user_ctx.set_runtime("account_balance", balance)
+
+        # 启动自愈：清理历史遗留 result=None 的挂单记录，避免统计/资金对账被旧脏数据干扰。
+        from zq_multiuser import heal_stale_pending_bets
+        heal_result = heal_stale_pending_bets(user_ctx)
+
         user_ctx.save_state()
+
+        healed_count = int(heal_result.get("count", 0) or 0)
+        if healed_count > 0:
+            healed_preview = ", ".join(heal_result.get("items", [])[:5])
+            if len(heal_result.get("items", [])) > 5:
+                healed_preview += " ..."
+            log_event(
+                logging.WARNING,
+                'start',
+                '检测到历史未结算挂单并已自愈',
+                user_id=user_ctx.user_id,
+                count=healed_count,
+                items=healed_preview,
+            )
+            if admin_chat:
+                mes = (
+                    "🩹 挂单自愈已执行\n"
+                    f"检测到历史异常挂单：{healed_count} 笔（result=None）\n"
+                    "处理方式：已自动标记为“异常未结算”（不再参与胜率/连输统计）\n"
+                    f"样例：{healed_preview}"
+                )
+                try:
+                    await client.send_message(admin_chat, mes)
+                except Exception as e:
+                    log_event(
+                        logging.ERROR,
+                        'start',
+                        '挂单自愈通知发送失败',
+                        user_id=user_ctx.user_id,
+                        error=str(e),
+                    )
         
         log_event(logging.INFO, 'start', '用户启动成功',
                   user_id=user_ctx.user_id, name=user_ctx.config.name, balance=balance)

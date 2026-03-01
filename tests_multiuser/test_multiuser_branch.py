@@ -129,6 +129,60 @@ def test_model_manager_apply_shared_config_uses_shared_chain():
     assert mgr.get_model("2")["model_id"] == "model-2"
 
 
+def test_heal_stale_pending_bets_marks_orphan_none_records(tmp_path):
+    user_dir = tmp_path / "users" / "heal_user_1"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "自愈用户"},
+            "telegram": {"user_id": 7101},
+            "groups": {"admin_chat": 7101},
+        },
+    )
+
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["bet"] = False
+    ctx.state.bet_sequence_log = [
+        {"bet_id": "b1", "result": "赢", "profit": 990},
+        {"bet_id": "b2", "result": None, "profit": 0},
+        {"bet_id": "b3", "result": None, "profit": None},
+    ]
+
+    result = zm.heal_stale_pending_bets(ctx)
+    assert result["count"] == 2
+    assert ctx.state.bet_sequence_log[1]["result"] == "异常未结算"
+    assert ctx.state.bet_sequence_log[2]["result"] == "异常未结算"
+    assert ctx.state.bet_sequence_log[2]["profit"] == 0
+    assert rt["pending_bet_last_heal_count"] == 2
+    assert rt["pending_bet_heal_total"] >= 2
+
+
+def test_heal_stale_pending_bets_keeps_latest_when_bet_pending(tmp_path):
+    user_dir = tmp_path / "users" / "heal_user_2"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "自愈用户2"},
+            "telegram": {"user_id": 7102},
+            "groups": {"admin_chat": 7102},
+        },
+    )
+
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["bet"] = True
+    ctx.state.bet_sequence_log = [
+        {"bet_id": "b1", "result": "输", "profit": -1000},
+        {"bet_id": "b2", "result": None, "profit": None},
+    ]
+
+    result = zm.heal_stale_pending_bets(ctx)
+    assert result["count"] == 0
+    assert ctx.state.bet_sequence_log[-1]["result"] is None
+    assert "pending_bet_last_heal_count" not in rt
+
+
 def test_user_context_supports_hash_comments_in_config(tmp_path):
     user_dir = tmp_path / "users" / "commented"
     user_dir.mkdir(parents=True, exist_ok=True)

@@ -112,6 +112,49 @@ def _sync_fund_from_account_when_insufficient(rt: Dict[str, Any], required_amoun
     return False
 
 
+def heal_stale_pending_bets(user_ctx: UserContext) -> Dict[str, Any]:
+    """
+    启动时自愈历史挂单：
+    - 仅允许“最后一笔且 runtime.bet=True”保持 result=None（真实待结算）
+    - 其他 result=None 一律标记为“异常未结算”，避免历史统计与资金核对长期受污染
+    """
+    state = user_ctx.state
+    rt = state.runtime
+    logs = state.bet_sequence_log if isinstance(state.bet_sequence_log, list) else []
+    if not logs:
+        return {"count": 0, "items": []}
+
+    pending_active = bool(rt.get("bet", False))
+    now_text = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    healed_items: List[str] = []
+
+    for idx, item in enumerate(logs):
+        if not isinstance(item, dict):
+            continue
+        if item.get("result") is not None:
+            continue
+
+        is_last = (idx == len(logs) - 1)
+        if is_last and pending_active:
+            # 正常待结算，不处理
+            continue
+
+        item["result"] = "异常未结算"
+        if item.get("profit") is None:
+            item["profit"] = 0
+        item["heal_time"] = now_text
+        item["heal_note"] = "startup_auto_heal_pending_bet"
+        healed_items.append(str(item.get("bet_id") or f"index:{idx}"))
+
+    healed_count = len(healed_items)
+    if healed_count > 0:
+        rt["pending_bet_heal_total"] = int(rt.get("pending_bet_heal_total", 0) or 0) + healed_count
+        rt["pending_bet_last_heal_count"] = healed_count
+        rt["pending_bet_last_heal_at"] = now_text
+
+    return {"count": healed_count, "items": healed_items}
+
+
 def _normalize_ai_keys(ai_cfg: Dict[str, Any]) -> List[str]:
     """统一读取 ai api_keys，兼容旧字段 api_key。"""
     if not isinstance(ai_cfg, dict):
