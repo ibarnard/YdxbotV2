@@ -1155,8 +1155,10 @@ def test_process_settle_profit_pause_does_not_immediately_resume(tmp_path, monke
     ctx.state.bet_sequence_log = [{"bet_id": "20260227_1_3", "profit": None}]
 
     sent_messages = []
+    routed_messages = []
 
-    async def fake_send_message_v2(*args, **kwargs):
+    async def fake_send_message_v2(client, msg_type, message, user_ctx, global_cfg, parse_mode="markdown", title=None, desp=None):
+        routed_messages.append((msg_type, message))
         return None
 
     async def fake_send_to_admin(client, message, user_ctx, global_cfg):
@@ -1180,7 +1182,7 @@ def test_process_settle_profit_pause_does_not_immediately_resume(tmp_path, monke
     event = SimpleNamespace(id=41001, message=SimpleNamespace(message="已结算: 结果为 9 大"))
     asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
 
-    assert any("原因：盈利达成" in m for m in sent_messages)
+    assert any(msg_type == "goal_pause" and "原因：盈利达成" in m for msg_type, m in routed_messages)
     assert any("暂停倒计时提醒" in m for m in sent_messages)
     assert not any(m.startswith("**恢复押注**") for m in sent_messages)
     assert rt["stop_count"] == 3  # profit_stop=2, 内部计数应为3
@@ -1301,11 +1303,12 @@ def test_process_bet_on_insufficient_fund_sends_pause_notice_even_without_pendin
 
     sent_messages = []
 
-    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
-        sent_messages.append(message)
-        return SimpleNamespace(chat_id=5019, id=len(sent_messages))
+    async def fake_send_message_v2(client, msg_type, message, user_ctx, global_cfg, parse_mode="markdown", title=None, desp=None):
+        if msg_type == "fund_pause":
+            sent_messages.append(message)
+        return None
 
-    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "send_message_v2", fake_send_message_v2)
 
     event = SimpleNamespace(reply_markup=object(), message=SimpleNamespace(message="unused"))
     asyncio.run(zm.process_bet_on(SimpleNamespace(), event, ctx, {}))

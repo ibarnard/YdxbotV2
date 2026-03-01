@@ -256,6 +256,8 @@ MESSAGE_ROUTING_TABLE = {
     "explode": {"channels": ["admin", "priority"], "priority": True},
     "lose_streak": {"channels": ["admin", "priority"], "priority": True},
     "lose_end": {"channels": ["admin", "priority"], "priority": True},
+    "fund_pause": {"channels": ["admin", "priority"], "priority": True},
+    "goal_pause": {"channels": ["admin", "priority"], "priority": True},
     "risk_pause": {"channels": ["admin"], "priority": False},
     "risk_summary": {"channels": ["admin", "priority"], "priority": True},
     "pause": {"channels": ["admin"], "priority": False},
@@ -992,8 +994,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 max_pause=max_allow_rounds,
             )
             pause_rounds = max(1, min(max_allow_rounds, int(model_pause_rounds)))
-            _apply_auto_risk_pause(rt, pause_rounds)
-            _set_pause_countdown_context(rt, "基础风控暂停", pause_rounds)
+            _enter_pause(rt, pause_rounds, "基础风控暂停")
             rt["risk_pause_acc_rounds"] = pause_acc_rounds + pause_rounds
             rt["risk_pause_snapshot_count"] = settled_count
             rt["risk_pause_block_hits"] = int(rt.get("risk_pause_block_hits", 0)) + 1
@@ -1066,7 +1067,15 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         if not rt.get("fund_pause_notified", False):
             display_fund = max(0, rt.get("gambling_fund", 0))
             mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
-            await send_to_admin(client, mes, user_ctx, global_config)
+            await send_message_v2(
+                client,
+                "fund_pause",
+                mes,
+                user_ctx,
+                global_config,
+                title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                desp=mes,
+            )
             rt["fund_pause_notified"] = True
         rt["bet"] = False
         rt["bet_on"] = False
@@ -1692,6 +1701,17 @@ def _apply_auto_risk_pause(rt: dict, pause_rounds: int) -> None:
     rt["mode_stop"] = False
 
 
+def _enter_pause(rt: dict, pause_rounds: int, reason: str) -> int:
+    """
+    统一暂停入口：写入暂停状态 + 倒计时上下文。
+    返回规范化后的暂停局数。
+    """
+    rounds = max(1, int(pause_rounds))
+    _apply_auto_risk_pause(rt, rounds)
+    _set_pause_countdown_context(rt, reason, rounds)
+    return rounds
+
+
 def _set_pause_countdown_context(rt: dict, reason: str, pause_rounds: int) -> None:
     """写入统一暂停倒计时上下文（手动暂停不使用该机制）。"""
     rounds = max(1, int(pause_rounds))
@@ -1791,8 +1811,7 @@ async def _trigger_deep_risk_pause_after_settle(
         max_pause=deep_cap,
     )
     pause_rounds = max(1, min(deep_cap, int(model_pause_rounds)))
-    _apply_auto_risk_pause(rt, pause_rounds)
-    _set_pause_countdown_context(rt, f"深度风控暂停（{deep_milestone}连输档）", pause_rounds)
+    _enter_pause(rt, pause_rounds, f"深度风控暂停（{deep_milestone}连输档）")
     rt["risk_pause_snapshot_count"] = settled_count
     rt["risk_pause_block_hits"] = int(rt.get("risk_pause_block_hits", 0)) + 1
     rt["risk_pause_block_rounds"] = int(rt.get("risk_pause_block_rounds", 0)) + pause_rounds
@@ -1839,6 +1858,96 @@ async def _trigger_deep_risk_pause_after_settle(
             f"milestone={deep_milestone}, next_seq={next_sequence}, "
             f"pause_rounds={pause_rounds}, source={model_source}"
         ),
+    )
+    return True
+
+
+async def _handle_goal_pause_after_settle(
+    client,
+    user_ctx: UserContext,
+    global_config: dict,
+) -> bool:
+    """
+    统一处理“炸号/盈利达成”触发的暂停。
+    仅做结构收敛，不改变原有阈值与重置语义。
+    """
+    state = user_ctx.state
+    rt = state.runtime
+
+    explode_count = int(rt.get("explode_count", 0))
+    explode = int(rt.get("explode", 5))
+    period_profit = int(rt.get("period_profit", 0))
+    profit_target = int(rt.get("profit", 1000000))
+
+    if not (explode_count >= explode or period_profit >= profit_target):
+        return False
+
+    if not rt.get("flag", True):
+        return False
+    rt["flag"] = False
+
+    notify_type = "explode" if explode_count >= explode else "profit"
+    log_event(logging.INFO, 'settle', '触发通知', user_id=user_ctx.user_id, data=f'type={notify_type}')
+
+    if notify_type == "profit":
+        date_str = datetime.now().strftime("%m月%d日")
+        current_round_str = f"{datetime.now().strftime('%Y%m%d')}_{rt.get('current_round', 1)}"
+        round_bet_count = sum(
+            1 for entry in state.bet_sequence_log
+            if str(entry.get("bet_id", "")).startswith(current_round_str)
+        )
+        win_msg = (
+            f"😄📈 {date_str}第 {rt.get('current_round', 1)} 轮 赢了\n"
+            f"收益：{period_profit / 10000:.2f} 万\n"
+            f"共下注：{round_bet_count} 次"
+        )
+        await send_message_v2(client, "win", win_msg, user_ctx, global_config)
+    else:
+        explode_msg = f"**💥 本轮炸了**\n收益：{period_profit / 10000:.2f} 万"
+        await send_message_v2(client, "explode", explode_msg, user_ctx, global_config)
+
+    configured_stop_rounds = int(rt.get("stop", 3) if notify_type == "explode" else rt.get("profit_stop", 5))
+    pause_reason = "炸号保护暂停" if notify_type == "explode" else "盈利达成暂停"
+    _enter_pause(rt, configured_stop_rounds, pause_reason)
+    rt["bet_sequence_count"] = 0
+
+    if period_profit >= profit_target:
+        rt["current_round"] = int(rt.get("current_round", 1)) + 1
+        rt["current_bet_seq"] = 1
+
+    rt["explode_count"] = 0
+    rt["period_profit"] = 0
+    rt["lose_count"] = 0
+    rt["win_count"] = 0
+    rt["bet_amount"] = int(rt.get("initial_amount", 500))
+    _clear_lose_recovery_tracking(rt)
+
+    pause_msg = (
+        f"**暂停押注**\n"
+        f"原因：{'被炸' if notify_type == 'explode' else '盈利达成'}\n"
+        f"剩余：{configured_stop_rounds} 局"
+    )
+    log_event(
+        logging.INFO,
+        'settle',
+        '暂停押注',
+        user_id=user_ctx.user_id,
+        data=f'type={notify_type}, stop_count={configured_stop_rounds}'
+    )
+    await send_message_v2(
+        client,
+        "goal_pause",
+        pause_msg,
+        user_ctx,
+        global_config,
+        title=f"菠菜机器人 {user_ctx.config.name} {'炸号' if notify_type == 'explode' else '盈利'}暂停",
+        desp=pause_msg,
+    )
+    await _refresh_pause_countdown_notice(
+        client,
+        user_ctx,
+        global_config,
+        remaining_rounds=configured_stop_rounds,
     )
     return True
 
@@ -2102,7 +2211,15 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             log_event(logging.WARNING, 'settle', '资金耗尽暂停', 
                       user_id=user_ctx.user_id, data=f'fund={rt.get("gambling_fund", 0)}')
             if not rt.get("fund_pause_notified", False):
-                await send_to_admin(client, mes, user_ctx, global_config)
+                await send_message_v2(
+                    client,
+                    "fund_pause",
+                    mes,
+                    user_ctx,
+                    global_config,
+                    title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                    desp=mes,
+                )
                 rt["fund_pause_notified"] = True
             rt["bet"] = False
             rt["bet_on"] = False
@@ -2117,7 +2234,15 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                         f"当前剩余：{display_fund / 10000:.2f} 万\n"
                         "请使用 `gf [金额]` 恢复"
                     )
-                    await send_to_admin(client, mes, user_ctx, global_config)
+                    await send_message_v2(
+                        client,
+                        "fund_pause",
+                        mes,
+                        user_ctx,
+                        global_config,
+                        title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                        desp=mes,
+                    )
                     rt["fund_pause_notified"] = True
                 rt["bet"] = False
                 rt["bet_on"] = False
@@ -2362,62 +2487,8 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             log_event(logging.DEBUG, 'settle', '定期保存状态', 
                       user_id=user_ctx.user_id, data=f'history_len={len(state.history)}')
         
-        # 炸和盈利通知
-        explode_count = rt.get("explode_count", 0)
-        explode = rt.get("explode", 5)
-        period_profit = rt.get("period_profit", 0)
-        profit_target = rt.get("profit", 1000000)
-        
-        if explode_count >= explode or period_profit >= profit_target:
-            if rt.get("flag", True):
-                rt["flag"] = False
-                notify_type = "explode" if explode_count >= explode else "profit"
-                log_event(logging.INFO, 'settle', '触发通知', user_id=user_ctx.user_id, data=f'type={notify_type}')
-                if notify_type == "profit":
-                    date_str = datetime.now().strftime("%m月%d日")
-                    current_round_str = f"{datetime.now().strftime('%Y%m%d')}_{rt.get('current_round', 1)}"
-                    round_bet_count = sum(
-                        1 for entry in state.bet_sequence_log
-                        if str(entry.get("bet_id", "")).startswith(current_round_str)
-                    )
-                    win_msg = (
-                        f"😄📈 {date_str}第 {rt.get('current_round', 1)} 轮 赢了\n"
-                        f"收益：{period_profit / 10000:.2f} 万\n"
-                        f"共下注：{round_bet_count} 次"
-                    )
-                    await send_message_v2(client, "win", win_msg, user_ctx, global_config)
-                else:
-                    mes = f"**💥 本轮炸了**\n收益：{period_profit / 10000:.2f} 万"
-                    await send_message_v2(client, "explode", mes, user_ctx, global_config)
-                
-                # 使用内部计数（暂停局数+1），由下注入口统一扣减，避免同一局被重复扣减导致“秒恢复”。
-                configured_stop_rounds = int(rt.get("stop", 3) if notify_type == "explode" else rt.get("profit_stop", 5))
-                rt["stop_count"] = max(1, configured_stop_rounds) + 1
-                pause_reason = "炸号保护暂停" if notify_type == "explode" else "盈利达成暂停"
-                _set_pause_countdown_context(rt, pause_reason, configured_stop_rounds)
-                rt["bet"] = False
-                rt["bet_on"] = False
-                rt["mode_stop"] = False
-                rt["bet_sequence_count"] = 0
-                if period_profit >= profit_target:
-                    rt["current_round"] = rt.get("current_round", 1) + 1
-                    rt["current_bet_seq"] = 1
-                rt["explode_count"] = 0
-                rt["period_profit"] = 0
-                rt["lose_count"] = 0
-                rt["win_count"] = 0
-                rt["bet_amount"] = int(rt.get("initial_amount", 500))
-                _clear_lose_recovery_tracking(rt)
-                mes = f"**暂停押注**\n原因：{'被炸' if notify_type == 'explode' else '盈利达成'}\n剩余：{configured_stop_rounds} 局"
-                log_event(logging.INFO, 'settle', '暂停押注', 
-                          user_id=user_ctx.user_id, data=f'type={notify_type}, stop_count={configured_stop_rounds}')
-                await send_to_admin(client, mes, user_ctx, global_config)
-                await _refresh_pause_countdown_notice(
-                    client,
-                    user_ctx,
-                    global_config,
-                    remaining_rounds=configured_stop_rounds,
-                )
+        # 炸和盈利触发统一暂停流程（消息与暂停入口统一）
+        await _handle_goal_pause_after_settle(client, user_ctx, global_config)
         
         # 历史记录统计通知
         if hasattr(user_ctx, 'dashboard_message') and user_ctx.dashboard_message:
@@ -3657,7 +3728,16 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
         rt["mode_stop"] = True
         _clear_lose_recovery_tracking(rt)
         if not rt.get("fund_pause_notified", False):
-            await send_to_admin(client, "⚠️ 菠菜资金不足，已自动暂停押注", user_ctx, global_config)
+            mes = "⚠️ 菠菜资金不足，已自动暂停押注"
+            await send_message_v2(
+                client,
+                "fund_pause",
+                mes,
+                user_ctx,
+                global_config,
+                title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                desp=mes,
+            )
             rt["fund_pause_notified"] = True
         user_ctx.save_state()
 
