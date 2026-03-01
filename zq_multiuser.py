@@ -2407,42 +2407,44 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         result_amount = 0
         lose_end_payload = None
         
-        # 资金安全闸门
-        if not is_fund_available(user_ctx):
-            if _sync_fund_from_account_when_insufficient(rt, 1):
-                log_event(
-                    logging.INFO,
-                    'settle',
-                    '资金耗尽前触发资金同步',
-                    user_id=user_ctx.user_id,
-                    data=f"fund={rt.get('gambling_fund', 0)}, account={rt.get('account_balance', 0)}",
-                )
-                user_ctx.save_state()
-
+        async def _apply_settle_fund_safety_guard() -> None:
+            """资金安全闸门（结算后执行，避免未结算订单被提前清空）。"""
             if not is_fund_available(user_ctx):
-                if hasattr(user_ctx, 'dashboard_message') and user_ctx.dashboard_message:
-                    await cleanup_message(client, user_ctx.dashboard_message)
-                display_fund = max(0, rt.get("gambling_fund", 0))
-                mes = f"**菠菜资金耗尽，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
-                log_event(logging.WARNING, 'settle', '资金耗尽暂停', 
-                          user_id=user_ctx.user_id, data=f'fund={rt.get("gambling_fund", 0)}')
-                if not rt.get("fund_pause_notified", False):
-                    await send_message_v2(
-                        client,
-                        "fund_pause",
-                        mes,
-                        user_ctx,
-                        global_config,
-                        title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
-                        desp=mes,
+                if _sync_fund_from_account_when_insufficient(rt, 1):
+                    log_event(
+                        logging.INFO,
+                        'settle',
+                        '资金耗尽前触发资金同步',
+                        user_id=user_ctx.user_id,
+                        data=f"fund={rt.get('gambling_fund', 0)}, account={rt.get('account_balance', 0)}",
                     )
-                    rt["fund_pause_notified"] = True
-                rt["bet"] = False
-                rt["bet_on"] = False
-                rt["mode_stop"] = True
-            else:
-                rt["fund_pause_notified"] = False
-        else:
+                    user_ctx.save_state()
+
+                if not is_fund_available(user_ctx):
+                    if hasattr(user_ctx, 'dashboard_message') and user_ctx.dashboard_message:
+                        await cleanup_message(client, user_ctx.dashboard_message)
+                    display_fund = max(0, rt.get("gambling_fund", 0))
+                    mes = f"**菠菜资金耗尽，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
+                    log_event(logging.WARNING, 'settle', '资金耗尽暂停',
+                              user_id=user_ctx.user_id, data=f'fund={rt.get("gambling_fund", 0)}')
+                    if not rt.get("fund_pause_notified", False):
+                        await send_message_v2(
+                            client,
+                            "fund_pause",
+                            mes,
+                            user_ctx,
+                            global_config,
+                            title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                            desp=mes,
+                        )
+                        rt["fund_pause_notified"] = True
+                    rt["bet"] = False
+                    rt["bet_on"] = False
+                    rt["mode_stop"] = True
+                else:
+                    rt["fund_pause_notified"] = False
+                return
+
             next_bet_amount = calculate_bet_amount(rt)
             if next_bet_amount > 0 and not is_fund_available(user_ctx, next_bet_amount):
                 if _sync_fund_from_account_when_insufficient(rt, next_bet_amount):
@@ -2483,7 +2485,8 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     rt["fund_pause_notified"] = False
             else:
                 rt["fund_pause_notified"] = False
-            if rt.get("bet", False):
+
+        if rt.get("bet", False):
                 try:
                     if state.bet_sequence_log and state.bet_sequence_log[-1].get("result") in ("赢", "输"):
                         # 异常兜底：如果最后一笔已结算但 bet 标记未清理，防止重复发送“押注结果”。
@@ -2713,6 +2716,9 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     log_event(logging.ERROR, 'settle', '结算失败', 
                               user_id=user_ctx.user_id, data=str(e))
                     await send_to_admin(client, f"结算出错: {e}", user_ctx, global_config)
+
+        # 先结算，再做资金闸门，避免出现“账户余额已变动，但菠菜资金未记账”的时序问题。
+        await _apply_settle_fund_safety_guard()
         
         # 每5局保存一次状态
         if len(state.history) % 5 == 0:

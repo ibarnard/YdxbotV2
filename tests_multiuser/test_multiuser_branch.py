@@ -1560,11 +1560,75 @@ def test_process_settle_syncs_fund_from_balance_before_next_bet_check(tmp_path, 
     event = SimpleNamespace(id=44001, message=SimpleNamespace(message="已结算: 结果为 9 大"))
     asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
 
-    assert rt["gambling_fund"] == 1_470_000
+    assert rt["gambling_fund"] == 2_200_000
     assert rt["fund_pause_notified"] is False
     assert rt["bet_on"] is False
     assert rt["mode_stop"] is True
     assert not any("菠菜资金不足，已暂停押注" in m for m in sent_messages)
+
+
+def test_process_settle_keeps_pending_bet_settlement_before_fund_pause(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5022"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "结算时序用户"},
+            "telegram": {"user_id": 5022},
+            "groups": {"admin_chat": 5022},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["bet"] = True
+    rt["bet_type"] = 0  # 押小，开大 -> 输
+    rt["bet_amount"] = 1_322_000
+    rt["bet_sequence_count"] = 8
+    rt["lose_count"] = 7
+    rt["lose_stop"] = 12
+    rt["lose_four"] = 2.05
+    rt["current_round"] = 1
+    rt["current_bet_seq"] = 90
+    rt["account_balance"] = 1_334_559
+    rt["gambling_fund"] = 1_334_559
+    ctx.state.bet_sequence_log = [{"bet_id": "20260302_1_90", "result": None, "profit": 0}]
+
+    sent_messages = []
+    sent_types = []
+
+    async def fake_send_message_v2(client, msg_type, message, user_ctx, global_cfg, parse_mode="markdown", title=None, desp=None):
+        sent_types.append(msg_type)
+        sent_messages.append(message)
+        return None
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5022, id=len(sent_messages))
+
+    async def fake_fetch_balance(user_ctx):
+        # 模拟远端余额已变化（比如该笔下注已在平台侧扣减）
+        return 12_559
+
+    monkeypatch.setattr(zm, "send_message_v2", fake_send_message_v2)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "fetch_balance", fake_fetch_balance)
+
+    class DummyClient:
+        async def send_message(self, target, message, parse_mode=None):
+            return SimpleNamespace(chat_id=target, id=1)
+
+        async def delete_messages(self, chat_id, message_id):
+            return None
+
+    event = SimpleNamespace(id=44002, message=SimpleNamespace(message="已结算: 结果为 9 大"))
+    asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
+
+    assert ctx.state.bet_sequence_log[-1]["result"] == "输"
+    assert ctx.state.bet_sequence_log[-1]["profit"] == -1_322_000
+    assert rt["gambling_fund"] == 12_559
+    assert rt["bet"] is False
+    assert "fund_pause" in sent_types
+    assert any("菠菜资金不足，已暂停押注" in m for m in sent_messages)
 
 
 def test_process_settle_only_consumes_pending_bet_once(tmp_path, monkeypatch):
