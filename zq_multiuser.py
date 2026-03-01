@@ -67,6 +67,13 @@ RISK_PAUSE_TOTAL_CAP_ROUNDS = 10
 RISK_PAUSE_MODEL_TIMEOUT_SEC = 3.5
 AI_KEY_WARNING_TEXT = "⚠️ 大模型AI key 失效/缺失，请更新 key！！！"
 
+# 高倍入场质量门控（目标：尽量减少进入第5手以后）
+ENTRY_GUARD_STEP3_MIN_CONF = 70
+ENTRY_GUARD_STEP3_PAUSE_ROUNDS = 2
+ENTRY_GUARD_STEP4_MIN_CONF = 75
+ENTRY_GUARD_STEP4_PAUSE_ROUNDS = 3
+ENTRY_GUARD_STEP4_ALLOWED_TAGS = {"DRAGON_CANDIDATE", "SINGLE_JUMP", "SYMMETRIC_WRAP"}
+
 
 def log_event(level, module, event, message=None, **kwargs):
     # 兼容旧调用: log_event(level, event, message, user_id, data)
@@ -739,6 +746,7 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
         
         # ========== 第四步：调用模型与多层兜底 ==========
 
+        model_used = True
         try:
             configured_keys = _normalize_ai_keys(user_ctx.config.ai if isinstance(user_ctx.config.ai, dict) else {})
             if not configured_keys:
@@ -759,6 +767,7 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
             final_result = parse_analysis_result_insight(result['content'], default_prediction=default_pred)
             
         except Exception as model_error:
+            model_used = False
             err_text = str(model_error)
             if "AI_KEY_MISSING" in err_text:
                 _mark_ai_key_issue(rt, "未配置可用 api_keys")
@@ -788,6 +797,10 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
             f"M-SMP/{pattern_tag} | {reason} | 信:{confidence}% | "
             f"缺口:{gap:+d} | 回归:{trend_gap['regression_target']}"
         )
+        rt["last_predict_tag"] = pattern_tag
+        rt["last_predict_confidence"] = int(confidence)
+        rt["last_predict_source"] = "model" if model_used else "fallback"
+        rt["last_predict_reason"] = reason
         
         # 审计日志
         audit_log = {
@@ -827,6 +840,10 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
         fallback = 0 if recent_sum >= len(recent_20) / 2 else 1
         
         rt["last_predict_info"] = f"M-SMP终极保底 | 强制预测:{fallback}"
+        rt["last_predict_tag"] = "FALLBACK"
+        rt["last_predict_confidence"] = 0
+        rt["last_predict_source"] = "hard_fallback"
+        rt["last_predict_reason"] = "M-SMP异常终极保底"
         state.predictions.append(fallback)
         return fallback
 
@@ -1007,16 +1024,18 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             total = risk_pause.get("total", RISK_WINDOW_BETS)
             win_rate = risk_pause.get("win_rate", 0.0) * 100
             reason_text = "、".join(risk_pause.get("reasons", [])) or "盘面波动风控"
+            resume_hint = _build_pause_resume_hint(rt)
             pause_msg = (
-                "⛔ 自动风控暂停\n"
+                "⛔ 自动风控暂停（已生效）\n"
                 "触发层级：基础风控\n"
                 f"触发原因：{reason_text}\n"
                 f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
-                f"当前计划连押：第 {next_sequence} 手\n"
+                f"触发点：第 {next_sequence} 手下注前\n"
                 f"模型建议：{model_pause_rounds} 局（来源：{model_source}）\n"
-                f"暂停局数：{pause_rounds} 局（连续命中 {base_hit_streak}/{RISK_BASE_TRIGGER_STREAK_NEEDED}，基础预算累计 {rt.get('risk_pause_acc_rounds', 0)}/{RISK_PAUSE_TOTAL_CAP_ROUNDS}）\n"
+                f"本次暂停：{pause_rounds} 局（连续命中 {base_hit_streak}/{RISK_BASE_TRIGGER_STREAK_NEEDED}，基础预算累计 {rt.get('risk_pause_acc_rounds', 0)}/{RISK_PAUSE_TOTAL_CAP_ROUNDS}）\n"
                 f"模型依据：{model_reason}\n"
-                "动作：保留当前倍投进度，等待盘面修复后继续下注"
+                "暂停期间：保留当前倍投进度，不会重置首注\n"
+                f"{resume_hint}"
             )
 
             # 刷新式提示：管理员窗口仅保留最后一条风控暂停提示。
@@ -1110,7 +1129,9 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     log_event(logging.INFO, 'bet_on', '开始押注', user_id=user_ctx.user_id)
     try:
         rt["last_predict_info"] = "初始化预测"
-        fallback_reason = ""
+        rt["last_predict_source"] = "unknown"
+        rt["last_predict_confidence"] = 0
+        rt["last_predict_tag"] = ""
         try:
             prediction = await asyncio.wait_for(
                 predict_next_bet_v10(user_ctx, global_config),
@@ -1118,24 +1139,76 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             )
         except asyncio.TimeoutError:
             prediction = None
-            fallback_reason = "预测超时"
-            rt["last_predict_info"] = "预测超时 - 触发统计回补预测"
+            rt["last_predict_info"] = "预测超时 - 本局不下注"
+            rt["last_predict_source"] = "timeout"
+            rt["last_predict_tag"] = "TIMEOUT"
+            rt["last_predict_confidence"] = 0
             log_event(
                 logging.WARNING,
                 'bet_on',
-                '预测超时，触发回退',
+                '预测超时，本局放弃下注',
                 user_id=user_ctx.user_id,
                 timeout=predict_timeout_sec,
             )
+            timeout_gate = {
+                "blocked": True,
+                "gate_name": "模型可用性门控（超时）",
+                "pause_rounds": 1,
+                "reason_text": f"模型响应超过 {predict_timeout_sec:.1f}s，风险过高，跳过本局",
+                "source": "timeout",
+                "tag": "TIMEOUT",
+                "confidence": 0,
+                "wins": risk_pause.get("wins", 0),
+                "total": risk_pause.get("total", 0),
+                "win_rate": risk_pause.get("win_rate", 0.0),
+            }
+            await _apply_entry_gate_pause(client, user_ctx, global_config, timeout_gate, next_sequence)
+            return
 
         if prediction in (-1, None):
-            recent_40 = state.history[-40:] if len(state.history) >= 40 else state.history
-            recent_total = sum(recent_40)
-            prediction = 1 if recent_total < len(recent_40) / 2 else 0
-            if fallback_reason:
-                rt["last_predict_info"] = f"{fallback_reason} - 触发智能统计回补预测(补{'大' if prediction == 1 else '小'})"
-            else:
-                rt["last_predict_info"] = f"AI节点闪退 - 触发智能统计回补预测(补{'大' if prediction == 1 else '小'})"
+            rt["last_predict_info"] = "预测结果无效 - 本局不下注"
+            rt["last_predict_source"] = "invalid"
+            invalid_gate = {
+                "blocked": True,
+                "gate_name": "模型可用性门控（无效结果）",
+                "pause_rounds": 1,
+                "reason_text": "模型返回结果无效，跳过本局",
+                "source": "invalid",
+                "tag": str(rt.get("last_predict_tag", "") or "UNKNOWN"),
+                "confidence": int(rt.get("last_predict_confidence", 0) or 0),
+                "wins": risk_pause.get("wins", 0),
+                "total": risk_pause.get("total", 0),
+                "win_rate": risk_pause.get("win_rate", 0.0),
+            }
+            await _apply_entry_gate_pause(client, user_ctx, global_config, invalid_gate, next_sequence)
+            return
+
+        predict_source = str(rt.get("last_predict_source", "")).lower().strip()
+        if predict_source in ("", "unknown"):
+            # 兼容测试桩/旧逻辑：返回了有效 prediction 但未写入来源时，按模型成功处理。
+            predict_source = "model"
+            rt["last_predict_source"] = "model"
+
+        if predict_source in {"timeout", "fallback", "hard_fallback", "invalid"}:
+            non_model_gate = {
+                "blocked": True,
+                "gate_name": "模型可用性门控（异常回退）",
+                "pause_rounds": 1,
+                "reason_text": "当前预测来自回退通道，信号不稳定，跳过本局",
+                "source": predict_source,
+                "tag": str(rt.get("last_predict_tag", "") or "UNKNOWN"),
+                "confidence": int(rt.get("last_predict_confidence", 0) or 0),
+                "wins": risk_pause.get("wins", 0),
+                "total": risk_pause.get("total", 0),
+                "win_rate": risk_pause.get("win_rate", 0.0),
+            }
+            await _apply_entry_gate_pause(client, user_ctx, global_config, non_model_gate, next_sequence)
+            return
+
+        quality_gate = _evaluate_entry_quality_gate(rt, risk_pause, next_sequence)
+        if quality_gate.get("blocked", False):
+            await _apply_entry_gate_pause(client, user_ctx, global_config, quality_gate, next_sequence)
+            return
 
         if rt.get("ai_key_issue_active", False):
             await send_to_admin(client, _build_ai_key_warning_message(rt), user_ctx, global_config)
@@ -1480,6 +1553,102 @@ def calculate_bet_amount(rt: dict) -> int:
     return constants.closest_multiple_of_500(target + target * 0.01)
 
 
+def _build_pause_resume_hint(rt: dict) -> str:
+    """构建“暂停结束后会做什么”的提示。"""
+    next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
+    next_amount = int(calculate_bet_amount(rt) or 0)
+    if next_amount > 0:
+        return f"恢复后动作：继续第 {next_sequence} 手，预计下注 {format_number(next_amount)}"
+    return f"恢复后动作：继续第 {next_sequence} 手"
+
+
+def _evaluate_entry_quality_gate(rt: dict, risk_pause: dict, next_sequence: int) -> dict:
+    """
+    高倍入场质量门控：
+    - 第3手：至少满足最低置信度，避免在弱信号下继续放大
+    - 第4手：更严格，且限制标签白名单
+    """
+    if next_sequence not in (3, 4):
+        return {"blocked": False}
+
+    source = str(rt.get("last_predict_source", "unknown")).lower()
+    tag = str(rt.get("last_predict_tag", "")).strip().upper()
+    confidence = int(rt.get("last_predict_confidence", 0) or 0)
+    total = int(risk_pause.get("total", 0))
+    wins = int(risk_pause.get("wins", 0))
+    win_rate = (wins / total) if total > 0 else 0.0
+
+    reasons = []
+    pause_rounds = ENTRY_GUARD_STEP3_PAUSE_ROUNDS
+    gate_name = "第3手质量门控"
+
+    if source != "model":
+        reasons.append("本局预测未拿到稳定模型结果（超时/异常）")
+
+    if next_sequence == 3:
+        if confidence < ENTRY_GUARD_STEP3_MIN_CONF:
+            reasons.append(f"置信度 {confidence}% < {ENTRY_GUARD_STEP3_MIN_CONF}%")
+    elif next_sequence == 4:
+        gate_name = "第4手强风控门控"
+        pause_rounds = ENTRY_GUARD_STEP4_PAUSE_ROUNDS
+        if confidence < ENTRY_GUARD_STEP4_MIN_CONF:
+            reasons.append(f"置信度 {confidence}% < {ENTRY_GUARD_STEP4_MIN_CONF}%")
+        if tag not in ENTRY_GUARD_STEP4_ALLOWED_TAGS:
+            reasons.append(f"标签 {tag or 'UNKNOWN'} 不在白名单")
+        if total >= RISK_WINDOW_BETS and win_rate < 0.45:
+            reasons.append(f"最近40笔胜率仅 {wins}/{total}（{win_rate * 100:.1f}%）")
+
+    if reasons:
+        return {
+            "blocked": True,
+            "gate_name": gate_name,
+            "pause_rounds": pause_rounds,
+            "reason_text": "；".join(reasons),
+            "source": source,
+            "tag": tag or "UNKNOWN",
+            "confidence": confidence,
+            "wins": wins,
+            "total": total,
+            "win_rate": win_rate,
+        }
+    return {"blocked": False}
+
+
+async def _apply_entry_gate_pause(
+    client,
+    user_ctx: UserContext,
+    global_config: dict,
+    gate: dict,
+    next_sequence: int,
+) -> None:
+    """统一发送高倍入场门控暂停提示。"""
+    rt = user_ctx.state.runtime
+    pause_rounds = max(1, int(gate.get("pause_rounds", 1)))
+    _enter_pause(rt, pause_rounds, gate.get("gate_name", "高倍入场门控"))
+    user_ctx.save_state()
+
+    pause_msg = (
+        "⛔ 高倍入场暂停（已生效）\n"
+        f"触发点：第 {next_sequence} 手下注前\n"
+        f"触发类型：{gate.get('gate_name', '高倍入场门控')}\n"
+        f"当前信号：标签 {gate.get('tag', 'UNKNOWN')} | 置信度 {gate.get('confidence', 0)}% | 来源 {gate.get('source', 'unknown')}\n"
+        f"最近胜率：{gate.get('wins', 0)}/{gate.get('total', 0)}（{gate.get('win_rate', 0.0) * 100:.1f}%）\n"
+        f"未通过条件：{gate.get('reason_text', '信号质量不足')}\n"
+        f"本次暂停：{pause_rounds} 局\n"
+        "暂停期间：保留当前倍投进度，不会重置首注\n"
+        f"{_build_pause_resume_hint(rt)}"
+    )
+
+    if hasattr(user_ctx, "risk_pause_message") and user_ctx.risk_pause_message:
+        await cleanup_message(client, user_ctx.risk_pause_message)
+    user_ctx.risk_pause_message = await send_to_admin(client, pause_msg, user_ctx, global_config)
+    await _refresh_pause_countdown_notice(
+        client,
+        user_ctx,
+        global_config,
+        remaining_rounds=pause_rounds,
+    )
+
 def _get_recent_settled_outcomes(state, window: int = RISK_WINDOW_BETS) -> list:
     """提取最近 N 笔已结算结果（赢=1，输=0）。"""
     if window <= 0:
@@ -1780,12 +1949,15 @@ async def _refresh_pause_countdown_notice(
 
     reason = str(rt.get("pause_countdown_reason", "自动暂停")).strip() or "自动暂停"
     progress_rounds = max(0, total_rounds - remaining_rounds)
+    resume_hint = _build_pause_resume_hint(rt)
     countdown_msg = (
-        "⏸️⏸️ 暂停倒计时提醒 ⏸️⏸️\n\n"
+        "⏸️⏸️ 暂停倒计时提醒（自动）⏸️⏸️\n\n"
         f"📌 暂停原因：{reason}\n"
+        "🧱 当前状态：暂停中，本局不会下注\n"
         f"🔢 倒计时：{remaining_rounds} 局\n"
         f"📊 暂停进度：{progress_rounds}/{total_rounds}\n"
-        "🔄 倒计时结束后将自动恢复押注"
+        f"🔄 {resume_hint}\n"
+        "ℹ️ 若恢复时仍不满足风控门槛，会再次自动暂停"
     )
 
     if hasattr(user_ctx, "pause_countdown_message") and user_ctx.pause_countdown_message:
@@ -1838,16 +2010,18 @@ async def _trigger_deep_risk_pause_after_settle(
     total = risk_pause.get("total", 0)
     win_rate = risk_pause.get("win_rate", 0.0) * 100
     reason_text = "、".join(risk_pause.get("reasons", [])) or f"连输达到{deep_milestone}档位"
+    resume_hint = _build_pause_resume_hint(rt)
     pause_msg = (
-        "⛔ 自动风控暂停\n"
+        "⛔ 自动风控暂停（已生效）\n"
         f"触发层级：{level_label}\n"
         f"触发原因：{reason_text}\n"
         f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
-        f"当前计划连押：第 {next_sequence} 手\n"
+        f"触发点：第 {next_sequence} 手下注前\n"
         f"模型建议：{model_pause_rounds} 局（来源：{model_source}）\n"
-        f"暂停局数：{pause_rounds} 局（该层上限 {deep_cap}，不占基础预算）\n"
+        f"本次暂停：{pause_rounds} 局（该层上限 {deep_cap}，不占基础预算）\n"
         f"模型依据：{model_reason}\n"
-        "动作：保留当前倍投进度，观察盘面后继续"
+        "暂停期间：保留当前倍投进度，不会重置首注\n"
+        f"{resume_hint}"
     )
 
     if hasattr(user_ctx, "risk_pause_message") and user_ctx.risk_pause_message:
@@ -1935,10 +2109,13 @@ async def _handle_goal_pause_after_settle(
     rt["bet_amount"] = int(rt.get("initial_amount", 500))
     _clear_lose_recovery_tracking(rt)
 
+    resume_hint = _build_pause_resume_hint(rt)
     pause_msg = (
-        f"**暂停押注**\n"
-        f"原因：{'被炸' if notify_type == 'explode' else '盈利达成'}\n"
-        f"剩余：{configured_stop_rounds} 局"
+        "⏸️ 目标暂停（已生效）\n"
+        f"原因：{'被炸保护' if notify_type == 'explode' else '盈利达成'}\n"
+        f"本次暂停：{configured_stop_rounds} 局\n"
+        "暂停期间：保留策略状态，等待倒计时结束\n"
+        f"{resume_hint}"
     )
     log_event(
         logging.INFO,
