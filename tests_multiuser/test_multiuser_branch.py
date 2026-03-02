@@ -641,8 +641,8 @@ def test_process_bet_on_step3_quality_gate_blocks_low_confidence(tmp_path, monke
     async def fake_predict(user_ctx, global_cfg):
         user_ctx.state.runtime["last_predict_source"] = "model"
         user_ctx.state.runtime["last_predict_tag"] = "CHAOS_SWITCH"
-        user_ctx.state.runtime["last_predict_confidence"] = 69
-        user_ctx.state.runtime["last_predict_info"] = "M-SMP/CHAOS_SWITCH | 信:69%"
+        user_ctx.state.runtime["last_predict_confidence"] = 67
+        user_ctx.state.runtime["last_predict_info"] = "M-SMP/CHAOS_SWITCH | 信:67%"
         return 1
 
     sent_messages = []
