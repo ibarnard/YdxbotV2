@@ -1387,6 +1387,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     log_event(logging.INFO, 'bet_on', '开始押注', user_id=user_ctx.user_id)
     try:
         force_unlock_active = False
+        deep_risk_enabled = bool(rt.get("risk_deep_enabled", True))
         rt["last_predict_info"] = "初始化预测"
         rt["last_predict_source"] = "unknown"
         rt["last_predict_confidence"] = 0
@@ -1428,30 +1429,39 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     attr_name="pause_transition_message",
                 )
             else:
-                if _should_skip_repeated_entry_timeout_gate(rt, next_sequence, settled_count):
-                    log_event(
-                        logging.INFO,
-                        'bet_on',
-                        '模型超时门控去重命中，跳过重复暂停',
-                        user_id=user_ctx.user_id,
-                        data=f'next_seq={next_sequence}, settled_count={settled_count}'
-                    )
-                    user_ctx.save_state()
+                if deep_risk_enabled:
+                    if _should_skip_repeated_entry_timeout_gate(rt, next_sequence, settled_count):
+                        log_event(
+                            logging.INFO,
+                            'bet_on',
+                            '模型超时门控去重命中，跳过重复暂停',
+                            user_id=user_ctx.user_id,
+                            data=f'next_seq={next_sequence}, settled_count={settled_count}'
+                        )
+                        user_ctx.save_state()
+                        return
+                    timeout_gate = {
+                        "blocked": True,
+                        "gate_name": "模型可用性门控（超时）",
+                        "pause_rounds": 1,
+                        "reason_text": f"模型响应超过 {predict_timeout_sec:.1f}s，风险过高，跳过本局",
+                        "source": "timeout",
+                        "tag": "TIMEOUT",
+                        "confidence": 0,
+                        "wins": risk_pause.get("wins", 0),
+                        "total": risk_pause.get("total", 0),
+                        "win_rate": risk_pause.get("win_rate", 0.0),
+                    }
+                    await _apply_entry_gate_pause(client, user_ctx, global_config, timeout_gate, next_sequence)
                     return
-                timeout_gate = {
-                    "blocked": True,
-                    "gate_name": "模型可用性门控（超时）",
-                    "pause_rounds": 1,
-                    "reason_text": f"模型响应超过 {predict_timeout_sec:.1f}s，风险过高，跳过本局",
-                    "source": "timeout",
-                    "tag": "TIMEOUT",
-                    "confidence": 0,
-                    "wins": risk_pause.get("wins", 0),
-                    "total": risk_pause.get("total", 0),
-                    "win_rate": risk_pause.get("win_rate", 0.0),
-                }
-                await _apply_entry_gate_pause(client, user_ctx, global_config, timeout_gate, next_sequence)
-                return
+                # 深度风控关闭：不触发暂停，改用统计兜底继续。
+                prediction = int(fallback_prediction(state.history))
+                rt["last_predict_info"] = (
+                    f"预测超时 - 深度风控已关闭，改用统计兜底预测({'大' if prediction == 1 else '小'})"
+                )
+                rt["last_predict_source"] = "timeout_fallback_no_risk"
+                rt["last_predict_tag"] = "TIMEOUT_FALLBACK"
+                rt["last_predict_confidence"] = 0
 
         if prediction is None:
             invalid_guard = _record_hand_stall_block(rt, next_sequence, history_len, "gate")
@@ -1459,22 +1469,30 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 prediction = _prepare_force_unlock_prediction(state, rt, next_sequence, invalid_guard)
                 force_unlock_active = True
             else:
-                rt["last_predict_info"] = "预测结果无效 - 本局不下注"
-                rt["last_predict_source"] = "invalid"
-                invalid_gate = {
-                    "blocked": True,
-                    "gate_name": "模型可用性门控（无效结果）",
-                    "pause_rounds": 1,
-                    "reason_text": "模型返回结果无效，跳过本局",
-                    "source": "invalid",
-                    "tag": str(rt.get("last_predict_tag", "") or "UNKNOWN"),
-                    "confidence": int(rt.get("last_predict_confidence", 0) or 0),
-                    "wins": risk_pause.get("wins", 0),
-                    "total": risk_pause.get("total", 0),
-                    "win_rate": risk_pause.get("win_rate", 0.0),
-                }
-                await _apply_entry_gate_pause(client, user_ctx, global_config, invalid_gate, next_sequence)
-                return
+                if deep_risk_enabled:
+                    rt["last_predict_info"] = "预测结果无效 - 本局不下注"
+                    rt["last_predict_source"] = "invalid"
+                    invalid_gate = {
+                        "blocked": True,
+                        "gate_name": "模型可用性门控（无效结果）",
+                        "pause_rounds": 1,
+                        "reason_text": "模型返回结果无效，跳过本局",
+                        "source": "invalid",
+                        "tag": str(rt.get("last_predict_tag", "") or "UNKNOWN"),
+                        "confidence": int(rt.get("last_predict_confidence", 0) or 0),
+                        "wins": risk_pause.get("wins", 0),
+                        "total": risk_pause.get("total", 0),
+                        "win_rate": risk_pause.get("win_rate", 0.0),
+                    }
+                    await _apply_entry_gate_pause(client, user_ctx, global_config, invalid_gate, next_sequence)
+                    return
+                prediction = int(fallback_prediction(state.history))
+                rt["last_predict_info"] = (
+                    f"预测结果无效 - 深度风控已关闭，改用统计兜底预测({'大' if prediction == 1 else '小'})"
+                )
+                rt["last_predict_source"] = "invalid_fallback_no_risk"
+                rt["last_predict_tag"] = "INVALID_FALLBACK"
+                rt["last_predict_confidence"] = 0
 
         if prediction == -1:
             skip_guard = _record_hand_stall_block(rt, next_sequence, history_len, "skip")
@@ -1524,7 +1542,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             predict_source = "model"
             rt["last_predict_source"] = "model"
 
-        if not force_unlock_active and predict_source in {"timeout", "fallback", "hard_fallback", "invalid"}:
+        if deep_risk_enabled and (not force_unlock_active) and predict_source in {"timeout", "fallback", "hard_fallback", "invalid"}:
             source_guard = _record_hand_stall_block(rt, next_sequence, history_len, "gate")
             if source_guard.get("force_unlock", False):
                 prediction = _prepare_force_unlock_prediction(state, rt, next_sequence, source_guard)
@@ -1545,7 +1563,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 await _apply_entry_gate_pause(client, user_ctx, global_config, non_model_gate, next_sequence)
                 return
 
-        if not force_unlock_active:
+        if deep_risk_enabled and (not force_unlock_active):
             quality_gate = _evaluate_entry_quality_gate(rt, risk_pause, next_sequence)
             if quality_gate.get("blocked", False):
                 quality_guard = _record_hand_stall_block(rt, next_sequence, history_len, "gate")
@@ -1557,7 +1575,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     return
 
         # 高阶手位二次确认：第7手起，主副模型需同向且置信度达标。
-        if not force_unlock_active and next_sequence >= HIGH_STEP_DOUBLE_CONFIRM_MIN_STEP:
+        if deep_risk_enabled and (not force_unlock_active) and next_sequence >= HIGH_STEP_DOUBLE_CONFIRM_MIN_STEP:
             dual_gate = await _evaluate_high_step_double_confirm(
                 user_ctx,
                 risk_pause,
@@ -4204,7 +4222,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 return (
                     "🛡️ 当前风控开关\n"
                     f"- 基础风控：{base_status}\n"
-                    f"- 深度风控：{deep_status}\n\n"
+                    f"- 深度风控（含高倍入场门控）：{deep_status}\n\n"
                     "用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`"
                 )
 
