@@ -1978,6 +1978,71 @@ def calculate_bet_amount(rt: dict) -> int:
     return constants.closest_multiple_of_500(target + target * 0.01)
 
 
+def _apply_preset_to_runtime(rt: dict, preset_name: str, preset: list) -> None:
+    """把预设参数应用到 runtime。"""
+    rt["continuous"] = int(preset[0])
+    rt["lose_stop"] = int(preset[1])
+    rt["lose_once"] = float(preset[2])
+    rt["lose_twice"] = float(preset[3])
+    rt["lose_three"] = float(preset[4])
+    rt["lose_four"] = float(preset[5])
+    rt["initial_amount"] = int(preset[6])
+    rt["current_preset_name"] = str(preset_name)
+    rt["bet_amount"] = int(preset[6])
+
+
+def _choose_auto_tier_preset_name(gambling_fund: int, presets: dict) -> str:
+    """按菠菜资金返回自动分档目标预设名。"""
+    fund = int(gambling_fund or 0)
+    rules = getattr(constants, "AUTO_TIER_RULES", [])
+    for threshold, preset_name in rules:
+        try:
+            if fund >= int(threshold) and str(preset_name) in presets:
+                return str(preset_name)
+        except Exception:
+            continue
+    # 兜底：优先平衡档，避免空配置卡死
+    for fallback in ("yc200b", "yc200s", "yc200a"):
+        if fallback in presets:
+            return fallback
+    return ""
+
+
+def _try_auto_tier_switch(rt: dict, presets: dict) -> tuple[bool, str, int]:
+    """
+    自动分档切换。
+    仅在“空仓状态”切换，避免中途改倍投曲线：
+    - 当前无待结算下注
+    - 连输计数为 0
+    - 连押计数为 0
+    """
+    if not bool(rt.get("auto_tier_enabled", False)):
+        return False, "", int(rt.get("gambling_fund", 0) or 0)
+
+    if bool(rt.get("bet", False)):
+        return False, "", int(rt.get("gambling_fund", 0) or 0)
+    if int(rt.get("lose_count", 0) or 0) != 0:
+        return False, "", int(rt.get("gambling_fund", 0) or 0)
+    if int(rt.get("bet_sequence_count", 0) or 0) != 0:
+        return False, "", int(rt.get("gambling_fund", 0) or 0)
+
+    fund = int(rt.get("gambling_fund", 0) or 0)
+    target_name = _choose_auto_tier_preset_name(fund, presets)
+    if not target_name:
+        return False, "", fund
+    if str(rt.get("current_preset_name", "")) == target_name:
+        rt["auto_tier_last_name"] = target_name
+        return False, target_name, fund
+
+    preset = presets.get(target_name)
+    if not isinstance(preset, (list, tuple)) or len(preset) < 7:
+        return False, "", fund
+
+    _apply_preset_to_runtime(rt, target_name, list(preset))
+    rt["auto_tier_last_name"] = target_name
+    return True, target_name, fund
+
+
 def _build_pause_resume_hint(rt: dict) -> str:
     """构建“暂停结束后会做什么”的提示。"""
     next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
@@ -2951,9 +3016,9 @@ async def _handle_goal_pause_after_settle(
     _enter_pause(rt, configured_stop_rounds, pause_reason)
     rt["bet_sequence_count"] = 0
 
-    if period_profit >= profit_target:
-        rt["current_round"] = int(rt.get("current_round", 1)) + 1
-        rt["current_bet_seq"] = 1
+    # 盈利达成/被炸保护都视为一个轮次结束，进入新轮次。
+    rt["current_round"] = int(rt.get("current_round", 1)) + 1
+    rt["current_bet_seq"] = 1
 
     rt["explode_count"] = 0
     rt["period_profit"] = 0
@@ -3412,6 +3477,10 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     rt["win_total"] = rt.get("win_total", 0) + (1 if win else 0)
                     rt["win_count"] = rt.get("win_count", 0) + 1 if win else 0
                     rt["lose_count"] = rt.get("lose_count", 0) + 1 if not win else 0
+                    reached_lose_stop = (
+                        (not win)
+                        and int(rt.get("lose_count", 0)) >= int(rt.get("lose_stop", 13))
+                    )
                     rt["status"] = 1 if win else 0
                     if win:
                         # 结束本轮连输后，重置深度风控里程碑触发记录
@@ -3604,8 +3673,27 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                                 user_id=user_ctx.user_id,
                                 data=str(risk_e),
                             )
-                    
-                    if win or rt.get("lose_count", 0) >= rt.get("lose_stop", 13):
+
+                    if reached_lose_stop:
+                        # 达到预设最大连投：记一次炸号计数，并重置到新一轮首注。
+                        rt["explode_count"] = int(rt.get("explode_count", 0)) + 1
+                        rt["lose_count"] = 0
+                        rt["win_count"] = 0
+                        rt["risk_deep_triggered_milestones"] = []
+                        rt["risk_pause_level1_hit"] = False
+                        _clear_lose_recovery_tracking(rt)
+                        log_event(
+                            logging.INFO,
+                            'settle',
+                            '触发预设连投上限，重置新轮次',
+                            user_id=user_ctx.user_id,
+                            data=(
+                                f"lose_stop={rt.get('lose_stop', 13)}, "
+                                f"explode_count={rt.get('explode_count', 0)}"
+                            ),
+                        )
+
+                    if win or reached_lose_stop:
                         rt["bet_sequence_count"] = 0
                         rt["bet_amount"] = int(rt.get("initial_amount", 500))
                         
@@ -4065,6 +4153,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
 **基础控制（推荐）**
 - `st [预设名]` : 启动预设并进入可下注状态 (例: `st yc10`)
+- `st yc200x` : 启动“资金自动分档”策略（yc200s/yc200b/yc200a 按菠菜资金切换）
 - `pause` : 仅暂停当前账号押注（不影响其他账号）
 - `resume` : 恢复当前账号押注
 - `open/off` : 兼容旧命令（分别等同 `resume/pause`）
@@ -4290,46 +4379,64 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         # st - 启动预设 - 与master一致
         if cmd == "st" and len(my) > 1:
             preset_name = my[1]
-            if preset_name in presets:
-                preset = presets[preset_name]
-                rt["continuous"] = int(preset[0])
-                rt["lose_stop"] = int(preset[1])
-                rt["lose_once"] = float(preset[2])
-                rt["lose_twice"] = float(preset[3])
-                rt["lose_three"] = float(preset[4])
-                rt["lose_four"] = float(preset[5])
-                rt["initial_amount"] = int(preset[6])
-                rt["current_preset_name"] = preset_name
-                rt["bet_amount"] = int(preset[6])
-                await _clear_pause_countdown_notice(client, user_ctx)
-                rt["switch"] = True
-                rt["manual_pause"] = False
-                rt["bet_on"] = True
-                rt["mode_stop"] = True
-                rt["open_ydx"] = False
-                rt["bet"] = False  # st 命令不直接设置 bet=True，等待真实盘口触发下注
-                rt["risk_deep_triggered_milestones"] = []
-                rt["fund_pause_notified"] = False
-                rt["limit_stop_notified"] = False
-                _clear_lose_recovery_tracking(rt)
-                user_ctx.save_state()
-                
-                mes = f"预设启动成功: {preset_name} ({preset[0]} {preset[1]} {preset[2]} {preset[3]} {preset[4]} {preset[5]} {preset[6]})"
-                log_event(logging.INFO, 'user_cmd', '启动预设', user_id=user_ctx.user_id, preset=preset_name)
-                message = await send_to_admin(client, mes, user_ctx, global_config)
-                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-                if message:
-                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))
-                await yc_command_handler_multiuser(
-                    client,
-                    event,
-                    [preset_name],
-                    user_ctx,
-                    global_config,
-                    auto_trigger=True,
+            auto_tier_cmd = str(getattr(constants, "AUTO_TIER_PRESET_NAME", "yc200x"))
+            target_for_yc = preset_name
+
+            if preset_name == auto_tier_cmd:
+                rt["auto_tier_enabled"] = True
+                rt["auto_tier_profile"] = auto_tier_cmd
+                switched, switched_to, _ = _try_auto_tier_switch(rt, presets)
+                if not switched and not switched_to:
+                    await send_to_admin(client, "自动分档启动失败：缺少 yc200s/yc200b/yc200a 预设", user_ctx, global_config)
+                    return
+                target_for_yc = switched_to or str(rt.get("current_preset_name", ""))
+                if not target_for_yc:
+                    await send_to_admin(client, "自动分档启动失败：未匹配到有效档位", user_ctx, global_config)
+                    return
+                mes = (
+                    f"自动分档已启动：{auto_tier_cmd}\n"
+                    f"当前档位：{target_for_yc}\n"
+                    f"参数：{rt.get('continuous', 1)} {rt.get('lose_stop', 3)} "
+                    f"{rt.get('lose_once', 2.8)} {rt.get('lose_twice', 2.4)} "
+                    f"{rt.get('lose_three', 2.1)} {rt.get('lose_four', 2.01)} {rt.get('initial_amount', 100000)}"
                 )
+            elif preset_name in presets:
+                preset = presets[preset_name]
+                _apply_preset_to_runtime(rt, preset_name, preset)
+                rt["auto_tier_enabled"] = False
+                rt["auto_tier_profile"] = ""
+                rt["auto_tier_last_name"] = ""
+                mes = f"预设启动成功: {preset_name} ({preset[0]} {preset[1]} {preset[2]} {preset[3]} {preset[4]} {preset[5]} {preset[6]})"
             else:
                 await send_to_admin(client, f"预设不存在: {preset_name}", user_ctx, global_config)
+                return
+
+            await _clear_pause_countdown_notice(client, user_ctx)
+            rt["switch"] = True
+            rt["manual_pause"] = False
+            rt["bet_on"] = True
+            rt["mode_stop"] = True
+            rt["open_ydx"] = False
+            rt["bet"] = False  # st 命令不直接设置 bet=True，等待真实盘口触发下注
+            rt["risk_deep_triggered_milestones"] = []
+            rt["fund_pause_notified"] = False
+            rt["limit_stop_notified"] = False
+            _clear_lose_recovery_tracking(rt)
+            user_ctx.save_state()
+
+            log_event(logging.INFO, 'user_cmd', '启动预设', user_id=user_ctx.user_id, preset=preset_name, active=target_for_yc)
+            message = await send_to_admin(client, mes, user_ctx, global_config)
+            asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+            if message:
+                asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))
+            await yc_command_handler_multiuser(
+                client,
+                event,
+                [target_for_yc],
+                user_ctx,
+                global_config,
+                auto_trigger=True,
+            )
             return
         
         # stats - 查看连大、连小、连输统计
@@ -4870,6 +4977,27 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
     rt = user_ctx.state.runtime
     if rt.get("manual_pause", False):
         return
+
+    switched, switched_to, fund_now = _try_auto_tier_switch(rt, user_ctx.presets)
+    if switched:
+        user_ctx.save_state()
+        notify = (
+            "🧭 自动分档已切换预设\n"
+            f"菠菜资金：{fund_now / 10000:.2f} 万\n"
+            f"当前档位：{switched_to}\n"
+            f"预设参数：{rt.get('continuous', 1)} {rt.get('lose_stop', 3)} "
+            f"{rt.get('lose_once', 2.8)} {rt.get('lose_twice', 2.4)} "
+            f"{rt.get('lose_three', 2.1)} {rt.get('lose_four', 2.01)} {rt.get('initial_amount', 100000)}"
+        )
+        await _send_transient_admin_notice(
+            client,
+            user_ctx,
+            global_config,
+            notify,
+            ttl_seconds=120,
+            attr_name="tier_switch_message",
+        )
+
     next_bet_amount = calculate_bet_amount(rt)
     if next_bet_amount <= 0:
         rt["bet"] = False

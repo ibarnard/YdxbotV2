@@ -190,6 +190,10 @@ def get_default_runtime() -> Dict[str, Any]:
         "risk_pause_block_hits": 0,
         "risk_pause_block_rounds": 0,
         "risk_pause_last_100_report_total": 0,
+        # 自动分档预设（st yc200x）
+        "auto_tier_enabled": False,
+        "auto_tier_profile": "",
+        "auto_tier_last_name": "",
         "lose_once": 2.5,
         "lose_twice": 2.5,
         "lose_three": 2.5,
