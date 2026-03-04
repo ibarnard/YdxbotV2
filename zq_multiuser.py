@@ -60,6 +60,9 @@ RISK_RECOVERY_PASS_NEEDED = 2         # 连续2次满足恢复条件才重置风
 RISK_DEEP_TRIGGER_INTERVAL = 3
 RISK_DEEP_FIRST_MAX_PAUSE_ROUNDS = 5
 RISK_DEEP_NEXT_MAX_PAUSE_ROUNDS = 3
+# 长龙盘面下，深度风控做“小幅放宽”，避免长时间停摆。
+RISK_DEEP_LONG_DRAGON_TAIL_LEN = 5
+RISK_DEEP_LONG_DRAGON_MAX_PAUSE_ROUNDS = 2
 RISK_BASE_MAX_PAUSE_ROUNDS = 10
 
 # 基础风控预算：同一基础风控周期累计暂停不超过10局（深度风控不占用）
@@ -1034,6 +1037,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             rt["flag"] = True
             rt["pause_resume_pending"] = True
             rt["pause_resume_pending_reason"] = str(rt.get("pause_countdown_reason", "自动暂停")).strip() or "自动暂停"
+            rt["pause_resume_probe_settled"] = -1
             user_ctx.save_state()
         else:
             await _refresh_pause_countdown_notice(
@@ -1144,6 +1148,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     rt["mode_stop"] = True
                     rt["pause_resume_pending"] = True
                     rt["pause_resume_pending_reason"] = "影子验证通过"
+                    rt["pause_resume_probe_settled"] = -1
                     await _send_transient_admin_notice(
                         client,
                         user_ctx,
@@ -1189,10 +1194,11 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     cycle_active = bool(rt.get("risk_pause_cycle_active", False))
     recovery_passes = int(rt.get("risk_pause_recovery_passes", 0))
     base_hit_streak = int(rt.get("risk_base_hit_streak", 0))
+    base_risk_enabled = bool(rt.get("risk_base_enabled", True))
 
     # 风险周期恢复判定：最近40笔胜率>45% 连续2次才重置预算。
     if not skip_same_snapshot and risk_pause:
-        if risk_pause.get("base_trigger", False):
+        if base_risk_enabled and risk_pause.get("base_trigger", False):
             base_hit_streak += 1
         else:
             base_hit_streak = 0
@@ -1227,7 +1233,11 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     # 深度风控已迁移到结算阶段触发（输单结果出来即触发），下注入口不再重复触发深度风控。
 
     # 基础风控：40局<=37.5% 且连续2次命中后才触发，使用10局基础预算。
-    if risk_pause.get("base_trigger", False) and base_hit_streak >= RISK_BASE_TRIGGER_STREAK_NEEDED:
+    if (
+        base_risk_enabled
+        and risk_pause.get("base_trigger", False)
+        and base_hit_streak >= RISK_BASE_TRIGGER_STREAK_NEEDED
+    ):
         remain_pause_budget = max(0, RISK_PAUSE_TOTAL_CAP_ROUNDS - pause_acc_rounds)
         rt["risk_pause_cycle_active"] = True
         rt["risk_pause_snapshot_count"] = settled_count
@@ -1271,7 +1281,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             wins = risk_pause.get("wins", 0)
             total = risk_pause.get("total", RISK_WINDOW_BETS)
             win_rate = risk_pause.get("win_rate", 0.0) * 100
-            reason_text = "、".join(risk_pause.get("reasons", [])) or "盘面波动风控"
+            reason_text = "最近40笔胜率<=37.5%"
             resume_hint = _build_pause_resume_hint(rt)
             pause_msg = (
                 "⛔ 自动风控暂停（已生效）\n"
@@ -1564,6 +1574,26 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     await _apply_entry_gate_pause(client, user_ctx, global_config, dual_gate, next_sequence)
                     return
 
+        # 自动暂停恢复后的第一手，先给出“模型复核说明”，避免只看到结果看不懂为何恢复。
+        if rt.get("pause_resume_pending", False):
+            last_probe_settled = int(rt.get("pause_resume_probe_settled", -1))
+            if last_probe_settled != settled_count:
+                review_msg = (
+                    "🧠 恢复后模型复核（本轮）\n"
+                    f"复核信号：{_format_predict_signal_brief(rt)}\n"
+                    f"执行决策：继续第 {next_sequence} 手，方向 {'大' if int(prediction) == 1 else '小'}\n"
+                    "说明：若后续盘口再次触发风控，将自动重新暂停"
+                )
+                await _send_transient_admin_notice(
+                    client,
+                    user_ctx,
+                    global_config,
+                    review_msg,
+                    ttl_seconds=120,
+                    attr_name="pause_transition_message",
+                )
+                rt["pause_resume_probe_settled"] = settled_count
+
         if rt.get("ai_key_issue_active", False):
             await send_to_admin(client, _build_ai_key_warning_message(rt), user_ctx, global_config)
 
@@ -1628,6 +1658,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             resume_msg = (
                 "✅ 恢复押注（已执行）\n"
                 f"恢复原因：{reason_text} 倒计时结束\n"
+                f"模型信号：{_format_predict_signal_brief(rt)}\n"
                 f"当前动作：已执行第 {rt.get('bet_sequence_count', 1)} 手，方向 {direction}，金额 {format_number(rt['bet_amount'])}\n"
                 "提示：若盘面仍触发风控，会再次自动暂停"
             )
@@ -1641,6 +1672,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             )
             rt["pause_resume_pending"] = False
             rt["pause_resume_pending_reason"] = ""
+            rt["pause_resume_probe_settled"] = -1
 
         rt["current_bet_seq"] = int(rt.get("current_bet_seq", 1)) + 1
         user_ctx.save_state()
@@ -1935,6 +1967,37 @@ def _build_pause_resume_hint(rt: dict) -> str:
     if next_amount > 0:
         return f"恢复后动作：继续第 {next_sequence} 手，预计下注 {format_number(next_amount)}"
     return f"恢复后动作：继续第 {next_sequence} 手"
+
+
+def _format_predict_signal_brief(rt: dict) -> str:
+    """把模型信号整理成易读短句，用于暂停恢复提示。"""
+    source = str(rt.get("last_predict_source", "unknown") or "unknown")
+    tag = str(rt.get("last_predict_tag", "") or "UNKNOWN")
+    confidence = int(rt.get("last_predict_confidence", 0) or 0)
+    reason = str(rt.get("last_predict_reason", "") or "").strip()
+    if reason:
+        return f"来源 {source} | 标签 {tag} | 置信度 {confidence}% | 理由 {reason}"
+    return f"来源 {source} | 标签 {tag} | 置信度 {confidence}%"
+
+
+def _get_history_tail_streak(history: list) -> tuple:
+    """返回历史尾部连庄信息：(连庄长度, 连庄方向0/1)。"""
+    if not isinstance(history, list) or not history:
+        return 0, -1
+    try:
+        tail_value = int(history[-1])
+    except Exception:
+        return 0, -1
+    streak = 1
+    for idx in range(len(history) - 2, -1, -1):
+        try:
+            current = int(history[idx])
+        except Exception:
+            break
+        if current != tail_value:
+            break
+        streak += 1
+    return streak, tail_value
 
 
 def _should_skip_repeated_entry_timeout_gate(rt: dict, next_sequence: int, settled_count: int) -> bool:
@@ -2285,6 +2348,7 @@ def _consume_shadow_probe_settle_result(rt: dict, result: int) -> dict:
             rt["mode_stop"] = True
             rt["pause_resume_pending"] = True
             rt["pause_resume_pending_reason"] = "影子验证通过"
+            rt["pause_resume_probe_settled"] = -1
         else:
             _clear_shadow_probe(rt)
             rt["shadow_probe_rearm"] = True
@@ -2654,6 +2718,8 @@ def _set_pause_countdown_context(rt: dict, reason: str, pause_rounds: int) -> No
     rt["pause_countdown_reason"] = str(reason or "自动暂停")
     rt["pause_countdown_total_rounds"] = rounds
     rt["pause_countdown_last_remaining"] = -1
+    # 每次进入新暂停周期后，恢复复核提示应重新可发送一次。
+    rt["pause_resume_probe_settled"] = -1
 
 
 async def _clear_pause_countdown_notice(client, user_ctx: UserContext) -> None:
@@ -2729,6 +2795,8 @@ async def _trigger_deep_risk_pause_after_settle(
 ) -> bool:
     """在结算阶段触发深度风控暂停（连输里程碑），命中后立即通知。"""
     rt = user_ctx.state.runtime
+    if not bool(rt.get("risk_deep_enabled", True)):
+        return False
     if not risk_pause.get("deep_trigger", False):
         return False
 
@@ -2736,6 +2804,18 @@ async def _trigger_deep_risk_pause_after_settle(
     deep_cap = int(risk_pause.get("deep_level_cap", 3))
     if deep_milestone <= 0 or deep_cap <= 0:
         return False
+
+    # 长龙盘面放宽：避免“连续长龙 + 深度风控”叠加导致长时间停摆。
+    original_deep_cap = deep_cap
+    tail_len, tail_side = _get_history_tail_streak(user_ctx.state.history)
+    deep_cap_adjust_reason = ""
+    if tail_len >= RISK_DEEP_LONG_DRAGON_TAIL_LEN:
+        deep_cap = max(1, min(deep_cap, int(RISK_DEEP_LONG_DRAGON_MAX_PAUSE_ROUNDS)))
+        if deep_cap < original_deep_cap:
+            side_text = "大" if tail_side == 1 else "小"
+            deep_cap_adjust_reason = (
+                f"盘面尾部{tail_len}连{side_text}，本层暂停上限由 {original_deep_cap} 调整为 {deep_cap}"
+            )
 
     level_label = f"深度风控（{deep_milestone}连输档）"
     model_eval = {
@@ -2763,6 +2843,8 @@ async def _trigger_deep_risk_pause_after_settle(
     total = risk_pause.get("total", 0)
     win_rate = risk_pause.get("win_rate", 0.0) * 100
     reason_text = "、".join(risk_pause.get("reasons", [])) or f"连输达到{deep_milestone}档位"
+    if deep_cap_adjust_reason:
+        reason_text = f"{reason_text}；{deep_cap_adjust_reason}"
     resume_hint = _build_pause_resume_hint(rt)
     pause_msg = (
         "⛔ 自动风控暂停（已生效）\n"
@@ -3968,6 +4050,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `pause` : 仅暂停当前账号押注（不影响其他账号）
 - `resume` : 恢复当前账号押注
 - `open/off` : 兼容旧命令（分别等同 `resume/pause`）
+- `risk [base|deep|all] [on|off]` : 风控开关 (例: `risk deep off`)
 
 **参数设置**
 - `gf [金额]` : 设置本金 (例: `gf 1000000`)
@@ -4111,6 +4194,79 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             mes = "▶️ 已恢复当前账号押注"
             await send_to_admin(client, mes, user_ctx, global_config)
             log_event(logging.INFO, 'user_cmd', '恢复押注', user_id=user_ctx.user_id)
+            return
+
+        # risk - 基础/深度风控开关
+        if cmd == "risk":
+            def _risk_state_text() -> str:
+                base_status = "ON ✅" if bool(rt.get("risk_base_enabled", True)) else "OFF ⏸"
+                deep_status = "ON ✅" if bool(rt.get("risk_deep_enabled", True)) else "OFF ⏸"
+                return (
+                    "🛡️ 当前风控开关\n"
+                    f"- 基础风控：{base_status}\n"
+                    f"- 深度风控：{deep_status}\n\n"
+                    "用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`"
+                )
+
+            if len(my) == 1:
+                message = await send_to_admin(client, _risk_state_text(), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
+                return
+
+            if len(my) != 3:
+                await send_to_admin(
+                    client,
+                    "❌ 参数格式错误\n用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`",
+                    user_ctx,
+                    global_config,
+                )
+                return
+
+            target = str(my[1]).strip().lower()
+            action = str(my[2]).strip().lower()
+            if target not in {"base", "deep", "all"} or action not in {"on", "off"}:
+                await send_to_admin(
+                    client,
+                    "❌ 参数无效\n用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`",
+                    user_ctx,
+                    global_config,
+                )
+                return
+
+            enabled = action == "on"
+            if target in {"base", "all"}:
+                rt["risk_base_enabled"] = enabled
+                if not enabled:
+                    # 关闭基础风控时顺便清理其周期计数，避免再次开启时吃到旧状态。
+                    rt["risk_pause_cycle_active"] = False
+                    rt["risk_pause_acc_rounds"] = 0
+                    rt["risk_pause_recovery_passes"] = 0
+                    rt["risk_base_hit_streak"] = 0
+                    rt["risk_pause_snapshot_count"] = -1
+                    rt["risk_pause_priority_notified"] = False
+            if target in {"deep", "all"}:
+                rt["risk_deep_enabled"] = enabled
+                if not enabled:
+                    rt["risk_deep_triggered_milestones"] = []
+
+            user_ctx.save_state()
+            scope_text = {"base": "基础风控", "deep": "深度风控", "all": "基础+深度风控"}[target]
+            status_text = "开启" if enabled else "关闭"
+            mes = f"✅ 已{status_text}{scope_text}\n\n{_risk_state_text()}"
+            message = await send_to_admin(client, mes, user_ctx, global_config)
+            asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+            if message:
+                asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
+            log_event(
+                logging.INFO,
+                'user_cmd',
+                '切换风控开关',
+                user_id=user_ctx.user_id,
+                target=target,
+                enabled=enabled,
+            )
             return
         
         # st - 启动预设 - 与master一致

@@ -1238,6 +1238,45 @@ def test_pause_command_sets_manual_pause_and_blocks_bet_on(tmp_path, monkeypatch
     asyncio.run(zm.process_bet_on(SimpleNamespace(), DummyEvent(), ctx, {}))
 
 
+def test_risk_command_can_toggle_base_and_deep_switches(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5030"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "风控开关用户"},
+            "telegram": {"user_id": 5030},
+            "groups": {"admin_chat": 5030},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5030, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="risk deep off", chat_id=5030, id=1), ctx, {}))
+    assert rt["risk_deep_enabled"] is False
+    assert rt["risk_base_enabled"] is True
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="risk base off", chat_id=5030, id=2), ctx, {}))
+    assert rt["risk_base_enabled"] is False
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="risk all on", chat_id=5030, id=3), ctx, {}))
+    assert rt["risk_base_enabled"] is True
+    assert rt["risk_deep_enabled"] is True
+    assert any("当前风控开关" in msg for msg in sent_messages)
+
+
 def test_check_bet_status_does_not_resume_when_manual_pause(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "5006"
     _write_json(
@@ -2021,6 +2060,105 @@ def test_process_settle_triggers_deep_risk_pause_immediately_on_loss_milestone(t
     assert rt["bet_on"] is False
     assert rt["bet"] is False
     assert 3 in rt.get("risk_deep_triggered_milestones", [])
+
+
+def test_trigger_deep_risk_pause_skips_when_deep_switch_off(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5031"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "深度关闭用户"},
+            "telegram": {"user_id": 5031},
+            "groups": {"admin_chat": 5031},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["risk_deep_enabled"] = False
+    rt["stop_count"] = 0
+
+    async def fake_send_to_admin(*args, **kwargs):
+        raise AssertionError("deep off 时不应发送深度风控暂停通知")
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    risk_eval = {
+        "deep_trigger": True,
+        "deep_milestone": 3,
+        "deep_level_cap": 5,
+        "wins": 12,
+        "total": 40,
+        "win_rate": 0.3,
+        "reasons": ["连输达到3局档位（每3局触发）"],
+    }
+
+    triggered = asyncio.run(
+        zm._trigger_deep_risk_pause_after_settle(
+            SimpleNamespace(),
+            ctx,
+            {},
+            risk_eval,
+            next_sequence=4,
+            settled_count=100,
+        )
+    )
+    assert triggered is False
+    assert rt["stop_count"] == 0
+
+
+def test_trigger_deep_risk_pause_relaxes_cap_on_long_dragon(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5032"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "长龙放宽用户"},
+            "telegram": {"user_id": 5032},
+            "groups": {"admin_chat": 5032},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["risk_deep_enabled"] = True
+    ctx.state.history = [1, 0, 1, 1, 1, 1, 1, 1]  # 尾部6连大
+    sent_messages = []
+
+    async def fake_suggest_pause_rounds_by_model(user_ctx, risk_eval, max_pause):
+        assert max_pause == zm.RISK_DEEP_LONG_DRAGON_MAX_PAUSE_ROUNDS
+        return 5, "模型建议", "model"
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5032, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "_suggest_pause_rounds_by_model", fake_suggest_pause_rounds_by_model)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    risk_eval = {
+        "deep_trigger": True,
+        "deep_milestone": 3,
+        "deep_level_cap": 5,
+        "wins": 14,
+        "total": 40,
+        "win_rate": 0.35,
+        "reasons": ["连输达到3局档位（每3局触发）"],
+    }
+
+    triggered = asyncio.run(
+        zm._trigger_deep_risk_pause_after_settle(
+            SimpleNamespace(),
+            ctx,
+            {},
+            risk_eval,
+            next_sequence=4,
+            settled_count=200,
+        )
+    )
+    assert triggered is True
+    # 放宽后上限=2，最终暂停2局 => 内部 stop_count=2+1
+    assert rt["stop_count"] == zm.RISK_DEEP_LONG_DRAGON_MAX_PAUSE_ROUNDS + 1
+    assert any("本层暂停上限由 5 调整为 2" in msg for msg in sent_messages)
 
 
 def test_format_dashboard_shows_software_version_and_preset_lines(tmp_path, monkeypatch):
