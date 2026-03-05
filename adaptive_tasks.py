@@ -588,13 +588,71 @@ def _sync_active_task_runtime_status(user_ctx: Any, status: str, reason: str = "
         runtime["last_reason"] = str(reason)
 
 
-def _apply_preset(user_ctx: Any, preset_name: str) -> bool:
+def _preset_base_amount(user_ctx: Any, preset_name: str) -> int:
+    name = str(preset_name or "").strip()
+    if not name:
+        return 0
+    presets = getattr(user_ctx, "presets", {})
+    if isinstance(presets, dict):
+        values = presets.get(name)
+        if isinstance(values, list) and len(values) >= 7:
+            return max(0, _safe_int(values[6], 0))
+    values = constants.PRESETS.get(name)
+    if isinstance(values, list) and len(values) >= 7:
+        return max(0, _safe_int(values[6], 0))
+    return 0
+
+
+def normalize_preset_for_active_loss_streak(user_ctx: Any, preset_name: str) -> str:
+    """
+    连输阶段禁止降档：
+    - `lose_floor_preset` 记录本轮连输已锁定的最低档位（会随升档抬高）；
+    - 仅在 lose_count > 0 时生效，连输结束后自动清空。
+    """
+    rt = _get_rt(user_ctx)
+    lose_count = max(0, _safe_int(rt.get("lose_count", 0), 0))
+    target_name = str(preset_name or "").strip()
+    if not target_name:
+        return ""
+
+    if lose_count <= 0:
+        rt["lose_floor_preset"] = ""
+        return target_name
+
+    floor_name = str(rt.get("lose_floor_preset", "") or "").strip()
+    floor_amount = _preset_base_amount(user_ctx, floor_name)
+    if floor_amount <= 0:
+        current_name = str(rt.get("current_preset_name", "") or "").strip()
+        current_amount = _preset_base_amount(user_ctx, current_name)
+        if current_amount > 0:
+            floor_name = current_name
+            floor_amount = current_amount
+            rt["lose_floor_preset"] = floor_name
+        else:
+            return target_name
+
+    target_amount = _preset_base_amount(user_ctx, target_name)
+    if target_amount <= 0:
+        return target_name
+
+    if target_amount < floor_amount:
+        return floor_name
+
+    if target_amount > floor_amount:
+        rt["lose_floor_preset"] = target_name
+    return target_name
+
+
+def _apply_preset(user_ctx: Any, preset_name: str) -> str:
+    target_name = normalize_preset_for_active_loss_streak(user_ctx, preset_name)
+    if not target_name:
+        return ""
     presets = getattr(user_ctx, "presets", {})
     if not isinstance(presets, dict):
-        return False
-    preset = presets.get(preset_name)
+        return ""
+    preset = presets.get(target_name)
     if not isinstance(preset, list) or len(preset) < 7:
-        return False
+        return ""
 
     rt = _get_rt(user_ctx)
     rt["continuous"] = int(preset[0])
@@ -605,13 +663,13 @@ def _apply_preset(user_ctx: Any, preset_name: str) -> bool:
     rt["lose_four"] = float(preset[5])
     rt["initial_amount"] = int(preset[6])
     rt["bet_amount"] = int(preset[6])
-    rt["current_preset_name"] = preset_name
+    rt["current_preset_name"] = target_name
     rt["switch"] = True
     rt["manual_pause"] = False
     rt["bet_on"] = True
     rt["mode_stop"] = True
     rt["bet"] = False
-    return True
+    return target_name
 
 
 def _set_current_task_runtime(rt: Dict[str, Any], task: Dict[str, Any], run_id: str, trigger_type: str, rec: Dict[str, Any], limits: Dict[str, int]) -> None:
@@ -703,8 +761,11 @@ def start_task(user_ctx: Any, task_name: str, trigger_type: str = "manual") -> D
     preset_name = str(rec.get("recommended_preset", "yc1") or "yc1")
     if preset_name not in PRESET_LADDER:
         preset_name = "yc1"
-    if not _apply_preset(user_ctx, preset_name):
+    applied_preset = _apply_preset(user_ctx, preset_name)
+    if not applied_preset:
         return {"ok": False, "error": f"preset `{preset_name}` missing"}
+    preset_name = applied_preset
+    rec["recommended_preset"] = preset_name
 
     current_fund = _safe_int(rt.get("gambling_fund", 0), 0)
     limits = compute_loss_limits(current_fund=current_fund, task_cfg=task, preset_name=preset_name)
@@ -952,7 +1013,9 @@ def _recheck_if_needed(user_ctx: Any, task_cfg: Dict[str, Any]) -> Optional[Dict
         return rec
     next_preset = str(rec.get("recommended_preset", rt.get("current_preset_name", "yc1")) or "yc1")
     if next_preset in PRESET_LADDER:
-        _apply_preset(user_ctx, next_preset)
+        applied_preset = _apply_preset(user_ctx, next_preset)
+        if applied_preset:
+            rec["recommended_preset"] = applied_preset
 
     rt["task_step_no"] = _safe_int(rt.get("task_step_no", 1), 1) + 1
     rt["task_step_planned_rounds"] = _safe_int(rec.get("planned_rounds", rt.get("task_step_planned_rounds", 0)), 0)

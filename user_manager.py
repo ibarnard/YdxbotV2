@@ -174,6 +174,7 @@ def get_default_runtime() -> Dict[str, Any]:
         "warning_lose_count": 3,
         "lose_notify_pending": False,
         "lose_start_info": {},
+        "lose_floor_preset": "",
         "last_logic_audit": "",
         "last_decision_id": "",
         "last_decision_timestamp": "",

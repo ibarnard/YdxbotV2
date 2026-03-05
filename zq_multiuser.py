@@ -2962,28 +2962,51 @@ def _is_invalid_callback_message_error(exc: Exception) -> bool:
         "getbotcallbackanswerrequest",
         "can't do that operation on such message",
         "messageidinvaliderror",
+        "下注窗口失效",
     )
     return any(marker in text for marker in markers)
 
 
-async def _find_latest_bet_prompt_message(client, event, user_ctx: UserContext):
+def _extract_reply_markup_payloads(msg) -> set:
+    payloads = set()
+    reply_markup = getattr(msg, "reply_markup", None)
+    rows = getattr(reply_markup, "rows", None) if reply_markup else None
+    if not rows:
+        return payloads
+    for row in rows:
+        buttons = getattr(row, "buttons", None) or []
+        for btn in buttons:
+            data = getattr(btn, "data", None)
+            if isinstance(data, (bytes, bytearray)):
+                payloads.add(bytes(data))
+    return payloads
+
+
+async def _find_latest_bet_prompt_message(client, event, user_ctx: UserContext, button_data=None):
     """回溯最近可点击的下注提示消息，用于 message id 失效时恢复。"""
     zq_bot = user_ctx.config.groups.get("zq_bot")
     zq_bot_targets = {str(item) for item in _iter_targets(zq_bot)}
     hints = ("[近 40 次结果]", "由近及远", "0 小 1 大")
+    expected_payload = bytes(button_data) if isinstance(button_data, (bytes, bytearray)) else button_data
+    fallback_msg = None
 
     try:
-        async for msg in client.iter_messages(event.chat_id, limit=20):
+        async for msg in client.iter_messages(event.chat_id, limit=40):
             if zq_bot_targets and str(getattr(msg, "sender_id", None)) not in zq_bot_targets:
                 continue
             if not getattr(msg, "reply_markup", None):
                 continue
+            payloads = _extract_reply_markup_payloads(msg)
+            if expected_payload is not None and payloads and expected_payload in payloads:
+                return msg
             raw = (getattr(msg, "message", None) or getattr(msg, "raw_text", None) or "").strip()
             if any(hint in raw for hint in hints):
                 return msg
+            if fallback_msg is None and payloads:
+                fallback_msg = msg
     except Exception as e:
         log_event(logging.DEBUG, "bet_on", "回溯下注提示消息失败", user_id=user_ctx.user_id, error=str(e))
-    return None
+    return fallback_msg
 
 
 async def _click_bet_button_with_recover(client, event, user_ctx: UserContext, button_data):
@@ -2995,11 +3018,16 @@ async def _click_bet_button_with_recover(client, event, user_ctx: UserContext, b
         if not _is_invalid_callback_message_error(e):
             raise
 
-    latest_msg = await _find_latest_bet_prompt_message(client, event, user_ctx)
+    latest_msg = await _find_latest_bet_prompt_message(client, event, user_ctx, button_data=button_data)
     if latest_msg is None:
-        raise RuntimeError("下注窗口失效且未找到可用的最新下注消息")
+        raise RuntimeError("下注窗口失效，且未找到可回溯的可点击下注消息")
 
-    await latest_msg.click(button_data)
+    try:
+        await latest_msg.click(button_data)
+    except Exception as retry_err:
+        if _is_invalid_callback_message_error(retry_err):
+            raise RuntimeError("下注窗口失效，回溯消息也不可用")
+        raise
     log_event(
         logging.WARNING,
         "bet_on",
@@ -4047,6 +4075,7 @@ async def _handle_goal_pause_after_settle(
     rt["explode_count"] = 0
     rt["period_profit"] = 0
     rt["lose_count"] = 0
+    _clear_lose_floor_preset(rt)
     rt["win_count"] = 0
     rt["bet_amount"] = int(rt.get("initial_amount", 500))
     _clear_lose_recovery_tracking(rt)
@@ -4129,6 +4158,22 @@ def _clear_lose_recovery_tracking(rt: dict) -> None:
     """清理连输回补跟踪状态，避免跨轮次残留导致误发“连输已终止”消息。"""
     rt["lose_notify_pending"] = False
     rt["lose_start_info"] = {}
+
+
+def _clear_lose_floor_preset(rt: dict) -> None:
+    rt["lose_floor_preset"] = ""
+
+
+def _sync_lose_floor_preset(rt: dict) -> None:
+    lose_count = int(rt.get("lose_count", 0))
+    if lose_count <= 0:
+        _clear_lose_floor_preset(rt)
+        return
+    if str(rt.get("lose_floor_preset", "") or "").strip():
+        return
+    current_preset = str(rt.get("current_preset_name", "") or "").strip()
+    if current_preset:
+        rt["lose_floor_preset"] = current_preset
 
 
 def _is_valid_lose_range(start_round, start_seq, end_round, end_seq) -> bool:
@@ -4514,6 +4559,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     rt["win_total"] = rt.get("win_total", 0) + (1 if win else 0)
                     rt["win_count"] = rt.get("win_count", 0) + 1 if win else 0
                     rt["lose_count"] = rt.get("lose_count", 0) + 1 if not win else 0
+                    _sync_lose_floor_preset(rt)
                     rt["status"] = 1 if win else 0
                     if win:
                         # 结束本轮连输后，重置深度风控里程碑触发记录
@@ -5864,8 +5910,12 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         
         # st - 启动预设 - 与master一致
         if cmd == "st" and len(my) > 1:
-            preset_name = my[1]
-            if preset_name in presets:
+            requested_preset_name = my[1]
+            if requested_preset_name in presets:
+                preset_name = adaptive_tasks.normalize_preset_for_active_loss_streak(
+                    user_ctx,
+                    requested_preset_name,
+                )
                 active_run_id = str(rt.get("current_task_run_id", "") or "").strip()
                 if active_run_id:
                     stop_result = adaptive_tasks.stop_current_task(user_ctx, reason="manual_preset_switch")
@@ -5917,7 +5967,16 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 _clear_lose_recovery_tracking(rt)
                 user_ctx.save_state()
                 
-                mes = f"预设启动成功: {preset_name} ({preset[0]} {preset[1]} {preset[2]} {preset[3]} {preset[4]} {preset[5]} {preset[6]})"
+                guard_prefix = ""
+                if preset_name != requested_preset_name:
+                    guard_prefix = (
+                        f"⚠️ 连输未结束，禁止降档到 `{requested_preset_name}`，"
+                        f"已保持 `{preset_name}`\n"
+                    )
+                mes = (
+                    f"{guard_prefix}"
+                    f"预设启动成功: {preset_name} ({preset[0]} {preset[1]} {preset[2]} {preset[3]} {preset[4]} {preset[5]} {preset[6]})"
+                )
                 log_event(logging.INFO, 'user_cmd', '启动预设', user_id=user_ctx.user_id, preset=preset_name)
                 message = await send_to_admin(client, mes, user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
@@ -5932,7 +5991,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     auto_trigger=True,
                 )
             else:
-                await send_to_admin(client, f"预设不存在: {preset_name}", user_ctx, global_config)
+                await send_to_admin(client, f"预设不存在: {requested_preset_name}", user_ctx, global_config)
             return
         
         # stats - 查看连大、连小、连输统计
@@ -6259,6 +6318,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["period_profit"] = 0
                     rt["win_count"] = 0
                     rt["lose_count"] = 0
+                    _clear_lose_floor_preset(rt)
                     rt["bet_sequence_count"] = 0
                     rt["explode_count"] = 0
                     rt["bet_amount"] = int(rt.get("initial_amount", 500))
@@ -6284,6 +6344,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["period_profit"] = 0
                     rt["win_count"] = 0
                     rt["lose_count"] = 0
+                    _clear_lose_floor_preset(rt)
                     rt["bet_sequence_count"] = 0
                     rt["explode_count"] = 0
                     rt["bet_amount"] = int(rt.get("initial_amount", 500))
@@ -6302,6 +6363,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     # 重置押注策略
                     rt["win_count"] = 0
                     rt["lose_count"] = 0
+                    _clear_lose_floor_preset(rt)
                     rt["bet_sequence_count"] = 0
                     rt["explode_count"] = 0
                     rt["bet_amount"] = int(rt.get("initial_amount", 500))
