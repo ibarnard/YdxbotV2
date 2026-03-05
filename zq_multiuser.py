@@ -10,6 +10,7 @@ import asyncio
 import json
 import os
 import random
+import re
 import requests
 import aiohttp
 import time
@@ -464,7 +465,7 @@ def build_replay_focus_message(user_ctx: UserContext, limit: int = 20) -> str:
         task_short = task_name if task_name else "-"
         if task_run_id:
             task_short = f"{task_short}@{task_run_id[:10]}"
-        regime = str(item.get("regime", "") or "-")
+        regime = _task_regime_text(item.get("regime", "-"))
         preset = str(item.get("preset", "") or "-")
         decision_id_short = decision_id[:20] + "..." if len(decision_id) > 23 else (decision_id or "-")
         lines.append(
@@ -636,6 +637,13 @@ def format_dashboard(user_ctx: UserContext) -> str:
     )}\n\n———————————————\n🎯 **策略设定**\n"""
     mes += f"🔢 **软件版本：{get_software_version_text()}**\n"
     mes += f"🤖 **模型 API：{rt.get('current_model_id', 'unknown')}**\n"
+    mes += f"🚦 **当前押注状态：{get_bet_status_text(rt)}**\n"
+    mes += f"🧭 **运行模式：{_dashboard_run_mode_label(rt)}**\n\n"
+    task_hint = ""
+    try:
+        task_hint = adaptive_tasks.format_task_dashboard_hint(user_ctx)
+    except Exception:
+        task_hint = "__ERR__"
     preset_name = rt.get("current_preset_name", "none")
     preset_params = (
         f"{rt.get('continuous', 1)} {rt.get('lose_stop', 13)} "
@@ -671,6 +679,10 @@ def format_dashboard(user_ctx: UserContext) -> str:
     if win_total > 0 or total > 0:
         win_rate = (win_total / total * 100) if total > 0 else 0.00
         mes += f"🎯 **押注次数：{total}**\n🏆 **胜率：{win_rate:.2f}%**\n💰 **收益：{format_number(rt.get('earnings', 0))}**"
+    if task_hint == "__ERR__":
+        mes += "\n\n🧩 **任务状态栏：读取失败**"
+    elif task_hint:
+        mes += f"\n\n{task_hint}"
     
     return mes
 
@@ -700,6 +712,135 @@ def _to_bool_switch(value: Any, default: bool = True) -> bool:
     return bool(default)
 
 
+def _normalize_run_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"task", "任务", "t"}:
+        return "task"
+    return "normal"
+
+
+def _normalize_task_mode_state(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"running", "paused_manual", "paused_risk"}:
+        return text
+    return "idle"
+
+
+def _task_mode_state(rt: Dict[str, Any]) -> str:
+    state = _normalize_task_mode_state(rt.get("task_mode_state", "idle"))
+    rt["task_mode_state"] = state
+    return state
+
+
+def _set_task_mode_state(rt: Dict[str, Any], state: str, reason: str = "") -> str:
+    normalized = _normalize_task_mode_state(state)
+    rt["task_mode_state"] = normalized
+    rt["task_mode_pause_reason"] = str(reason or "").strip()
+    return normalized
+
+
+def _task_mode_state_text(rt: Dict[str, Any]) -> str:
+    mapping = {
+        "idle": "待机",
+        "running": "运行中",
+        "paused_manual": "手动暂停",
+        "paused_risk": "风控暂停",
+    }
+    return mapping.get(_task_mode_state(rt), "待机")
+
+
+def _is_task_mode(rt: Dict[str, Any]) -> bool:
+    mode = _normalize_run_mode(rt.get("run_mode", "normal"))
+    rt["run_mode"] = mode
+    return mode == "task"
+
+
+def _is_task_mode_guard_active(rt: Dict[str, Any]) -> bool:
+    if _is_task_mode(rt):
+        return True
+    active_run_id = str(rt.get("current_task_run_id", "") or "").strip()
+    return bool(active_run_id)
+
+
+def _run_mode_text(rt: Dict[str, Any]) -> str:
+    return "任务模式" if _is_task_mode(rt) else "普通模式"
+
+
+def _dashboard_run_mode_label(rt: Dict[str, Any]) -> str:
+    try:
+        if _is_task_mode_guard_active(rt):
+            mode_state = _task_mode_state(rt)
+            if mode_state == "paused_manual":
+                return "手动暂停"
+            if mode_state == "paused_risk":
+                return "风控暂停"
+            if mode_state in {"running", "idle"}:
+                return "任务模式"
+            return "其他"
+        if rt.get("manual_pause", False):
+            return "手动暂停"
+        return "普通模式"
+    except Exception:
+        return "其他"
+
+
+def _set_run_mode(rt: Dict[str, Any], mode: str) -> str:
+    normalized = _normalize_run_mode(mode)
+    rt["run_mode"] = normalized
+    if normalized == "normal":
+        _set_task_mode_state(rt, "idle", "")
+    elif str(rt.get("task_mode_state", "")).strip() == "":
+        _set_task_mode_state(rt, "idle", "")
+    return normalized
+
+
+def _is_command_allowed_in_task_mode(cmd: str, args: List[str]) -> bool:
+    allowed_cmds = {
+        "task",
+        "pause",
+        "resume",
+        "暂停",
+        "恢复",
+        "gf",
+        "status",
+        "help",
+        "balance",
+        "users",
+        "replay",
+        "explain",
+        "stats",
+        "ver",
+        "version",
+        "ms",
+        "res",
+    }
+    if cmd not in allowed_cmds:
+        return False
+    if cmd == "res":
+        if not args:
+            return False
+        return str(args[0]).strip().lower() == "task"
+    if cmd != "ms":
+        return True
+    if not args:
+        return True
+    arg = str(args[0]).strip().lower()
+    return arg in {"normal", "task", "n", "t", "普通", "任务"}
+
+
+def _task_mode_block_message(cmd: str, rt: Dict[str, Any]) -> str:
+    run_id = str(rt.get("current_task_run_id", "") or "").strip()
+    task_name = str(rt.get("current_task_name", "") or "").strip()
+    state_text = _task_mode_state_text(rt)
+    task_line = f"- 当前任务：`{task_name}`（run_id: {run_id[:14]}{'...' if len(run_id) > 14 else ''}）" if run_id else "- 当前无运行中的 run_id"
+    return (
+        f"⛔ 当前为任务模式（{state_text}），命令 `{cmd}` 无效。\n"
+        f"{task_line}\n"
+        "为避免打断自动执行，普通改档命令已锁定。\n"
+        "可用命令：`task ...` / `pause` / `resume` / `gf` / `status` / `res task` / `ms normal`"
+    )
+
+
 def _risk_switch_label(enabled: bool) -> str:
     return "ON ✅" if enabled else "OFF ⏸"
 
@@ -711,23 +852,30 @@ def _normalize_risk_switches(rt: Dict[str, Any], apply_default: bool = False) ->
     """
     current_base = _to_bool_switch(rt.get("risk_base_enabled", True), True)
     current_deep = _to_bool_switch(rt.get("risk_deep_enabled", True), True)
+    current_light = _to_bool_switch(rt.get("risk_light_enabled", True), True)
     default_base = _to_bool_switch(rt.get("risk_base_default_enabled", current_base), current_base)
     default_deep = _to_bool_switch(rt.get("risk_deep_default_enabled", current_deep), current_deep)
+    default_light = _to_bool_switch(rt.get("risk_light_default_enabled", current_light), current_light)
 
     if apply_default:
         current_base = default_base
         current_deep = default_deep
+        current_light = default_light
 
     rt["risk_base_enabled"] = current_base
     rt["risk_deep_enabled"] = current_deep
+    rt["risk_light_enabled"] = current_light
     rt["risk_base_default_enabled"] = default_base
     rt["risk_deep_default_enabled"] = default_deep
+    rt["risk_light_default_enabled"] = default_light
 
     return {
         "base_enabled": current_base,
         "deep_enabled": current_deep,
+        "light_enabled": current_light,
         "base_default_enabled": default_base,
         "deep_default_enabled": default_deep,
+        "light_default_enabled": default_light,
     }
 
 
@@ -743,11 +891,13 @@ def _build_risk_state_text(rt: Dict[str, Any], include_usage: bool = True) -> st
         f"- 基础风控：{_risk_switch_label(risk_modes['base_enabled'])}"
         f"（默认：{_risk_switch_label(risk_modes['base_default_enabled'])}）\n"
         f"- 深度风控（含高倍入场门控）：{_risk_switch_label(risk_modes['deep_enabled'])}"
-        f"（默认：{_risk_switch_label(risk_modes['deep_default_enabled'])}）\n\n"
+        f"（默认：{_risk_switch_label(risk_modes['deep_default_enabled'])}）\n"
+        f"- 轻度风控（任务轻度止损暂停）：{_risk_switch_label(risk_modes['light_enabled'])}"
+        f"（默认：{_risk_switch_label(risk_modes['light_default_enabled'])}）\n\n"
         "说明：`risk` 命令会同步写入当前账号默认，脚本重启后按默认模式生效。"
     )
     if include_usage:
-        mes += "\n用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`"
+        mes += "\n用法：`risk base on|off` / `risk deep on|off` / `risk light on|off` / `risk all on|off`"
     return mes
 
 
@@ -765,12 +915,196 @@ def build_startup_focus_reminder(user_ctx: UserContext) -> str:
     return (
         "📌 启动重点设置提醒\n"
         f"🛡️ 风控提醒：基础 {_risk_switch_label(risk_modes['base_enabled'])} / "
-        f"深度 {_risk_switch_label(risk_modes['deep_enabled'])}\n"
+        f"深度 {_risk_switch_label(risk_modes['deep_enabled'])} / "
+        f"轻度 {_risk_switch_label(risk_modes['light_enabled'])}\n"
         f"🧭 默认模式：基础 {_risk_switch_label(risk_modes['base_default_enabled'])} / "
-        f"深度 {_risk_switch_label(risk_modes['deep_default_enabled'])}（可用 `risk ...` 开关）\n"
+        f"深度 {_risk_switch_label(risk_modes['deep_default_enabled'])} / "
+        f"轻度 {_risk_switch_label(risk_modes['light_default_enabled'])}（可用 `risk ...` 开关）\n"
         f"🎯 预设提醒：当前 `{preset_name}`（可用 `st <预设名>` 切换）\n"
         f"📊 当前状态：{status_text}，模式：{mode_text}\n"
         "ℹ️ 更多命令：`help`"
+    )
+
+
+def _parse_task_new_extra_args(args: List[str]) -> Dict[str, Any]:
+    cron_minutes = 0
+    trigger_mode = "hybrid"
+    task_loss_pct: Optional[float] = None
+    daily_loss_pct: Optional[float] = None
+    max_consecutive_losses: Optional[int] = None
+
+    for raw in args:
+        token = str(raw or "").strip()
+        if not token:
+            continue
+        low = token.lower()
+
+        if "=" in low:
+            key, value = low.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            try:
+                if key in {"task_loss_pct", "loss", "loss_pct", "run_loss_pct"}:
+                    if value.endswith("%"):
+                        task_loss_pct = float(value[:-1]) / 100.0
+                    else:
+                        task_loss_pct = float(value)
+                    continue
+                if key in {"daily_loss_pct", "day_loss_pct", "daily", "dayloss"}:
+                    if value.endswith("%"):
+                        daily_loss_pct = float(value[:-1]) / 100.0
+                    else:
+                        daily_loss_pct = float(value)
+                    continue
+                if key in {"max_consecutive_losses", "maxlose", "consecutive"}:
+                    max_consecutive_losses = int(value)
+                    continue
+            except Exception:
+                return {"ok": False, "error": f"参数解析失败：`{token}`"}
+            return {"ok": False, "error": f"不支持的参数：`{token}`"}
+
+        if low in {"time", "regime", "hybrid"}:
+            trigger_mode = low
+            continue
+        if low.isdigit():
+            cron_minutes = int(low)
+            continue
+        return {"ok": False, "error": f"无法识别参数：`{token}`"}
+
+    return {
+        "ok": True,
+        "cron_minutes": cron_minutes,
+        "trigger_mode": trigger_mode,
+        "task_loss_pct": task_loss_pct,
+        "daily_loss_pct": daily_loss_pct,
+        "max_consecutive_losses": max_consecutive_losses,
+    }
+
+
+def _task_new_usage_text() -> str:
+    return "`task new <name> [cron_minutes] [time|regime|hybrid] [task_loss_pct=0.006] [daily_loss_pct=0.02] [max_consecutive_losses=4]`"
+
+
+def _task_trigger_mode_text(mode: Any) -> str:
+    mapping = {
+        "time": "定时触发",
+        "regime": "盘面触发",
+        "hybrid": "混合触发",
+    }
+    return mapping.get(str(mode or "").strip().lower(), "混合触发")
+
+
+def _task_regime_text(regime: Any) -> str:
+    try:
+        return adaptive_tasks.regime_text(regime)
+    except Exception:
+        return str(regime or "-") or "-"
+
+
+def _pct_text(value: Any, default: float) -> str:
+    try:
+        pct = float(value) * 100.0
+    except Exception:
+        pct = default * 100.0
+    return f"{pct:.2f}%"
+
+
+def _build_task_trigger_notice(result: Dict[str, Any], rec: Dict[str, Any], title: str = "任务已触发") -> str:
+    return (
+        f"{title}\n"
+        f"任务：{result.get('task_name', '-')}\n"
+        f"run_id：{result.get('task_run_id', '-')}\n"
+        f"盘面：{_task_regime_text(rec.get('regime', '-'))}\n"
+        f"档位：{result.get('preset', '-')}\n"
+        f"本阶段计划：{rec.get('planned_rounds', 0)} 局（会按复评动态重算）"
+    )
+
+
+def _build_task_new_success_text(task_name: str, trigger_mode: str, cron_minutes: int, task_cfg: Dict[str, Any]) -> str:
+    mode_text = _task_trigger_mode_text(trigger_mode)
+    safe_cron = max(0, int(cron_minutes or 0))
+    try:
+        max_consecutive_losses = max(1, int(task_cfg.get("max_consecutive_losses", 4) or 4))
+    except Exception:
+        max_consecutive_losses = 4
+    cron_text = f"{safe_cron} 分钟" if safe_cron > 0 else "关闭"
+    return (
+        f"✅ 任务 `{task_name}` 已创建\n"
+        f"- 触发方式：{mode_text}（定时触发：{cron_text}）\n"
+        f"- 风控阈值：任务止损 {_pct_text(task_cfg.get('task_loss_pct', 0.006), 0.006)} | "
+        f"日损 {_pct_text(task_cfg.get('daily_loss_pct', 0.02), 0.02)} | "
+        f"最大连输 {max_consecutive_losses} 次\n"
+        "- 下一步：`ms task` → `task run <name>`"
+    )
+
+
+def _format_task_start_error(user_ctx: UserContext, error_text: str) -> str:
+    err = str(error_text or "").strip()
+    low = err.lower()
+    rt = user_ctx.state.runtime
+
+    if "task mode is risk-paused until" in low:
+        match = re.search(r"risk-paused until\s+(.+)$", err, flags=re.IGNORECASE)
+        until = match.group(1).strip() if match else str(rt.get("task_freeze_until", "-") or "-")
+        reason = str(rt.get("task_freeze_reason", "") or "").strip()
+        mes = (
+            "❌ 启动失败：任务模式处于风控暂停\n"
+            f"- 暂停时间：{until}\n"
+        )
+        if reason:
+            mes += f"- 触发原因：{reason}\n"
+        mes += "- 处理方式：执行 `task resume` 恢复，或 `res task` 强制清理后重启任务"
+        return mes
+
+    if low == "task mode is paused manually":
+        return "❌ 启动失败：任务模式当前为手动暂停\n- 处理方式：先执行 `task resume`，再执行 `task run <name>`"
+    if " is running" in low and low.startswith("task `"):
+        return f"❌ 启动失败：已有任务在运行\n- 详情：{err}\n- 处理方式：先 `task panel` 查看，必要时 `task stop`"
+    if low.startswith("task `") and low.endswith("` not found"):
+        return f"❌ 启动失败：任务不存在\n- 详情：{err}\n- 可先执行 `task list` 查看可用任务"
+    if low.startswith("task `") and low.endswith("` is disabled"):
+        return f"❌ 启动失败：任务已停用\n- 详情：{err}\n- 处理方式：执行 `task enable <name>` 后重试"
+    if low.startswith("task `") and low.endswith("` is paused"):
+        return f"❌ 启动失败：任务配置处于暂停态\n- 详情：{err}\n- 处理方式：先 `task enable <name>` 或检查任务状态"
+    if low.startswith("preset `") and low.endswith("` missing"):
+        return f"❌ 启动失败：推荐预设不存在\n- 详情：{err}\n- 处理方式：检查预设配置（`yss`）后重试"
+    return f"❌ 启动失败：{err}"
+
+
+def _build_task_usage_text() -> str:
+    return (
+        "**任务系统（v2-adaptive）**\n"
+        "- `task help` : 查看任务命令说明\n"
+        "快速上手（推荐顺序）\n"
+        "1. `ms task`：切换到任务模式\n"
+        "2. `task run <name>`：启动任务（自动选策略）\n"
+        "3. `task panel`：查看任务状态栏\n"
+        "4. `task pause` / `task resume` / `task stop`：运行期控制\n\n"
+        "创建任务\n"
+        "- `task new <name> [cron_minutes] [time|regime|hybrid]` : 最简创建方式（风控参数用默认值）\n"
+        f"- {_task_new_usage_text()} : 创建任务\n"
+        "  参数说明：`<name>`任务名；`cron_minutes`定时间隔（0=关闭定时）；`time/regime/hybrid`触发方式\n"
+        "  风控可选：`task_loss_pct`（单任务止损比例）`daily_loss_pct`（日损比例）`max_consecutive_losses`（最大连输）\n"
+        "  示例：`task new ceshi 10 hybrid task_loss_pct=1% daily_loss_pct=3% max_consecutive_losses=6`\n"
+        "\n"
+        "查看与管理\n"
+        "- `task list` : 列出任务\n"
+        "- `task show [name]` : 查看任务详情（省略 name 默认查看当前运行任务）\n"
+        "- `task panel` : 查看任务状态面板（详细版，单独展示）\n"
+        "- `task disable <name>` / `task enable <name>` : 启用/停用任务配置\n"
+        "- `task pause` / `task resume` : 任务模式内暂停/恢复（状态机）\n"
+        "- `task run <name>` : 立即手动触发任务\n"
+        "- `task stop` : 结束当前运行任务（安全退出）\n"
+        "- `task auto on|off` : 开关任务自动触发\n"
+        "- `task logs [name] [limit]` : 查看任务运行日志（默认20条）\n"
+        "- `task stats [name]` : 查看任务统计与链路覆盖率\n"
+        "- `ms task` / `ms normal` : 进入/退出任务模式\n"
+        f"盘面类型：{adaptive_tasks.regime_catalog_text()}\n"
+        "说明：仪表盘默认只显示任务模式简版提示，详细进度请用 `task panel`。\n"
+        "说明：任务模式下仅允许 `task`/查询/`pause`/`resume`/`gf` 命令，其它命令会被拦截。\n"
+        "说明：任务模式下 `st`/`set`/`risk` 等改档命令无效；需先 `task stop` 或 `ms normal` 退出任务模式。\n"
+        "说明：任务轻度风控触发后会进入“风控暂停”，任务不会结束，需 `task resume` 手动恢复。\n"
+        "示例：`task new day15 15 hybrid` / `task run day15` / `task stop` / `task logs day15 30`"
     )
 
 
@@ -796,7 +1130,7 @@ async def adaptive_task_scheduler_loop(client, user_ctx: UserContext, global_con
                 rt["analytics_last_ingest_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                 user_ctx.save_state()
 
-            if _to_bool_switch(rt.get("task_auto_enabled", True), True):
+            if _is_task_mode(rt) and _to_bool_switch(rt.get("task_auto_enabled", True), True):
                 result = adaptive_tasks.maybe_trigger_task(user_ctx)
                 if result.get("ok"):
                     rec = result.get("recommendation", {})
@@ -804,14 +1138,7 @@ async def adaptive_task_scheduler_loop(client, user_ctx: UserContext, global_con
                         client,
                         user_ctx,
                         global_config,
-                        (
-                            "任务已后台触发\n"
-                            f"任务：{result.get('task_name', '-')}\n"
-                            f"run_id：{result.get('task_run_id', '-')}\n"
-                            f"盘面：{rec.get('regime', '-')}\n"
-                            f"档位：{result.get('preset', '-')}\n"
-                            f"计划局数：{rec.get('planned_rounds', 0)}"
-                        ),
+                        _build_task_trigger_notice(result, rec, title="任务已后台触发"),
                         ttl_seconds=120,
                         attr_name="task_transition_message",
                     )
@@ -1155,7 +1482,7 @@ def extract_pattern_features(history):
     }
 
 
-def fallback_prediction(history):
+def fallback_prediction(history, user_id: int = 0):
     """
     天眼兜底机制：如果AI异常，强行维持50:50概率
     缺哪个补哪个，绝不暂停！
@@ -1170,8 +1497,13 @@ def fallback_prediction(history):
     
     prediction = 1 if big_count < small_count else 0
     
-    log_event(logging.WARNING, 'predict_v10', '天眼兜底触发', 
-              user_id=0, data=f'big={big_count}, small={small_count}, fallback={prediction}')
+    log_event(
+        logging.WARNING,
+        'predict_v10',
+        '天眼兜底触发',
+        user_id=user_id,
+        data=f'big={big_count}, small={small_count}, fallback={prediction}',
+    )
     
     return prediction
 
@@ -1592,8 +1924,51 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     if len(state.history) < 40:
         log_event(logging.INFO, 'bet_on', '历史数据低于40局，继续执行押注', user_id=user_ctx.user_id, data=f'len={len(state.history)}')
 
+    if _is_task_mode_guard_active(rt):
+        prev_task_state = _task_mode_state(rt)
+        task_mode_info = adaptive_tasks.get_task_mode_state(user_ctx)
+        curr_task_state = str(task_mode_info.get("state", "idle") or "idle")
+
+        if prev_task_state == "paused_risk" and curr_task_state != "paused_risk":
+            rt["bet"] = False
+            rt["bet_on"] = True
+            rt["mode_stop"] = True
+            rt["manual_pause"] = False
+            user_ctx.save_state()
+            await _send_transient_admin_notice(
+                client,
+                user_ctx,
+                global_config,
+                (
+                    "▶️ 任务风控暂停已解除，自动恢复下注\n"
+                    f"任务：{rt.get('current_task_name', '-')}\n"
+                    f"run_id：{rt.get('current_task_run_id', '-')}"
+                ),
+                ttl_seconds=120,
+                attr_name="task_transition_message",
+            )
+
+        if curr_task_state == "paused_risk":
+            rt["bet"] = False
+            rt["bet_on"] = False
+            rt["mode_stop"] = True
+            rt["manual_pause"] = False
+            user_ctx.save_state()
+            if hasattr(user_ctx, "dashboard_message") and user_ctx.dashboard_message:
+                await cleanup_message(client, user_ctx.dashboard_message)
+            dashboard = format_dashboard(user_ctx)
+            user_ctx.dashboard_message = await send_to_admin(client, dashboard, user_ctx, global_config)
+            log_event(
+                logging.INFO,
+                "bet_on",
+                "任务风控暂停中，跳过下注",
+                user_id=user_ctx.user_id,
+                data=f"reason={rt.get('task_mode_pause_reason', '')}",
+            )
+            return
+
     # 动态任务自动触发：在每次有效盘口到来时尝试触发一次
-    if _to_bool_switch(rt.get("task_auto_enabled", True), True):
+    if _is_task_mode(rt) and _to_bool_switch(rt.get("task_auto_enabled", True), True):
         try:
             task_trigger_result = adaptive_tasks.maybe_trigger_task(user_ctx)
             if task_trigger_result.get("ok"):
@@ -1602,14 +1977,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     client,
                     user_ctx,
                     global_config,
-                    (
-                        "任务已自动触发\n"
-                        f"任务：{task_trigger_result.get('task_name', '-')}\n"
-                        f"run_id：{task_trigger_result.get('task_run_id', '-')}\n"
-                        f"盘面：{rec.get('regime', '-')}\n"
-                        f"档位：{task_trigger_result.get('preset', '-')}\n"
-                        f"计划局数：{rec.get('planned_rounds', 0)}"
-                    ),
+                    _build_task_trigger_notice(task_trigger_result, rec, title="任务已自动触发"),
                     ttl_seconds=120,
                     attr_name="task_transition_message",
                 )
@@ -1972,13 +2340,20 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             log_event(
                 logging.WARNING,
                 'bet_on',
-                '预测超时，本局放弃下注',
+                '预测超时，进入超时处理',
                 user_id=user_ctx.user_id,
                 timeout=predict_timeout_sec,
+                deep_risk=deep_risk_enabled,
             )
             timeout_guard = _record_hand_stall_block(rt, next_sequence, history_len, "timeout")
             if timeout_guard.get("force_unlock", False):
-                prediction = _prepare_force_unlock_prediction(state, rt, next_sequence, timeout_guard)
+                prediction = _prepare_force_unlock_prediction(
+                    state,
+                    rt,
+                    next_sequence,
+                    timeout_guard,
+                    user_id=user_ctx.user_id,
+                )
                 force_unlock_active = True
                 await _send_transient_admin_notice(
                     client,
@@ -2021,18 +2396,31 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     await _apply_entry_gate_pause(client, user_ctx, global_config, timeout_gate, next_sequence)
                     return
                 # 深度风控关闭：不触发暂停，改用统计兜底继续。
-                prediction = int(fallback_prediction(state.history))
+                prediction = int(fallback_prediction(state.history, user_id=user_ctx.user_id))
                 rt["last_predict_info"] = (
                     f"预测超时 - 深度风控已关闭，改用统计兜底预测({'大' if prediction == 1 else '小'})"
                 )
                 rt["last_predict_source"] = "timeout_fallback_no_risk"
                 rt["last_predict_tag"] = "TIMEOUT_FALLBACK"
                 rt["last_predict_confidence"] = 0
+                log_event(
+                    logging.INFO,
+                    'bet_on',
+                    '深度风控关闭：预测超时改用统计兜底',
+                    user_id=user_ctx.user_id,
+                    fallback=prediction,
+                )
 
         if prediction is None:
             invalid_guard = _record_hand_stall_block(rt, next_sequence, history_len, "gate")
             if invalid_guard.get("force_unlock", False):
-                prediction = _prepare_force_unlock_prediction(state, rt, next_sequence, invalid_guard)
+                prediction = _prepare_force_unlock_prediction(
+                    state,
+                    rt,
+                    next_sequence,
+                    invalid_guard,
+                    user_id=user_ctx.user_id,
+                )
                 force_unlock_active = True
             else:
                 if deep_risk_enabled:
@@ -2052,7 +2440,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     }
                     await _apply_entry_gate_pause(client, user_ctx, global_config, invalid_gate, next_sequence)
                     return
-                prediction = int(fallback_prediction(state.history))
+                prediction = int(fallback_prediction(state.history, user_id=user_ctx.user_id))
                 rt["last_predict_info"] = (
                     f"预测结果无效 - 深度风控已关闭，改用统计兜底预测({'大' if prediction == 1 else '小'})"
                 )
@@ -2063,7 +2451,13 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         if prediction == -1:
             skip_guard = _record_hand_stall_block(rt, next_sequence, history_len, "skip")
             if skip_guard.get("force_unlock", False):
-                prediction = _prepare_force_unlock_prediction(state, rt, next_sequence, skip_guard)
+                prediction = _prepare_force_unlock_prediction(
+                    state,
+                    rt,
+                    next_sequence,
+                    skip_guard,
+                    user_id=user_ctx.user_id,
+                )
                 force_unlock_active = True
                 await _send_transient_admin_notice(
                     client,
@@ -2111,7 +2505,13 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         if deep_risk_enabled and (not force_unlock_active) and predict_source in {"timeout", "fallback", "hard_fallback", "invalid"}:
             source_guard = _record_hand_stall_block(rt, next_sequence, history_len, "gate")
             if source_guard.get("force_unlock", False):
-                prediction = _prepare_force_unlock_prediction(state, rt, next_sequence, source_guard)
+                prediction = _prepare_force_unlock_prediction(
+                    state,
+                    rt,
+                    next_sequence,
+                    source_guard,
+                    user_id=user_ctx.user_id,
+                )
                 force_unlock_active = True
             else:
                 non_model_gate = {
@@ -2134,7 +2534,13 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             if quality_gate.get("blocked", False):
                 quality_guard = _record_hand_stall_block(rt, next_sequence, history_len, "gate")
                 if quality_guard.get("force_unlock", False):
-                    prediction = _prepare_force_unlock_prediction(state, rt, next_sequence, quality_guard)
+                    prediction = _prepare_force_unlock_prediction(
+                        state,
+                        rt,
+                        next_sequence,
+                        quality_guard,
+                        user_id=user_ctx.user_id,
+                    )
                     force_unlock_active = True
                 else:
                     await _apply_entry_gate_pause(client, user_ctx, global_config, quality_gate, next_sequence)
@@ -2152,7 +2558,13 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             if dual_gate.get("blocked", False):
                 dual_guard = _record_hand_stall_block(rt, next_sequence, history_len, "gate")
                 if dual_guard.get("force_unlock", False):
-                    prediction = _prepare_force_unlock_prediction(state, rt, next_sequence, dual_guard)
+                    prediction = _prepare_force_unlock_prediction(
+                        state,
+                        rt,
+                        next_sequence,
+                        dual_guard,
+                        user_id=user_ctx.user_id,
+                    )
                     force_unlock_active = True
                 else:
                     await _apply_entry_gate_pause(client, user_ctx, global_config, dual_gate, next_sequence)
@@ -2712,9 +3124,15 @@ def _record_hand_stall_block(rt: dict, next_sequence: int, history_len: int, rea
     }
 
 
-def _prepare_force_unlock_prediction(state, rt: dict, next_sequence: int, trigger: dict) -> int:
+def _prepare_force_unlock_prediction(
+    state,
+    rt: dict,
+    next_sequence: int,
+    trigger: dict,
+    user_id: int = 0,
+) -> int:
     """生成防卡死强制解锁预测方向（统计兜底）。"""
-    prediction = int(fallback_prediction(state.history))
+    prediction = int(fallback_prediction(state.history, user_id=user_id))
     rt["last_predict_source"] = "unlock_fallback"
     rt["last_predict_tag"] = "UNLOCK"
     rt["last_predict_confidence"] = 0
@@ -4230,7 +4648,23 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                         )
 
                         task_update = adaptive_tasks.on_settle(user_ctx, bool(win), int(profit))
-                        if task_update.get("ended", {}).get("ok"):
+                        if task_update.get("risk_paused"):
+                            paused = task_update.get("paused", {}) if isinstance(task_update.get("paused", {}), dict) else {}
+                            await _send_transient_admin_notice(
+                                client,
+                                user_ctx,
+                                global_config,
+                                (
+                                    "⛔ 任务触发风控暂停（任务未结束）\n"
+                                    f"任务：{paused.get('task_name', rt.get('current_task_name', '-'))}\n"
+                                    f"run_id：{paused.get('task_run_id', rt.get('current_task_run_id', '-'))}\n"
+                                    f"状态：{paused.get('status', task_update.get('status', '-'))}\n"
+                                    f"原因：{paused.get('reason', task_update.get('reason', '-'))}"
+                                ),
+                                ttl_seconds=180,
+                                attr_name="task_transition_message",
+                            )
+                        elif task_update.get("ended", {}).get("ok"):
                             ended = task_update.get("ended", {})
                             await _send_transient_admin_notice(
                                 client,
@@ -4254,13 +4688,24 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                                 (
                                     "任务复评已更新\n"
                                     f"任务：{rt.get('current_task_name', '-')}\n"
-                                    f"新盘面：{rt.get('task_regime', '-')}\n"
+                                    f"新盘面：{_task_regime_text(rt.get('task_regime', '-'))}\n"
                                     f"新档位：{rt.get('current_preset_name', '-')}\n"
-                                    f"本段计划：{rt.get('task_step_planned_rounds', 0)} 局"
+                                    f"本段计划：{rt.get('task_step_planned_rounds', 0)} 局（动态重算）"
                                 ),
                                 ttl_seconds=120,
                                 attr_name="task_transition_message",
                             )
+
+                        active_run_id = str(rt.get("current_task_run_id", "") or "").strip()
+                        total_task_rounds = int(rt.get("task_run_total_rounds", 0) or 0)
+                        last_cycle_report = int(rt.get("task_cycle_last_report_round", 0) or 0)
+                        if active_run_id and total_task_rounds > 0 and total_task_rounds % 40 == 0 and total_task_rounds != last_cycle_report:
+                            cycle_mes = adaptive_tasks.format_task_cycle_report(user_ctx)
+                            if cycle_mes:
+                                if hasattr(user_ctx, "task_cycle_message") and user_ctx.task_cycle_message:
+                                    await cleanup_message(client, user_ctx.task_cycle_message)
+                                user_ctx.task_cycle_message = await send_to_admin(client, cycle_mes, user_ctx, global_config)
+                                rt["task_cycle_last_report_round"] = total_task_rounds
 
                     user_ctx.save_state()
 
@@ -4779,73 +5224,39 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
     try:
         # ========== help命令 ==========
         if cmd == "help":
-            mes = """**️ 命令列表 (Commands)**
+            mes = """**命令总览（精简版）**
 
-**基础控制（推荐）**
-- `st [预设名]` : 启动预设并进入可下注状态 (例: `st yc10`)
-- `pause` : 仅暂停当前账号押注（不影响其他账号）
-- `resume` : 恢复当前账号押注
-- `open/off` : 兼容旧命令（分别等同 `resume/pause`）
-
-**风控说明（重点）**
-- `risk` : 查看当前风控状态与账号默认模式
-- `risk base on|off` : 切换基础风控（并写入当前账号默认）
-- `risk deep on|off` : 切换深度风控（并写入当前账号默认）
-- `risk all on|off` : 同步切换基础/深度风控（并写入当前账号默认）
-- 说明：风控会直接影响暂停与入场门槛，进而影响押注收益；脚本重启后按账号默认模式自动生效
-
-**参数设置**
-- `gf [金额]` : 设置本金 (例: `gf 1000000`)
-- `set [炸] [赢] [停] [盈停]` : 设置风控参数
-  (例: `set 5 1000000 3 5` -> 炸5次, 赢100w, 停3局, 盈停5局)
-- `warn [次数]` : 设置连输告警阈值 (例: `warn 2`)
-- `wlc [次数]` : `warn` 的简写命令
-
-**模型与策略**
-- `model [list|select|reload]` : 模型管理 (例: `model select 1`)
-- `apikey [show|set|add|del|test]` : 管理当前账号 AI key (`ak` 同义)
-- `ms [模式]` : 切换模式 (0:反投, 1:预测, 2:追投)
-
-**测算功能**
-- `yc [预设名]` : 测算预设策略盈利 (例: `yc yc05`)
-- `yc [参数...]` : 自定义参数测算 (例: `yc 1 13 3 2.1 2.1 2.05 500`)
-
-**数据管理**
-- `res tj` : 重置统计数据
-- `res state` : 清空历史与状态
-- `res bet` : 重置押注策略
-- `replay [条数]` : 查看最近复盘重点（决策链路/输赢/金额，默认20条）
-- `explain` : 查看AI决策解释
-- `stats` : 查看连大、连小、连输统计
-- `balance` : 查询账户余额
-- `xx` : 清理配置群中“我发送的消息”
-
-**发布更新**
-- `ver` : 查看版本概览（最近3个Tag + 最近3个Commit）
-- `update [版本|提交]` : 更新到指定版本（留空默认最新）
-- `reback [版本|提交]` : 回退到指定版本
-- `restart` : 重启当前进程
-
-**预设管理**
-- `ys [名] ...` : 保存预设
-- `yss` : 查看所有预设
-- `yss dl [名]` : 删除预设
-
-**多用户管理**
-- `users` : 查看当前用户状态
+**常用控制**
+- `st <预设名>` : 启动预设并进入可下注状态
+- `pause` / `resume` : 暂停/恢复当前账号下注
 - `status` : 查看仪表盘
-"""
-            mes += """
+- `ms [0|1|2]` : 切换投注模式（反投/预测/追投）
 
-**任务系统（v2-adaptive）**
-- `task new <name> [cron_minutes] [time|regime|hybrid]` : 创建任务
-- `task list` : 列出任务
-- `task show <name>` : 查看任务详情
-- `task pause <name>` / `task resume <name>` : 暂停/恢复任务
-- `task run <name>` : 立即手动触发任务
-- `task logs [name] [limit]` : 查看任务运行日志
-- `task stats [name]` : 查看任务统计与链路覆盖率
+**任务模式**
+- `ms task` / `ms normal` : 进入/退出任务模式
+- `task run <name>` : 启动任务
+- `task panel` : 查看任务状态栏
+- `task pause` / `task resume` / `task stop` : 任务运行控制
+- `task help` : 查看任务完整说明
+
+**风控与资金**
+- `risk` : 查看风控开关状态
+- `risk base|deep|light|all on|off` : 调整风控并写入账号默认
+- `gf <金额>` : 设置菠菜资金
+- `set <炸> <赢> <停> <盈停>` : 设置基础参数
+
+**查询与重置**
+- `balance` : 查询账户余额
+- `stats` : 连大/连小/连输统计
+- `replay [条数]` : 最近复盘重点
+- `res tj|state|bet|task` : 重置统计/状态/押注/任务模式状态
+
+**版本与维护**
+- `ver` : 查看版本概览
+- `update [版本|提交]` / `reback [版本|提交]` : 更新或回退
+- `restart` : 重启进程
 """
+            mes += f"\n\n{_build_task_usage_text()}"
             log_event(logging.INFO, 'user_cmd', '显示帮助', user_id=user_ctx.user_id)
             message = await send_to_admin(client, mes, user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
@@ -4859,6 +5270,11 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             cmd = "resume"
         elif cmd == "off":
             cmd = "pause"
+
+        if _is_task_mode_guard_active(rt):
+            if not _is_command_allowed_in_task_mode(cmd, my[1:]):
+                await send_to_admin(client, _task_mode_block_message(cmd, rt), user_ctx, global_config)
+                return
 
         if cmd == "xx":
             target_groups = []
@@ -4921,6 +5337,37 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         
         # pause/resume - 暂停/恢复押注
         if cmd in ("pause", "暂停"):
+            if _is_task_mode_guard_active(rt):
+                mode_state = _task_mode_state(rt)
+                if mode_state == "paused_manual":
+                    await send_to_admin(client, "⏸ 当前任务模式已是手动暂停状态", user_ctx, global_config)
+                    return
+                pause_result = adaptive_tasks.pause_task_mode(user_ctx, reason="manual_pause")
+                if not pause_result.get("ok"):
+                    await send_to_admin(client, "⚠️ 任务模式暂停失败，请稍后重试", user_ctx, global_config)
+                    return
+                _set_task_mode_state(rt, "paused_manual", "manual_pause")
+                await _clear_pause_countdown_notice(client, user_ctx)
+                rt["switch"] = True
+                rt["bet_on"] = False
+                rt["bet"] = False
+                rt["mode_stop"] = True
+                rt["manual_pause"] = True
+                _clear_lose_recovery_tracking(rt)
+                user_ctx.save_state()
+                run_id = str(pause_result.get("task_run_id", "") or "").strip()
+                if run_id:
+                    mes = (
+                        "⏸ 任务模式已手动暂停\n"
+                        f"- 任务：`{pause_result.get('task_name', '-')}`\n"
+                        f"- run_id：{run_id}"
+                    )
+                else:
+                    mes = "⏸ 任务模式已手动暂停（当前无运行中的 task run）"
+                await send_to_admin(client, mes, user_ctx, global_config)
+                log_event(logging.INFO, 'user_cmd', '任务模式手动暂停', user_id=user_ctx.user_id)
+                return
+
             if rt.get("manual_pause", False):
                 await send_to_admin(client, "⏸ 当前账号已是暂停状态", user_ctx, global_config)
                 return
@@ -4938,6 +5385,32 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             return
         
         if cmd in ("resume", "恢复"):
+            if _is_task_mode_guard_active(rt):
+                resume_result = adaptive_tasks.resume_task_mode(user_ctx)
+                if not resume_result.get("ok"):
+                    if resume_result.get("error") == "not_paused":
+                        await send_to_admin(client, "当前任务模式不在暂停状态", user_ctx, global_config)
+                    else:
+                        await send_to_admin(client, "⚠️ 任务模式恢复失败，请稍后重试", user_ctx, global_config)
+                    return
+
+                await _clear_pause_countdown_notice(client, user_ctx)
+                rt["switch"] = True
+                rt["bet_on"] = True
+                rt["bet"] = False
+                rt["mode_stop"] = True
+                rt["manual_pause"] = False
+                _set_task_mode_state(rt, str(resume_result.get("state", "idle") or "idle"), "")
+                user_ctx.save_state()
+
+                if str(resume_result.get("state", "idle")) == "running":
+                    mes = "▶️ 任务模式已恢复（当前任务继续运行）"
+                else:
+                    mes = "▶️ 任务模式已恢复（等待下一次任务触发）"
+                await send_to_admin(client, mes, user_ctx, global_config)
+                log_event(logging.INFO, 'user_cmd', '任务模式手动恢复', user_id=user_ctx.user_id)
+                return
+
             await _clear_pause_countdown_notice(client, user_ctx)
             rt["switch"] = True
             rt["bet_on"] = True
@@ -4950,7 +5423,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             log_event(logging.INFO, 'user_cmd', '恢复押注', user_id=user_ctx.user_id)
             return
 
-        # risk - 基础/深度风控开关
+        # risk - 基础/深度/轻度风控开关
         if cmd == "risk":
             _normalize_risk_switches(rt, apply_default=False)
 
@@ -4964,7 +5437,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             if len(my) != 3:
                 await send_to_admin(
                     client,
-                    "❌ 参数格式错误\n用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`",
+                    "❌ 参数格式错误\n用法：`risk base on|off` / `risk deep on|off` / `risk light on|off` / `risk all on|off`",
                     user_ctx,
                     global_config,
                 )
@@ -4972,10 +5445,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
             target = str(my[1]).strip().lower()
             action = str(my[2]).strip().lower()
-            if target not in {"base", "deep", "all"} or action not in {"on", "off"}:
+            if target not in {"base", "deep", "light", "all"} or action not in {"on", "off"}:
                 await send_to_admin(
                     client,
-                    "❌ 参数无效\n用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`",
+                    "❌ 参数无效\n用法：`risk base on|off` / `risk deep on|off` / `risk light on|off` / `risk all on|off`",
                     user_ctx,
                     global_config,
                 )
@@ -4998,10 +5471,18 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 rt["risk_deep_default_enabled"] = enabled
                 if not enabled:
                     rt["risk_deep_triggered_milestones"] = []
+            if target in {"light", "all"}:
+                rt["risk_light_enabled"] = enabled
+                rt["risk_light_default_enabled"] = enabled
 
             _normalize_risk_switches(rt, apply_default=False)
             user_ctx.save_state()
-            scope_text = {"base": "基础风控", "deep": "深度风控", "all": "基础+深度风控"}[target]
+            scope_text = {
+                "base": "基础风控",
+                "deep": "深度风控",
+                "light": "轻度风控",
+                "all": "基础+深度+轻度风控",
+            }[target]
             status_text = "开启" if enabled else "关闭"
             mes = f"✅ 已{status_text}{scope_text}（已写入账号默认模式）\n\n{_build_risk_state_text(rt)}"
             message = await send_to_admin(client, mes, user_ctx, global_config)
@@ -5022,6 +5503,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         if cmd == "task":
             sub_cmd = str(my[1]).strip().lower() if len(my) > 1 else "help"
 
+            if sub_cmd in {"help", "h"}:
+                await send_to_admin(client, _build_task_usage_text(), user_ctx, global_config)
+                return
+
             if sub_cmd in {"list", "ls"}:
                 mes = adaptive_tasks.format_task_list(user_ctx)
                 message = await send_to_admin(client, mes, user_ctx, global_config)
@@ -5034,39 +5519,58 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 if len(my) < 3:
                     await send_to_admin(
                         client,
-                        "用法：`task new <name> [cron_minutes] [time|regime|hybrid]`",
+                        f"用法：{_task_new_usage_text()}",
                         user_ctx,
                         global_config,
                     )
                     return
                 task_name = str(my[2]).strip()
-                cron_minutes = 0
-                trigger_mode = "hybrid"
-                if len(my) >= 4:
-                    if str(my[3]).strip().isdigit():
-                        cron_minutes = int(my[3])
-                    else:
-                        trigger_mode = str(my[3]).strip().lower()
-                if len(my) >= 5:
-                    trigger_mode = str(my[4]).strip().lower()
+                parsed = _parse_task_new_extra_args(my[3:])
+                if not parsed.get("ok"):
+                    await send_to_admin(
+                        client,
+                        f"❌ {parsed.get('error', '参数错误')}\n"
+                        f"用法：{_task_new_usage_text()}",
+                        user_ctx,
+                        global_config,
+                    )
+                    return
+                cron_minutes = int(parsed.get("cron_minutes", 0))
+                trigger_mode = str(parsed.get("trigger_mode", "hybrid") or "hybrid")
+                task_loss_pct = parsed.get("task_loss_pct")
+                daily_loss_pct = parsed.get("daily_loss_pct")
+                max_consecutive_losses = parsed.get("max_consecutive_losses")
                 result = adaptive_tasks.create_task(
                     user_ctx,
                     name=task_name,
                     cron_minutes=cron_minutes,
                     mode=trigger_mode,
+                    task_loss_pct=task_loss_pct,
+                    daily_loss_pct=daily_loss_pct,
+                    max_consecutive_losses=max_consecutive_losses,
                 )
                 if result.get("ok"):
-                    mes = f"✅ 任务 `{task_name}` 已创建（mode={trigger_mode}, cron={cron_minutes}m）"
+                    created_task = result.get("task", {}) if isinstance(result.get("task", {}), dict) else {}
+                    mes = _build_task_new_success_text(task_name, trigger_mode, cron_minutes, created_task)
                 else:
                     mes = f"❌ 创建失败：{result.get('error', 'unknown')}"
                 await send_to_admin(client, mes, user_ctx, global_config)
                 return
 
             if sub_cmd == "show":
-                if len(my) < 3:
-                    await send_to_admin(client, "用法：`task show <name>`", user_ctx, global_config)
+                task_name = str(my[2]).strip() if len(my) >= 3 else str(rt.get("current_task_name", "") or "").strip()
+                if not task_name:
+                    await send_to_admin(client, "当前没有运行任务。用法：`task show <name>`", user_ctx, global_config)
                     return
-                mes = adaptive_tasks.format_task_detail(user_ctx, str(my[2]).strip())
+                mes = adaptive_tasks.format_task_detail(user_ctx, task_name)
+                message = await send_to_admin(client, mes, user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 180))
+                return
+
+            if sub_cmd in {"panel", "status"}:
+                mes = adaptive_tasks.format_task_runtime_panel(user_ctx)
                 message = await send_to_admin(client, mes, user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
                 if message:
@@ -5074,13 +5578,74 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 return
 
             if sub_cmd in {"pause", "resume"}:
+                if len(my) > 2:
+                    await send_to_admin(client, f"用法：`task {sub_cmd}`", user_ctx, global_config)
+                    return
+
+                if not _is_task_mode_guard_active(rt):
+                    await send_to_admin(
+                        client,
+                        "当前非任务模式。请先执行 `ms task`，再使用 `task run <name>` 启动任务。",
+                        user_ctx,
+                        global_config,
+                    )
+                    return
+
+                if sub_cmd == "pause":
+                    result = adaptive_tasks.pause_task_mode(user_ctx, reason="manual_pause")
+                    if result.get("ok"):
+                        _set_task_mode_state(rt, "paused_manual", "manual_pause")
+                        await _clear_pause_countdown_notice(client, user_ctx)
+                        rt["switch"] = True
+                        rt["bet_on"] = False
+                        rt["bet"] = False
+                        rt["mode_stop"] = True
+                        rt["manual_pause"] = True
+                        _clear_lose_recovery_tracking(rt)
+                        user_ctx.save_state()
+                        run_id = str(result.get("task_run_id", "") or "").strip()
+                        if run_id:
+                            mes = (
+                                "⏸ 任务模式已手动暂停\n"
+                                f"- 任务：`{result.get('task_name', '-')}`\n"
+                                f"- run_id：{run_id}"
+                            )
+                        else:
+                            mes = "⏸ 任务模式已手动暂停（当前无运行中的 task run）"
+                    elif result.get("error") == "already_paused":
+                        mes = "⏸ 当前任务模式已是手动暂停状态"
+                    else:
+                        mes = "❌ 任务模式暂停失败"
+                else:
+                    result = adaptive_tasks.resume_task_mode(user_ctx)
+                    if result.get("ok"):
+                        await _clear_pause_countdown_notice(client, user_ctx)
+                        rt["switch"] = True
+                        rt["bet_on"] = True
+                        rt["bet"] = False
+                        rt["mode_stop"] = True
+                        rt["manual_pause"] = False
+                        _set_task_mode_state(rt, str(result.get("state", "idle") or "idle"), "")
+                        user_ctx.save_state()
+                        if str(result.get("state", "idle")) == "running":
+                            mes = "▶️ 任务模式已恢复（当前任务继续运行）"
+                        else:
+                            mes = "▶️ 任务模式已恢复（等待下一次任务触发）"
+                    elif result.get("error") == "not_paused":
+                        mes = "当前任务模式不在暂停状态"
+                    else:
+                        mes = "❌ 任务模式恢复失败"
+                await send_to_admin(client, mes, user_ctx, global_config)
+                return
+
+            if sub_cmd in {"disable", "enable"}:
                 if len(my) < 3:
                     await send_to_admin(client, f"用法：`task {sub_cmd} <name>`", user_ctx, global_config)
                     return
                 task_name = str(my[2]).strip()
-                result = adaptive_tasks.set_task_enabled(user_ctx, task_name, enabled=(sub_cmd == "resume"))
+                result = adaptive_tasks.set_task_enabled(user_ctx, task_name, enabled=(sub_cmd == "enable"))
                 if result.get("ok"):
-                    state_text = "已恢复" if sub_cmd == "resume" else "已暂停"
+                    state_text = "已启用" if sub_cmd == "enable" else "已停用"
                     mes = f"✅ 任务 `{task_name}` {state_text}"
                 else:
                     mes = f"❌ 操作失败：{result.get('error', 'unknown')}"
@@ -5094,18 +5659,83 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 task_name = str(my[2]).strip()
                 result = adaptive_tasks.start_task(user_ctx, task_name, trigger_type="manual")
                 if result.get("ok"):
+                    _set_run_mode(rt, "task")
+                    rt["risk_base_enabled"] = False
+                    rt["risk_deep_enabled"] = False
+                    rt["risk_light_enabled"] = False
+                    _normalize_risk_switches(rt, apply_default=False)
+                    user_ctx.save_state()
                     rec = result.get("recommendation", {})
+                    limits = result.get("limits", {}) if isinstance(result.get("limits", {}), dict) else {}
                     mes = (
                         f"✅ 任务 `{task_name}` 已启动\n"
-                        f"- run_id: {result.get('task_run_id', '-')}\n"
-                        f"- regime: {rec.get('regime', '-')}\n"
-                        f"- preset: {result.get('preset', '-')}\n"
-                        f"- planned_rounds: {rec.get('planned_rounds', 0)}\n"
-                        f"- recheck_interval: {rec.get('recheck_interval', 0)}"
+                        f"- run_id：{result.get('task_run_id', '-')}\n"
+                        f"- 盘面：{_task_regime_text(rec.get('regime', '-'))}\n"
+                        f"- 档位：{result.get('preset', '-')}\n"
+                        f"- 本阶段计划：{rec.get('planned_rounds', 0)} 局（约每 {rec.get('recheck_interval', 0)} 局复评，后续会动态重算）\n"
+                        "- 风控：任务模式下已关闭基础/深度/轻度风控\n"
+                        f"- 风控阈值：任务止损 {limits.get('run_loss_limit', 0)} | 日损 {limits.get('day_loss_limit', 0)}\n"
+                        "- 查看详情：`task panel`"
                     )
                 else:
-                    mes = f"❌ 启动失败：{result.get('error', result.get('reason', 'unknown'))}"
+                    mes = _format_task_start_error(user_ctx, result.get("error", result.get("reason", "unknown")))
                 await send_to_admin(client, mes, user_ctx, global_config)
+                return
+
+            if sub_cmd in {"stop", "end", "exit"}:
+                active_name = str(rt.get("current_task_name", "") or "").strip()
+                active_run_id = str(rt.get("current_task_run_id", "") or "").strip()
+                if not active_run_id:
+                    if _is_task_mode(rt):
+                        _set_run_mode(rt, "normal")
+                        user_ctx.save_state()
+                        await send_to_admin(
+                            client,
+                            "✅ 当前无运行中的任务，已退出任务模式（切回普通模式）。",
+                            user_ctx,
+                            global_config,
+                        )
+                    else:
+                        await send_to_admin(
+                            client,
+                            "当前没有运行中的任务。\n可用 `task run <name>` 启动任务。",
+                            user_ctx,
+                            global_config,
+                        )
+                    return
+                result = adaptive_tasks.stop_current_task(user_ctx, reason="manual_stop")
+                if result.get("ok"):
+                    _set_run_mode(rt, "normal")
+                    user_ctx.save_state()
+                    mes = (
+                        "🛑 任务已手动结束\n"
+                        f"- 任务：`{result.get('task_name', active_name or '-')}`\n"
+                        f"- run_id：{result.get('task_run_id', active_run_id)}\n"
+                        f"- 结束状态：{result.get('status', 'stopped')}\n"
+                        f"- 原因：{result.get('reason', 'manual_stop')}"
+                    )
+                else:
+                    mes = f"❌ 结束任务失败：{result.get('error', 'unknown')}"
+                await send_to_admin(client, mes, user_ctx, global_config)
+                return
+
+            if sub_cmd == "auto":
+                if len(my) < 3:
+                    state_text = "开启" if _to_bool_switch(rt.get("task_auto_enabled", True), True) else "关闭"
+                    await send_to_admin(client, f"任务自动触发当前：{state_text}\n用法：`task auto on|off`", user_ctx, global_config)
+                    return
+                action = str(my[2]).strip().lower()
+                if action not in {"on", "off"}:
+                    await send_to_admin(client, "参数错误，用法：`task auto on|off`", user_ctx, global_config)
+                    return
+                rt["task_auto_enabled"] = action == "on"
+                user_ctx.save_state()
+                await send_to_admin(
+                    client,
+                    f"✅ 任务自动触发已{'开启' if rt['task_auto_enabled'] else '关闭'}",
+                    user_ctx,
+                    global_config,
+                )
                 return
 
             if sub_cmd == "logs":
@@ -5147,11 +5777,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
             await send_to_admin(
                 client,
-                (
-                    "用法：`task new/list/show/pause/resume/run/logs/stats`\n"
-                    "- `task new <name> [cron_minutes] [time|regime|hybrid]`\n"
-                    "- `task run <name>`"
-                ),
+                f"❌ 未知 task 子命令：`{sub_cmd}`\n{_build_task_usage_text()}",
                 user_ctx,
                 global_config,
             )
@@ -5161,6 +5787,34 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         if cmd == "st" and len(my) > 1:
             preset_name = my[1]
             if preset_name in presets:
+                active_run_id = str(rt.get("current_task_run_id", "") or "").strip()
+                if active_run_id:
+                    stop_result = adaptive_tasks.stop_current_task(user_ctx, reason="manual_preset_switch")
+                    if stop_result.get("ok"):
+                        await send_to_admin(
+                            client,
+                            (
+                                "🛑 检测到任务模式正在运行，已自动结束任务以切换预设\n"
+                                f"- 任务：`{stop_result.get('task_name', '-')}`\n"
+                                f"- run_id：{stop_result.get('task_run_id', active_run_id)}\n"
+                                "- 原因：执行 `st` 手动切换预设"
+                            ),
+                            user_ctx,
+                            global_config,
+                        )
+                    else:
+                        await send_to_admin(
+                            client,
+                            (
+                                "⚠️ 检测到任务模式运行中，但自动结束任务失败。\n"
+                                f"错误：{stop_result.get('error', 'unknown')}\n"
+                                "建议先执行 `task stop` 后再执行 `st <预设名>`。"
+                            ),
+                            user_ctx,
+                            global_config,
+                        )
+                        return
+
                 preset = presets[preset_name]
                 rt["continuous"] = int(preset[0])
                 rt["lose_stop"] = int(preset[1])
@@ -5587,11 +6241,29 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     user_ctx.save_state()
                     mes = f"押注策略已重置: 初始金额={rt.get('initial_amount', 500)}"
                     log_event(logging.INFO, 'user_cmd', '重置押注策略', user_id=user_ctx.user_id, action='completed')
+                elif my[1] == "task":
+                    reset_result = adaptive_tasks.reset_task_mode_state(user_ctx, reset_day_loss=True)
+                    mes = (
+                        "✅ 任务模式状态已强制刷新\n"
+                        f"- 运行模式：{_run_mode_text(rt)}\n"
+                        f"- 任务模式状态：{_task_mode_state_text(rt)}\n"
+                        f"- 清理任务条目：{reset_result.get('reset_task_count', 0)}\n"
+                        "- 可继续：`ms task` → `task run <name>`"
+                    )
+                    log_event(
+                        logging.INFO,
+                        'user_cmd',
+                        '重置任务状态',
+                        user_id=user_ctx.user_id,
+                        action='completed',
+                        reset_count=reset_result.get('reset_task_count', 0),
+                        active_run_stopped=reset_result.get('active_run_stopped', False),
+                    )
                 else:
-                    mes = "无效命令，正确格式：res tj 或 res state 或 res bet"
+                    mes = "无效命令，正确格式：res tj 或 res state 或 res bet 或 res task"
                     log_event(logging.WARNING, 'user_cmd', '无效重置命令', user_id=user_ctx.user_id, cmd=text)
             else:
-                mes = "请指定重置类型：res tj / res state / res bet"
+                mes = "请指定重置类型：res tj / res state / res bet / res task"
             
             message = await send_to_admin(client, mes, user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
@@ -5709,25 +6381,73 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             return
         
-        # ms - 切换模式 - 与master一致
+        # ms - 切换模式（投注模式 + 运行模式）
         if cmd == "ms":
+            mode_names = {0: "反投", 1: "预测", 2: "追投"}
+            current_bet_mode = int(rt.get("bet_mode", 1) or 1)
+            current_run_mode = _run_mode_text(rt)
+
             if len(my) > 1:
-                try:
-                    mode = int(my[1])
-                    mode_names = {0: "反投", 1: "预测", 2: "追投"}
-                    if mode in mode_names:
-                        rt["bet_mode"] = mode
-                        user_ctx.save_state()
-                        mes = f"模式已切换: {mode_names[mode]} ({mode})"
-                        log_event(logging.INFO, 'user_cmd', '切换模式', user_id=user_ctx.user_id, mode=mode)
-                    else:
-                        mes = "无效模式: 0=反投, 1=预测, 2=追投"
-                except ValueError:
-                    mes = "模式必须是数字: 0, 1, 或 2"
+                arg = str(my[1]).strip().lower()
+                if arg in {"task", "t", "任务"}:
+                    _set_run_mode(rt, "task")
+                    rt["risk_base_enabled"] = False
+                    rt["risk_deep_enabled"] = False
+                    rt["risk_light_enabled"] = False
+                    _normalize_risk_switches(rt, apply_default=False)
+                    user_ctx.save_state()
+                    mes = "✅ 已切换到任务模式\n- 已自动关闭当前基础/深度/轻度风控"
+                    if not str(rt.get("current_task_run_id", "") or "").strip():
+                        mes += "\n提示：可用 `task run <name>` 启动任务。"
+                    log_event(logging.INFO, 'user_cmd', '切换运行模式', user_id=user_ctx.user_id, run_mode="task")
+                elif arg in {"normal", "n", "普通"}:
+                    active_run_id = str(rt.get("current_task_run_id", "") or "").strip()
+                    extra = ""
+                    if active_run_id:
+                        stop_result = adaptive_tasks.stop_current_task(user_ctx, reason="manual_mode_switch")
+                        if stop_result.get("ok"):
+                            extra = (
+                                "\n🛑 已结束当前任务运行\n"
+                                f"- 任务：`{stop_result.get('task_name', '-')}`\n"
+                                f"- run_id：{stop_result.get('task_run_id', active_run_id)}"
+                            )
+                        else:
+                            await send_to_admin(
+                                client,
+                                (
+                                    "❌ 切换失败：检测到任务运行中且结束失败。\n"
+                                    f"错误：{stop_result.get('error', 'unknown')}\n"
+                                    "请先执行 `task stop`。"
+                                ),
+                                user_ctx,
+                                global_config,
+                            )
+                            return
+                    _set_run_mode(rt, "normal")
+                    _normalize_risk_switches(rt, apply_default=True)
+                    user_ctx.save_state()
+                    mes = f"✅ 已切换到普通模式（已恢复账号默认风控）{extra}"
+                    log_event(logging.INFO, 'user_cmd', '切换运行模式', user_id=user_ctx.user_id, run_mode="normal")
+                else:
+                    try:
+                        mode = int(arg)
+                        if _is_task_mode_guard_active(rt):
+                            mes = _task_mode_block_message("ms", rt)
+                        elif mode in mode_names:
+                            rt["bet_mode"] = mode
+                            user_ctx.save_state()
+                            mes = f"投注模式已切换: {mode_names[mode]} ({mode})"
+                            log_event(logging.INFO, 'user_cmd', '切换投注模式', user_id=user_ctx.user_id, mode=mode)
+                        else:
+                            mes = "无效投注模式: 0=反投, 1=预测, 2=追投"
+                    except ValueError:
+                        mes = "用法：`ms [0|1|2]`（投注模式）或 `ms [normal|task]`（运行模式）"
             else:
-                current_mode = rt.get("bet_mode", 1)
-                mode_names = {0: "反投", 1: "预测", 2: "追投"}
-                mes = f"当前模式: {mode_names.get(current_mode, '未知')} ({current_mode})\n用法: ms [0|1|2]"
+                mes = (
+                    f"当前运行模式：{current_run_mode}\n"
+                    f"当前投注模式：{mode_names.get(current_bet_mode, '未知')} ({current_bet_mode})\n"
+                    "用法：`ms [0|1|2]`（投注模式）或 `ms [normal|task]`（运行模式）"
+                )
             
             message = await send_to_admin(client, mes, user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))

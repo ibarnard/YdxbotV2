@@ -2483,6 +2483,77 @@ def test_format_dashboard_shows_software_version_and_preset_lines(tmp_path, monk
     assert "🤖 **预设参数：1 11 2.8 2.3 2.2 2.05 10000**" in msg
 
 
+def test_format_dashboard_hides_task_hint_when_not_running(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5114"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "仪表盘简洁用户"},
+            "telegram": {"user_id": 5114},
+            "groups": {"admin_chat": 5114},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [1, 0] * 30
+
+    monkeypatch.setattr(zm, "get_current_repo_info", lambda: {"current_tag": "v1.0.10", "nearest_tag": "v1.0.10", "short_commit": "abcd1234"})
+
+    msg = zm.format_dashboard(ctx)
+    assert "🧩 **任务模式：运行中**" not in msg
+    assert "详情：`task panel`" not in msg
+
+
+def test_format_dashboard_shows_task_hint_when_task_mode_idle(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "51130"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务待机提示用户"},
+            "telegram": {"user_id": 51130},
+            "groups": {"admin_chat": 51130},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [1, 0] * 30
+    ctx.state.runtime["run_mode"] = "task"
+    ctx.state.runtime["task_mode_state"] = "idle"
+    ctx.state.runtime["current_task_run_id"] = ""
+    ctx.state.runtime["current_task_name"] = ""
+    ctx.save_state()
+
+    monkeypatch.setattr(zm, "get_current_repo_info", lambda: {"current_tag": "v1.0.10", "nearest_tag": "v1.0.10", "short_commit": "abcd1234"})
+    msg = zm.format_dashboard(ctx)
+    assert "🧩 **任务状态栏**｜待机" in msg
+    assert "task run <name>" in msg
+
+
+def test_format_dashboard_highlights_task_mode_when_running(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5113"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务仪表盘用户"},
+            "telegram": {"user_id": 5113},
+            "groups": {"admin_chat": 5113},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [1, 0] * 30
+    created = zm.adaptive_tasks.create_task(ctx, "daily_mix", cron_minutes=15, mode="hybrid")
+    assert created["ok"] is True
+    started = zm.adaptive_tasks.start_task(ctx, "daily_mix", trigger_type="manual")
+    assert started["ok"] is True
+
+    monkeypatch.setattr(zm, "get_current_repo_info", lambda: {"current_tag": "v1.0.10", "nearest_tag": "v1.0.10", "short_commit": "abcd1234"})
+    msg = zm.format_dashboard(ctx)
+    assert "🧩 **任务状态栏**｜运行中" in msg
+    assert "`daily_mix`" in msg
+    assert "`task panel`" in msg
+
+
 def test_st_command_triggers_auto_yc_report(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "5008"
     _write_json(
@@ -2517,6 +2588,574 @@ def test_st_command_triggers_auto_yc_report(tmp_path, monkeypatch):
     assert any("🔮 已根据当前预设自动测算" in msg for msg in sent_messages)
     assert any("🎯 策略参数" in msg for msg in sent_messages)
     assert any("连数|倍率|下注| 盈利 |所需本金" in msg for msg in sent_messages)
+
+
+def test_task_show_without_name_defaults_to_current_task(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5110"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务详情用户"},
+            "telegram": {"user_id": 5110},
+            "groups": {"admin_chat": 5110},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [0, 1] * 30
+    assert zm.adaptive_tasks.create_task(ctx, "focus_task", cron_minutes=10, mode="hybrid")["ok"] is True
+    assert zm.adaptive_tasks.start_task(ctx, "focus_task", trigger_type="manual")["ok"] is True
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5110, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    cmd_event = SimpleNamespace(raw_text="task show", chat_id=5110, id=60)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert sent_messages
+    assert "🧩 任务 `focus_task` 详情" in sent_messages[-1]
+    assert "当前运行状态：运行中" in sent_messages[-1]
+
+
+def test_task_panel_command_shows_detailed_runtime_panel(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5115"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务面板用户"},
+            "telegram": {"user_id": 5115},
+            "groups": {"admin_chat": 5115},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [0, 1] * 30
+    assert zm.adaptive_tasks.create_task(ctx, "panel_task", cron_minutes=10, mode="hybrid")["ok"] is True
+    assert zm.adaptive_tasks.start_task(ctx, "panel_task", trigger_type="manual")["ok"] is True
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5115, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    cmd_event = SimpleNamespace(raw_text="task panel", chat_id=5115, id=63)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert sent_messages
+    assert "🧩 **任务状态栏**" in sent_messages[-1]
+    assert "进度：" in sent_messages[-1]
+
+
+def test_task_new_command_accepts_risk_params(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5121"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务参数用户"},
+            "telegram": {"user_id": 5121},
+            "groups": {"admin_chat": 5121},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5121, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    cmd_event = SimpleNamespace(
+        raw_text="task new tune1 10 hybrid task_loss_pct=0.01 daily_loss_pct=0.03 max_consecutive_losses=6",
+        chat_id=5121,
+        id=73,
+    )
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    tasks = ctx.get_tasks()
+    assert len(tasks) == 1
+    task = tasks[0]
+    assert task.get("name") == "tune1"
+    assert float(task.get("task_loss_pct", 0)) == 0.01
+    assert float(task.get("daily_loss_pct", 0)) == 0.03
+    assert int(task.get("max_consecutive_losses", 0)) == 6
+    assert any("任务 `tune1` 已创建" in msg for msg in sent_messages)
+    assert any("风控阈值" in msg for msg in sent_messages)
+    assert any("下一步：`ms task`" in msg for msg in sent_messages)
+
+
+def test_task_pause_resume_state_machine_in_task_mode(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5119"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务状态机用户"},
+            "telegram": {"user_id": 5119},
+            "groups": {"admin_chat": 5119},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [0, 1] * 30
+    assert zm.adaptive_tasks.create_task(ctx, "fsm_task", cron_minutes=10, mode="hybrid")["ok"] is True
+    assert zm.adaptive_tasks.start_task(ctx, "fsm_task", trigger_type="manual")["ok"] is True
+    ctx.state.runtime["run_mode"] = "task"
+    ctx.save_state()
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5119, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="task pause", chat_id=5119, id=70), ctx, {}))
+    assert ctx.state.runtime.get("task_mode_state", "idle") == "paused_manual"
+    assert ctx.state.runtime.get("manual_pause", False) is True
+    assert any("任务模式已手动暂停" in msg for msg in sent_messages)
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="task resume", chat_id=5119, id=71), ctx, {}))
+    assert ctx.state.runtime.get("task_mode_state", "idle") == "running"
+    assert ctx.state.runtime.get("manual_pause", True) is False
+    assert any("任务模式已恢复" in msg for msg in sent_messages)
+
+
+def test_task_resume_recovers_from_risk_paused_state(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5120"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "风控暂停用户"},
+            "telegram": {"user_id": 5120},
+            "groups": {"admin_chat": 5120},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.runtime["run_mode"] = "task"
+    ctx.state.runtime["task_mode_state"] = "paused_risk"
+    ctx.state.runtime["task_freeze_until"] = "2099-01-01 00:00:00"
+    ctx.state.runtime["task_freeze_reason"] = "risk pause"
+    ctx.save_state()
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5120, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="task resume", chat_id=5120, id=72), ctx, {}))
+
+    assert ctx.state.runtime.get("task_mode_state", "idle") == "idle"
+    assert any("任务模式已恢复" in msg for msg in sent_messages)
+
+
+def test_task_run_clears_stale_risk_pause_state(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5123"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "风控冻结引导用户"},
+            "telegram": {"user_id": 5123},
+            "groups": {"admin_chat": 5123},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [0, 1] * 30
+    assert zm.adaptive_tasks.create_task(ctx, "freeze_task", cron_minutes=10, mode="hybrid")["ok"] is True
+    ctx.state.runtime["run_mode"] = "task"
+    ctx.state.runtime["task_mode_state"] = "paused_risk"
+    ctx.state.runtime["task_freeze_until"] = "2099-01-01 00:00:00"
+    ctx.state.runtime["task_freeze_reason"] = "daily loss limit reached (12000/10000)"
+    ctx.save_state()
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5123, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="task run freeze_task", chat_id=5123, id=75), ctx, {}))
+
+    assert sent_messages
+    assert any("任务 `freeze_task` 已启动" in msg for msg in sent_messages)
+
+
+def test_res_task_force_refresh_clears_task_risk_states(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5122"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务强刷用户"},
+            "telegram": {"user_id": 5122},
+            "groups": {"admin_chat": 5122},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    assert zm.adaptive_tasks.create_task(ctx, "reset_me", cron_minutes=10, mode="hybrid")["ok"] is True
+
+    ctx.state.runtime["run_mode"] = "task"
+    ctx.state.runtime["task_mode_state"] = "paused_risk"
+    ctx.state.runtime["task_mode_pause_reason"] = "daily loss limit reached"
+    ctx.state.runtime["task_freeze_until"] = "2099-01-01 00:00:00"
+    ctx.state.runtime["task_freeze_reason"] = "daily loss limit reached"
+    ctx.state.runtime["task_day_loss_acc"] = 25000
+    ctx.state.runtime["task_day_loss_date"] = "2026-03-05"
+    tasks = ctx.get_tasks()
+    tasks[0].setdefault("runtime", {})["status"] = "daily_stop"
+    ctx.save_state()
+    ctx.save_tasks()
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5122, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    cmd_event = SimpleNamespace(raw_text="res task", chat_id=5122, id=74)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert ctx.state.runtime.get("run_mode", "normal") == "normal"
+    assert ctx.state.runtime.get("task_mode_state", "idle") == "idle"
+    assert ctx.state.runtime.get("task_freeze_until", "") == ""
+    assert ctx.state.runtime.get("task_day_loss_acc", 1) == 0
+    assert ctx.get_tasks()[0].get("runtime", {}).get("status") == "idle"
+    assert any("强制刷新" in msg for msg in sent_messages)
+
+
+def test_task_stop_command_ends_running_task(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5111"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务停止用户"},
+            "telegram": {"user_id": 5111},
+            "groups": {"admin_chat": 5111},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [0, 1] * 30
+    assert zm.adaptive_tasks.create_task(ctx, "stop_me", cron_minutes=10, mode="hybrid")["ok"] is True
+    assert zm.adaptive_tasks.start_task(ctx, "stop_me", trigger_type="manual")["ok"] is True
+    assert ctx.state.runtime.get("current_task_run_id", "") != ""
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5111, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    cmd_event = SimpleNamespace(raw_text="task stop", chat_id=5111, id=61)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert ctx.state.runtime.get("current_task_run_id", "") == ""
+    assert ctx.state.runtime.get("run_mode", "normal") == "normal"
+    assert any("任务已手动结束" in msg for msg in sent_messages)
+
+
+def test_task_stop_without_active_run_exits_task_mode(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5116"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务模式退出用户"},
+            "telegram": {"user_id": 5116},
+            "groups": {"admin_chat": 5116},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.runtime["run_mode"] = "task"
+    ctx.state.runtime["current_task_run_id"] = ""
+    ctx.save_state()
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5116, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    cmd_event = SimpleNamespace(raw_text="task stop", chat_id=5116, id=66)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert ctx.state.runtime.get("run_mode", "normal") == "normal"
+    assert any("已退出任务模式" in msg for msg in sent_messages)
+
+
+def test_ms_command_switches_run_mode(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5117"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "模式切换用户"},
+            "telegram": {"user_id": 5117},
+            "groups": {"admin_chat": 5117},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5117, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="ms task", chat_id=5117, id=67), ctx, {}))
+    assert ctx.state.runtime.get("run_mode", "normal") == "task"
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="ms normal", chat_id=5117, id=68), ctx, {}))
+    assert ctx.state.runtime.get("run_mode", "normal") == "normal"
+    assert any("已切换到任务模式" in msg for msg in sent_messages)
+    assert any("已切换到普通模式" in msg for msg in sent_messages)
+
+
+def test_ms_task_disables_all_risk_switches(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "51171"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "模式风控用户"},
+            "telegram": {"user_id": 51171},
+            "groups": {"admin_chat": 51171},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=51171, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="ms task", chat_id=51171, id=671), ctx, {}))
+    assert ctx.state.runtime.get("risk_base_enabled", True) is False
+    assert ctx.state.runtime.get("risk_deep_enabled", True) is False
+    assert ctx.state.runtime.get("risk_light_enabled", True) is False
+    assert any("自动关闭当前基础/深度/轻度风控" in msg for msg in sent_messages)
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="ms normal", chat_id=51171, id=672), ctx, {}))
+    assert ctx.state.runtime.get("risk_base_enabled", False) is True
+    assert ctx.state.runtime.get("risk_deep_enabled", False) is True
+    assert ctx.state.runtime.get("risk_light_enabled", False) is True
+
+
+def test_risk_light_command_updates_switch_and_default(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "51172"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "轻度风控用户"},
+            "telegram": {"user_id": 51172},
+            "groups": {"admin_chat": 51172},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=51172, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="risk light off", chat_id=51172, id=673), ctx, {}))
+    assert ctx.state.runtime.get("risk_light_enabled", True) is False
+    assert ctx.state.runtime.get("risk_light_default_enabled", True) is False
+
+    asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="risk light on", chat_id=51172, id=674), ctx, {}))
+    assert ctx.state.runtime.get("risk_light_enabled", False) is True
+    assert ctx.state.runtime.get("risk_light_default_enabled", False) is True
+    assert any("轻度风控" in msg for msg in sent_messages)
+
+
+def test_ms_numeric_blocked_in_task_mode(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5118"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "模式拦截用户"},
+            "telegram": {"user_id": 5118},
+            "groups": {"admin_chat": 5118},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.runtime["run_mode"] = "task"
+    ctx.state.runtime["bet_mode"] = 2
+    ctx.save_state()
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5118, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    cmd_event = SimpleNamespace(raw_text="ms 1", chat_id=5118, id=69)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert ctx.state.runtime.get("bet_mode", 0) == 2
+    assert any("当前为任务模式" in msg for msg in sent_messages)
+
+
+def test_st_command_blocked_when_task_mode_active(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5112"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务冲突用户"},
+            "telegram": {"user_id": 5112},
+            "groups": {"admin_chat": 5112},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [0, 1] * 30
+    assert zm.adaptive_tasks.create_task(ctx, "switch_task", cron_minutes=10, mode="hybrid")["ok"] is True
+    ctx.state.runtime["run_mode"] = "task"
+    ctx.state.runtime["current_preset_name"] = "yc1"
+    ctx.save_state()
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5112, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    cmd_event = SimpleNamespace(raw_text="st yc05", chat_id=5112, id=62)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert ctx.state.runtime.get("current_preset_name") == "yc1"
+    assert any("当前为任务模式" in msg for msg in sent_messages)
+    assert any("命令 `st` 无效" in msg for msg in sent_messages)
+    assert any("普通改档命令已锁定" in msg for msg in sent_messages)
+
+
+def test_help_command_contains_task_usage_section(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5108"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "帮助用户"},
+            "telegram": {"user_id": 5108},
+            "groups": {"admin_chat": 5108},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5108, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    cmd_event = SimpleNamespace(raw_text="help", chat_id=5108, id=41)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert sent_messages
+    msg = sent_messages[-1]
+    assert "**任务系统（v2-adaptive）**" in msg
+    assert "`task help`" in msg
+    assert "`task new <name> [cron_minutes] [time|regime|hybrid]`" in msg
+    assert "`task logs [name] [limit]`" in msg
+
+
+def test_task_help_command_shows_detailed_usage(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5109"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "任务帮助用户"},
+            "telegram": {"user_id": 5109},
+            "groups": {"admin_chat": 5109},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5109, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    cmd_event = SimpleNamespace(raw_text="task help", chat_id=5109, id=42)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert sent_messages
+    msg = sent_messages[-1]
+    assert "**任务系统（v2-adaptive）**" in msg
+    assert "`task list`" in msg
+    assert "`task run <name>`" in msg
+    assert "示例：`task new day15 15 hybrid`" in msg
 
 
 def test_xx_command_cleans_messages_in_config_groups(tmp_path, monkeypatch):
@@ -2681,13 +3320,8 @@ def test_process_red_packet_ignores_game_message(tmp_path, monkeypatch):
 
 
 def test_compute_replay_linkage_coverage_only_counts_settled_records():
-    settled_tokens = next(
-        const
-        for const in zm._compute_replay_linkage_coverage.__code__.co_consts[1].co_consts
-        if isinstance(const, tuple) and len(const) >= 2 and all(isinstance(item, str) for item in const)
-    )
-    win_token = settled_tokens[0]
-    lose_token = settled_tokens[1]
+    win_token = "赢"
+    lose_token = "输"
     abnormal_token = "abnormal"
 
     state = SimpleNamespace(

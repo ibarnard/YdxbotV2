@@ -195,8 +195,10 @@ def get_default_runtime() -> Dict[str, Any]:
         # 账号级默认风控开关：脚本启动时会按该默认值恢复当前开关状态。
         "risk_base_default_enabled": True,
         "risk_deep_default_enabled": True,
+        "risk_light_default_enabled": True,
         "risk_base_enabled": True,
         "risk_deep_enabled": True,
+        "risk_light_enabled": True,
         "risk_pause_level1_hit": False,
         "risk_deep_triggered_milestones": [],
         "risk_pause_priority_notified": False,
@@ -267,6 +269,9 @@ def get_default_runtime() -> Dict[str, Any]:
         "current_model_id": "qwen3-coder-plus",
         
         # 预设相关
+        "run_mode": "normal",
+        "task_mode_state": "idle",
+        "task_mode_pause_reason": "",
         "current_preset_name": "",
         "current_task_name": "",
         "current_task_run_id": "",
@@ -281,6 +286,8 @@ def get_default_runtime() -> Dict[str, Any]:
         "task_run_pnl": 0,
         "task_run_peak": 0,
         "task_run_max_dd": 0,
+        "task_run_total_rounds": 0,
+        "task_cycle_last_report_round": 0,
         "task_run_loss_limit": 0,
         "task_day_loss_limit": 0,
         "task_day_loss_acc": 0,
@@ -462,6 +469,10 @@ class UserContext:
                 if "risk_deep_default_enabled" not in saved_runtime:
                     merged_runtime["risk_deep_default_enabled"] = bool(
                         merged_runtime.get("risk_deep_enabled", True)
+                    )
+                if "risk_light_default_enabled" not in saved_runtime:
+                    merged_runtime["risk_light_default_enabled"] = bool(
+                        merged_runtime.get("risk_light_enabled", True)
                     )
                 
                 self.state = UserState(
