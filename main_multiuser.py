@@ -578,6 +578,7 @@ async def start_user(user_ctx: UserContext, global_config: dict):
 
         # 启动恢复：按账号默认风控模式生效，并清理历史遗留挂单。
         from zq_multiuser import (
+            adaptive_task_scheduler_loop,
             apply_account_risk_default_mode,
             build_startup_focus_reminder,
             heal_stale_pending_bets,
@@ -592,6 +593,39 @@ async def start_user(user_ctx: UserContext, global_config: dict):
             deep=risk_mode.get("deep_enabled"),
         )
         heal_result = heal_stale_pending_bets(user_ctx)
+
+        # 启动时初始化分析资产库，确保 task/replay 可直接回溯复盘。
+        try:
+            from adaptive_analytics import (
+                ingest_user_history,
+                linkage_coverage_report,
+                refresh_regime_preset_stats,
+            )
+
+            ingest_report = ingest_user_history(user_ctx)
+            refresh_report = refresh_regime_preset_stats(user_ctx)
+            coverage = linkage_coverage_report(user_ctx)
+            user_ctx.state.runtime["analytics_coverage_pct"] = coverage.get("coverage_pct", 0.0)
+            user_ctx.state.runtime["analytics_last_ingest_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            log_event(
+                logging.INFO,
+                'start',
+                '分析资产库初始化完成',
+                user_id=user_ctx.user_id,
+                decision_rows=ingest_report.get("decision_rows", 0),
+                bet_rows=ingest_report.get("bet_rows", 0),
+                settle_rows=ingest_report.get("settle_rows", 0),
+                stats_updated=refresh_report.get("updated", 0),
+                coverage=coverage.get("coverage_pct", 0.0),
+            )
+        except Exception as analytics_e:
+            log_event(
+                logging.WARNING,
+                'start',
+                '分析资产库初始化失败',
+                user_id=user_ctx.user_id,
+                error=str(analytics_e),
+            )
 
         user_ctx.save_state()
 
@@ -630,6 +664,18 @@ async def start_user(user_ctx: UserContext, global_config: dict):
             try:
                 focus_msg = build_startup_focus_reminder(user_ctx)
                 await client.send_message(admin_chat, focus_msg)
+                try:
+                    task_count = len(user_ctx.get_tasks()) if hasattr(user_ctx, "get_tasks") else 0
+                    from adaptive_tasks import format_current_task_brief
+                    extra_focus = (
+                        "任务重点提醒\n"
+                        f"- 已配置任务数：{task_count}\n"
+                        f"- 当前任务：{format_current_task_brief(user_ctx)}\n"
+                        f"- 链路覆盖率：{user_ctx.state.runtime.get('analytics_coverage_pct', '-')}"
+                    )
+                    await client.send_message(admin_chat, extra_focus)
+                except Exception:
+                    pass
             except Exception as e:
                 log_event(
                     logging.ERROR,
@@ -638,6 +684,27 @@ async def start_user(user_ctx: UserContext, global_config: dict):
                     user_id=user_ctx.user_id,
                     error=str(e),
                 )
+
+        # 后台任务调度（每账号独立）
+        try:
+            scheduler_task = asyncio.create_task(
+                adaptive_task_scheduler_loop(client, user_ctx, global_config)
+            )
+            setattr(user_ctx, "_task_scheduler", scheduler_task)
+            log_event(
+                logging.INFO,
+                'start',
+                '任务调度协程已启动',
+                user_id=user_ctx.user_id,
+            )
+        except Exception as scheduler_e:
+            log_event(
+                logging.WARNING,
+                'start',
+                '任务调度协程启动失败',
+                user_id=user_ctx.user_id,
+                error=str(scheduler_e),
+            )
         
         log_event(logging.INFO, 'start', '用户启动成功',
                   user_id=user_ctx.user_id, name=user_ctx.config.name, balance=balance)
@@ -716,6 +783,12 @@ async def main():
         await asyncio.gather(*tasks, return_exceptions=True)
     finally:
         for user_ctx in user_manager.get_all_users().values():
+            scheduler = getattr(user_ctx, "_task_scheduler", None)
+            if scheduler:
+                try:
+                    scheduler.cancel()
+                except Exception:
+                    pass
             user_ctx.save_state()
             _release_session_lock(user_ctx)
     

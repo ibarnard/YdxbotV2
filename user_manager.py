@@ -268,6 +268,27 @@ def get_default_runtime() -> Dict[str, Any]:
         
         # 预设相关
         "current_preset_name": "",
+        "current_task_name": "",
+        "current_task_run_id": "",
+        "current_task_trigger": "",
+        "task_policy_id": "",
+        "task_regime": "",
+        "task_recheck_interval": 0,
+        "task_step_no": 0,
+        "task_step_planned_rounds": 0,
+        "task_step_executed_rounds": 0,
+        "task_step_remaining_rounds": 0,
+        "task_run_pnl": 0,
+        "task_run_peak": 0,
+        "task_run_max_dd": 0,
+        "task_run_loss_limit": 0,
+        "task_day_loss_limit": 0,
+        "task_day_loss_acc": 0,
+        "task_day_loss_date": datetime.now().strftime("%Y-%m-%d"),
+        "task_consecutive_losses": 0,
+        "task_freeze_reason": "",
+        "task_freeze_until": "",
+        "task_auto_enabled": True,
     }
 
 
@@ -284,6 +305,7 @@ class UserContext:
         self._model_manager_ai_sig = ""
         self._config_path = ""
         self._config_data = {}
+        self.tasks: Dict[str, Any] = {"version": 1, "tasks": []}
         self._lock = threading.Lock()
         self._load_all()
     
@@ -291,6 +313,7 @@ class UserContext:
         self._load_config()
         self._load_state()
         self._load_presets()
+        self._load_tasks()
 
     def _resolve_user_config_path(self) -> str:
         """
@@ -576,6 +599,102 @@ class UserContext:
             except Exception as e:
                 log_event(logging.ERROR, 'save_presets', '保存用户预设失败', f'user_id={self.user_id}, error={str(e)}')
     
+    def _default_tasks(self) -> Dict[str, Any]:
+        return {"version": 1, "tasks": []}
+
+    def _normalize_task(self, raw: Dict[str, Any]) -> Dict[str, Any]:
+        def _to_int_local(value: Any, default: int = 0) -> int:
+            try:
+                return int(value)
+            except Exception:
+                return default
+
+        name = str(raw.get("name", "") or "").strip()
+        trigger = raw.get("trigger", {}) if isinstance(raw.get("trigger"), dict) else {}
+        runtime = raw.get("runtime", {}) if isinstance(raw.get("runtime"), dict) else {}
+        candidate_presets = raw.get("candidate_presets", [])
+        if not isinstance(candidate_presets, list):
+            candidate_presets = []
+        candidate_presets = [str(x).strip() for x in candidate_presets if str(x).strip()]
+        if not candidate_presets:
+            candidate_presets = ["yc1", "yc5", "yc10", "yc20", "yc50", "yc100", "yc200"]
+
+        return {
+            "name": name,
+            "enabled": bool(raw.get("enabled", True)),
+            "trigger": {
+                "mode": str(trigger.get("mode", "hybrid") or "hybrid"),
+                "cron_minutes": int(trigger.get("cron_minutes", 0) or 0),
+                "min_interval_minutes": int(trigger.get("min_interval_minutes", 10) or 10),
+            },
+            "candidate_presets": candidate_presets,
+            "top_k_cases": int(raw.get("top_k_cases", 50) or 50),
+            "min_rounds": int(raw.get("min_rounds", 8) or 8),
+            "max_rounds": int(raw.get("max_rounds", 30) or 30),
+            "task_loss_pct": float(raw.get("task_loss_pct", 0.006) or 0.006),
+            "daily_loss_pct": float(raw.get("daily_loss_pct", 0.02) or 0.02),
+            "max_consecutive_losses": int(raw.get("max_consecutive_losses", 4) or 4),
+            "high_tier_sample_min": int(raw.get("high_tier_sample_min", 120) or 120),
+            "high_tier_conf_min": float(raw.get("high_tier_conf_min", 0.78) or 0.78),
+            "high_tier_win_rate_min": float(raw.get("high_tier_win_rate_min", 0.57) or 0.57),
+            "high_tier_dd_ratio_max": float(raw.get("high_tier_dd_ratio_max", 0.4) or 0.4),
+            "policy_id": str(raw.get("policy_id", "adaptive-v1") or "adaptive-v1"),
+            "runtime": {
+                "status": str(runtime.get("status", "idle") or "idle"),
+                "last_trigger_at": str(runtime.get("last_trigger_at", "") or ""),
+                "last_run_id": str(runtime.get("last_run_id", "") or ""),
+                "last_run_status": str(runtime.get("last_run_status", "") or ""),
+                "last_run_pnl": _to_int_local(runtime.get("last_run_pnl", 0), 0),
+                "last_run_max_dd": _to_int_local(runtime.get("last_run_max_dd", 0), 0),
+                "last_reason": str(runtime.get("last_reason", "") or ""),
+                "next_due_at": str(runtime.get("next_due_at", "") or ""),
+            },
+        }
+
+    def _load_tasks(self):
+        tasks_path = os.path.join(self.user_dir, "tasks.json")
+        tasks_data = self._default_tasks()
+        if os.path.exists(tasks_path):
+            try:
+                with open(tasks_path, 'r', encoding='utf-8') as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    raw_tasks = loaded.get("tasks", [])
+                    if isinstance(raw_tasks, list):
+                        normalized = []
+                        for item in raw_tasks:
+                            if isinstance(item, dict):
+                                task = self._normalize_task(item)
+                                if task["name"]:
+                                    normalized.append(task)
+                        tasks_data["tasks"] = normalized
+                log_event(
+                    logging.DEBUG,
+                    'load_tasks',
+                    '鍔犺浇 tasks.json 鎴愬姛',
+                    f'user_id={self.user_id}, count={len(tasks_data["tasks"])}'
+                )
+            except Exception as e:
+                log_event(logging.ERROR, 'load_tasks', '鍔犺浇 tasks.json 澶辫触', f'user_id={self.user_id}, error={str(e)}')
+        else:
+            log_event(logging.INFO, 'load_tasks', '鍒濆鍖栫┖ tasks.json', f'user_id={self.user_id}')
+        self.tasks = tasks_data
+        self.save_tasks()
+
+    def save_tasks(self):
+        with self._lock:
+            tasks_path = os.path.join(self.user_dir, "tasks.json")
+            try:
+                with open(tasks_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.tasks, f, indent=4, ensure_ascii=False)
+                log_event(logging.DEBUG, 'save_tasks', '淇濆瓨 tasks.json 鎴愬姛', f'user_id={self.user_id}')
+            except Exception as e:
+                log_event(logging.ERROR, 'save_tasks', '淇濆瓨 tasks.json 澶辫触', f'user_id={self.user_id}, error={str(e)}')
+
+    def get_tasks(self) -> List[Dict[str, Any]]:
+        tasks = self.tasks.get("tasks", []) if isinstance(self.tasks, dict) else []
+        return tasks if isinstance(tasks, list) else []
+
     def get_runtime(self, key: str, default=None):
         return self.state.runtime.get(key, default)
     

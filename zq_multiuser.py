@@ -29,6 +29,12 @@ from update_manager import (
     restart_process,
     update_to_version,
 )
+import adaptive_tasks
+from adaptive_analytics import (
+    ingest_user_history,
+    linkage_coverage_report,
+    refresh_regime_preset_stats,
+)
 
 # 日志配置
 logger = logging.getLogger('zq_multiuser')
@@ -61,7 +67,7 @@ def _infer_log_category(level: int, module: str, event: str) -> str:
     business_tokens = (
         "bet", "settle", "risk", "predict", "user_cmd", "balance", "fund",
         "profit", "preset", "pause", "resume", "restart", "update", "reback",
-        "model", "apikey", "stats", "status", "yc", "dashboard",
+        "model", "apikey", "stats", "status", "yc", "dashboard", "task",
     )
     if any(token in text for token in business_tokens):
         return "business"
@@ -440,7 +446,7 @@ def build_replay_focus_message(user_ctx: UserContext, limit: int = 20) -> str:
             f"{coverage['linked']}/{coverage['total']} ({coverage['coverage_pct']:.2f}%)"
         ),
         "",
-        "格式：bet_id | 结果/盈亏 | seq | 方向 | 决策来源/标签/置信度 | decision_id",
+        "格式：bet_id | 结果/盈亏 | seq | 方向 | 决策来源/标签/置信度 | 任务/盘面/预设 | decision_id",
     ]
 
     for item in reversed(recent):
@@ -453,9 +459,16 @@ def build_replay_focus_message(user_ctx: UserContext, limit: int = 20) -> str:
         tag = str(item.get("decision_tag", "-") or "-")
         conf = _safe_int(item.get("decision_confidence", 0), 0)
         decision_id = str(item.get("decision_id", "") or "")
+        task_name = str(item.get("task_name", "") or "-")
+        task_run_id = str(item.get("task_run_id", "") or "")
+        task_short = task_name if task_name else "-"
+        if task_run_id:
+            task_short = f"{task_short}@{task_run_id[:10]}"
+        regime = str(item.get("regime", "") or "-")
+        preset = str(item.get("preset", "") or "-")
         decision_id_short = decision_id[:20] + "..." if len(decision_id) > 23 else (decision_id or "-")
         lines.append(
-            f"- {bet_id} | {result}/{profit} | seq{seq} | {direction} | {source}/{tag}/{conf}% | {decision_id_short}"
+            f"- {bet_id} | {result}/{profit} | seq{seq} | {direction} | {source}/{tag}/{conf}% | {task_short}/{regime}/{preset} | {decision_id_short}"
         )
 
     return "\n".join(lines)
@@ -759,6 +772,58 @@ def build_startup_focus_reminder(user_ctx: UserContext) -> str:
         f"📊 当前状态：{status_text}，模式：{mode_text}\n"
         "ℹ️ 更多命令：`help`"
     )
+
+
+async def adaptive_task_scheduler_loop(client, user_ctx: UserContext, global_config: dict):
+    """后台任务调度：定时检查并触发 task。"""
+    while True:
+        try:
+            rt = user_ctx.state.runtime
+            last_ingest_at = str(rt.get("analytics_last_ingest_at", "") or "")
+            need_ingest = True
+            if last_ingest_at:
+                try:
+                    last_dt = datetime.strptime(last_ingest_at, "%Y-%m-%d %H:%M:%S")
+                    need_ingest = (datetime.now() - last_dt).total_seconds() >= 300
+                except Exception:
+                    need_ingest = True
+
+            if need_ingest:
+                ingest_user_history(user_ctx)
+                refresh_regime_preset_stats(user_ctx)
+                coverage = linkage_coverage_report(user_ctx)
+                rt["analytics_coverage_pct"] = coverage.get("coverage_pct", 0.0)
+                rt["analytics_last_ingest_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                user_ctx.save_state()
+
+            if _to_bool_switch(rt.get("task_auto_enabled", True), True):
+                result = adaptive_tasks.maybe_trigger_task(user_ctx)
+                if result.get("ok"):
+                    rec = result.get("recommendation", {})
+                    await _send_transient_admin_notice(
+                        client,
+                        user_ctx,
+                        global_config,
+                        (
+                            "任务已后台触发\n"
+                            f"任务：{result.get('task_name', '-')}\n"
+                            f"run_id：{result.get('task_run_id', '-')}\n"
+                            f"盘面：{rec.get('regime', '-')}\n"
+                            f"档位：{result.get('preset', '-')}\n"
+                            f"计划局数：{rec.get('planned_rounds', 0)}"
+                        ),
+                        ttl_seconds=120,
+                        attr_name="task_transition_message",
+                    )
+        except Exception as e:
+            log_event(
+                logging.WARNING,
+                "task",
+                "后台调度检查失败",
+                user_id=user_ctx.user_id,
+                data=str(e),
+            )
+        await asyncio.sleep(20)
 
 
 # 消息分发规则表（与 master 一致）
@@ -1527,6 +1592,46 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     if len(state.history) < 40:
         log_event(logging.INFO, 'bet_on', '历史数据低于40局，继续执行押注', user_id=user_ctx.user_id, data=f'len={len(state.history)}')
 
+    # 动态任务自动触发：在每次有效盘口到来时尝试触发一次
+    if _to_bool_switch(rt.get("task_auto_enabled", True), True):
+        try:
+            task_trigger_result = adaptive_tasks.maybe_trigger_task(user_ctx)
+            if task_trigger_result.get("ok"):
+                rec = task_trigger_result.get("recommendation", {})
+                await _send_transient_admin_notice(
+                    client,
+                    user_ctx,
+                    global_config,
+                    (
+                        "任务已自动触发\n"
+                        f"任务：{task_trigger_result.get('task_name', '-')}\n"
+                        f"run_id：{task_trigger_result.get('task_run_id', '-')}\n"
+                        f"盘面：{rec.get('regime', '-')}\n"
+                        f"档位：{task_trigger_result.get('preset', '-')}\n"
+                        f"计划局数：{rec.get('planned_rounds', 0)}"
+                    ),
+                    ttl_seconds=120,
+                    attr_name="task_transition_message",
+                )
+                log_event(
+                    logging.INFO,
+                    "task",
+                    "自动触发任务",
+                    user_id=user_ctx.user_id,
+                    task=task_trigger_result.get("task_name", ""),
+                    run_id=task_trigger_result.get("task_run_id", ""),
+                    preset=task_trigger_result.get("preset", ""),
+                    regime=rec.get("regime", ""),
+                )
+        except Exception as task_e:
+            log_event(
+                logging.WARNING,
+                "task",
+                "自动触发任务失败",
+                user_id=user_ctx.user_id,
+                data=str(task_e),
+            )
+
     # 自动风控暂停：基础风控(40局窗口) + 深度风控(每3连输里程碑)。
     # 同一已结算快照不重复触发，避免重复暂停。
     next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
@@ -2132,6 +2237,11 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             "decision_reason": decision_snapshot.get("decision_reason", ""),
             "decision_mode": decision_snapshot.get("decision_mode", "M-SMP"),
             "decision_round": decision_snapshot.get("decision_round", 0),
+            "task_name": str(rt.get("current_task_name", "") or ""),
+            "task_run_id": str(rt.get("current_task_run_id", "") or ""),
+            "task_policy_id": str(rt.get("task_policy_id", "") or ""),
+            "regime": str(rt.get("task_regime", "") or ""),
+            "preset": str(rt.get("current_preset_name", "") or ""),
             "settle_result_num": None,
             "settle_result_type": "",
             "settle_history_index": -1,
@@ -2154,8 +2264,15 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 "decision_tag": decision_snapshot.get("decision_tag", ""),
                 "decision_confidence": _safe_int(decision_snapshot.get("decision_confidence", 0), 0),
                 "decision_prediction": _safe_int(decision_snapshot.get("decision_prediction", -1), -1),
+                "task_name": str(rt.get("current_task_name", "") or ""),
+                "task_run_id": str(rt.get("current_task_run_id", "") or ""),
+                "policy_id": str(rt.get("task_policy_id", "") or ""),
+                "regime": str(rt.get("task_regime", "") or ""),
+                "preset": str(rt.get("current_preset_name", "") or ""),
             },
         )
+
+        adaptive_tasks.on_bet_placed(user_ctx)
 
         bet_report = generate_mobile_bet_report(
             state.history,
@@ -4076,6 +4193,16 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                             settled_entry["decision_source"] = decision_snapshot.get("decision_source", "")
                             settled_entry["decision_tag"] = decision_snapshot.get("decision_tag", "")
                             settled_entry["decision_confidence"] = decision_snapshot.get("decision_confidence", 0)
+                        if not str(settled_entry.get("task_name", "")).strip():
+                            settled_entry["task_name"] = str(rt.get("current_task_name", "") or "")
+                        if not str(settled_entry.get("task_run_id", "")).strip():
+                            settled_entry["task_run_id"] = str(rt.get("current_task_run_id", "") or "")
+                        if not str(settled_entry.get("task_policy_id", "")).strip():
+                            settled_entry["task_policy_id"] = str(rt.get("task_policy_id", "") or "")
+                        if not str(settled_entry.get("regime", "")).strip():
+                            settled_entry["regime"] = str(rt.get("task_regime", "") or "")
+                        if not str(settled_entry.get("preset", "")).strip():
+                            settled_entry["preset"] = str(rt.get("current_preset_name", "") or "")
                         append_replay_event(
                             user_ctx,
                             "bet_settled",
@@ -4094,8 +4221,46 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                                 "settle_result_num": result_num,
                                 "settle_result_type": result_type,
                                 "history_index": len(state.history) - 1,
+                                "task_name": str(settled_entry.get("task_name", "") or ""),
+                                "task_run_id": str(settled_entry.get("task_run_id", "") or ""),
+                                "policy_id": str(settled_entry.get("task_policy_id", "") or ""),
+                                "regime": str(settled_entry.get("regime", "") or ""),
+                                "preset": str(settled_entry.get("preset", "") or ""),
                             },
                         )
+
+                        task_update = adaptive_tasks.on_settle(user_ctx, bool(win), int(profit))
+                        if task_update.get("ended", {}).get("ok"):
+                            ended = task_update.get("ended", {})
+                            await _send_transient_admin_notice(
+                                client,
+                                user_ctx,
+                                global_config,
+                                (
+                                    "任务运行已结束\n"
+                                    f"任务：{ended.get('task_name', '-')}\n"
+                                    f"run_id：{ended.get('task_run_id', '-')}\n"
+                                    f"状态：{ended.get('status', '-')}\n"
+                                    f"原因：{ended.get('reason', '-')}"
+                                ),
+                                ttl_seconds=180,
+                                attr_name="task_transition_message",
+                            )
+                        elif task_update.get("rechecked"):
+                            await _send_transient_admin_notice(
+                                client,
+                                user_ctx,
+                                global_config,
+                                (
+                                    "任务复评已更新\n"
+                                    f"任务：{rt.get('current_task_name', '-')}\n"
+                                    f"新盘面：{rt.get('task_regime', '-')}\n"
+                                    f"新档位：{rt.get('current_preset_name', '-')}\n"
+                                    f"本段计划：{rt.get('task_step_planned_rounds', 0)} 局"
+                                ),
+                                ttl_seconds=120,
+                                attr_name="task_transition_message",
+                            )
 
                     user_ctx.save_state()
 
@@ -4670,6 +4835,17 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `users` : 查看当前用户状态
 - `status` : 查看仪表盘
 """
+            mes += """
+
+**任务系统（v2-adaptive）**
+- `task new <name> [cron_minutes] [time|regime|hybrid]` : 创建任务
+- `task list` : 列出任务
+- `task show <name>` : 查看任务详情
+- `task pause <name>` / `task resume <name>` : 暂停/恢复任务
+- `task run <name>` : 立即手动触发任务
+- `task logs [name] [limit]` : 查看任务运行日志
+- `task stats [name]` : 查看任务统计与链路覆盖率
+"""
             log_event(logging.INFO, 'user_cmd', '显示帮助', user_id=user_ctx.user_id)
             message = await send_to_admin(client, mes, user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
@@ -4839,6 +5015,145 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 user_id=user_ctx.user_id,
                 target=target,
                 enabled=enabled,
+            )
+            return
+
+        # task - 动态分档任务系统
+        if cmd == "task":
+            sub_cmd = str(my[1]).strip().lower() if len(my) > 1 else "help"
+
+            if sub_cmd in {"list", "ls"}:
+                mes = adaptive_tasks.format_task_list(user_ctx)
+                message = await send_to_admin(client, mes, user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 120))
+                return
+
+            if sub_cmd == "new":
+                if len(my) < 3:
+                    await send_to_admin(
+                        client,
+                        "用法：`task new <name> [cron_minutes] [time|regime|hybrid]`",
+                        user_ctx,
+                        global_config,
+                    )
+                    return
+                task_name = str(my[2]).strip()
+                cron_minutes = 0
+                trigger_mode = "hybrid"
+                if len(my) >= 4:
+                    if str(my[3]).strip().isdigit():
+                        cron_minutes = int(my[3])
+                    else:
+                        trigger_mode = str(my[3]).strip().lower()
+                if len(my) >= 5:
+                    trigger_mode = str(my[4]).strip().lower()
+                result = adaptive_tasks.create_task(
+                    user_ctx,
+                    name=task_name,
+                    cron_minutes=cron_minutes,
+                    mode=trigger_mode,
+                )
+                if result.get("ok"):
+                    mes = f"✅ 任务 `{task_name}` 已创建（mode={trigger_mode}, cron={cron_minutes}m）"
+                else:
+                    mes = f"❌ 创建失败：{result.get('error', 'unknown')}"
+                await send_to_admin(client, mes, user_ctx, global_config)
+                return
+
+            if sub_cmd == "show":
+                if len(my) < 3:
+                    await send_to_admin(client, "用法：`task show <name>`", user_ctx, global_config)
+                    return
+                mes = adaptive_tasks.format_task_detail(user_ctx, str(my[2]).strip())
+                message = await send_to_admin(client, mes, user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 180))
+                return
+
+            if sub_cmd in {"pause", "resume"}:
+                if len(my) < 3:
+                    await send_to_admin(client, f"用法：`task {sub_cmd} <name>`", user_ctx, global_config)
+                    return
+                task_name = str(my[2]).strip()
+                result = adaptive_tasks.set_task_enabled(user_ctx, task_name, enabled=(sub_cmd == "resume"))
+                if result.get("ok"):
+                    state_text = "已恢复" if sub_cmd == "resume" else "已暂停"
+                    mes = f"✅ 任务 `{task_name}` {state_text}"
+                else:
+                    mes = f"❌ 操作失败：{result.get('error', 'unknown')}"
+                await send_to_admin(client, mes, user_ctx, global_config)
+                return
+
+            if sub_cmd == "run":
+                if len(my) < 3:
+                    await send_to_admin(client, "用法：`task run <name>`", user_ctx, global_config)
+                    return
+                task_name = str(my[2]).strip()
+                result = adaptive_tasks.start_task(user_ctx, task_name, trigger_type="manual")
+                if result.get("ok"):
+                    rec = result.get("recommendation", {})
+                    mes = (
+                        f"✅ 任务 `{task_name}` 已启动\n"
+                        f"- run_id: {result.get('task_run_id', '-')}\n"
+                        f"- regime: {rec.get('regime', '-')}\n"
+                        f"- preset: {result.get('preset', '-')}\n"
+                        f"- planned_rounds: {rec.get('planned_rounds', 0)}\n"
+                        f"- recheck_interval: {rec.get('recheck_interval', 0)}"
+                    )
+                else:
+                    mes = f"❌ 启动失败：{result.get('error', result.get('reason', 'unknown'))}"
+                await send_to_admin(client, mes, user_ctx, global_config)
+                return
+
+            if sub_cmd == "logs":
+                task_name = ""
+                limit = 20
+                if len(my) >= 3:
+                    if str(my[2]).strip().isdigit():
+                        limit = int(my[2])
+                    else:
+                        task_name = str(my[2]).strip()
+                if len(my) >= 4 and str(my[3]).strip().isdigit():
+                    limit = int(my[3])
+                try:
+                    ingest_user_history(user_ctx)
+                except Exception:
+                    pass
+                mes = adaptive_tasks.task_logs(user_ctx, task_name=task_name, limit=limit)
+                message = await send_to_admin(client, mes, user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 180))
+                return
+
+            if sub_cmd == "stats":
+                task_name = str(my[2]).strip() if len(my) >= 3 else ""
+                try:
+                    ingest_user_history(user_ctx)
+                    refresh_regime_preset_stats(user_ctx)
+                    coverage = linkage_coverage_report(user_ctx)
+                    rt["analytics_coverage_pct"] = coverage.get("coverage_pct", 0.0)
+                except Exception:
+                    pass
+                mes = adaptive_tasks.task_stats(user_ctx, task_name=task_name)
+                message = await send_to_admin(client, mes, user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 180))
+                return
+
+            await send_to_admin(
+                client,
+                (
+                    "用法：`task new/list/show/pause/resume/run/logs/stats`\n"
+                    "- `task new <name> [cron_minutes] [time|regime|hybrid]`\n"
+                    "- `task run <name>`"
+                ),
+                user_ctx,
+                global_config,
             )
             return
         
