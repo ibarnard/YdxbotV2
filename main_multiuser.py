@@ -492,6 +492,24 @@ async def fetch_account_balance(user_ctx: UserContext) -> int:
         return user_ctx.get_runtime("account_balance", 0)
 
 
+def _apply_startup_balance_snapshot(user_ctx: UserContext, balance: int) -> int:
+    """
+    启动时仅刷新账户余额快照，不自动改写菠菜资金。
+    业务要求：菠菜资金必须保持手动独立控制（例如通过 gf 设置），
+    脚本重启/新开也不应被账户余额覆盖。
+    """
+    user_ctx.set_runtime("account_balance", int(balance))
+    current_fund = user_ctx.get_runtime("gambling_fund", 0)
+    try:
+        normalized_fund = int(current_fund)
+    except Exception:
+        normalized_fund = 0
+    if normalized_fund < 0:
+        normalized_fund = 0
+        user_ctx.set_runtime("gambling_fund", normalized_fund)
+    return normalized_fund
+
+
 async def start_user(user_ctx: UserContext, global_config: dict):
     lock_acquired = False
     try:
@@ -573,8 +591,15 @@ async def start_user(user_ctx: UserContext, global_config: dict):
         await check_models_for_user(client, user_ctx)
         
         balance = await fetch_account_balance(user_ctx)
-        user_ctx.set_runtime("gambling_fund", balance)
-        user_ctx.set_runtime("account_balance", balance)
+        fund_snapshot = _apply_startup_balance_snapshot(user_ctx, balance)
+        log_event(
+            logging.INFO,
+            'start',
+            '启动余额快照已刷新（菠菜资金保持独立）',
+            user_id=user_ctx.user_id,
+            account_balance=balance,
+            gambling_fund=fund_snapshot,
+        )
 
         # 启动恢复：按账号默认风控模式生效，并清理历史遗留挂单。
         from zq_multiuser import (
