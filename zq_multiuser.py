@@ -2977,8 +2977,12 @@ def _extract_reply_markup_payloads(msg) -> set:
         buttons = getattr(row, "buttons", None) or []
         for btn in buttons:
             data = getattr(btn, "data", None)
-            if isinstance(data, (bytes, bytearray)):
+            if data is None:
+                continue
+            if isinstance(data, bytearray):
                 payloads.add(bytes(data))
+                continue
+            payloads.add(data)
     return payloads
 
 
@@ -4174,7 +4178,6 @@ def _sync_lose_floor_preset(rt: dict) -> None:
     current_preset = str(rt.get("current_preset_name", "") or "").strip()
     if current_preset:
         rt["lose_floor_preset"] = current_preset
-
 
 def _is_valid_lose_range(start_round, start_seq, end_round, end_seq) -> bool:
     """校验连输区间是否有效（起点不晚于终点）。"""
@@ -5943,7 +5946,6 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                             global_config,
                         )
                         return
-
                 preset = presets[preset_name]
                 rt["continuous"] = int(preset[0])
                 rt["lose_stop"] = int(preset[1])
@@ -6480,9 +6482,17 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 ys = [int(my[2]), int(my[3]), float(my[4]), float(my[5]), float(my[6]), float(my[7]), int(my[8])]
                 presets[preset_name] = ys
                 user_ctx.save_presets()
-                rt["current_preset_name"] = preset_name
+                applied_preset_name = adaptive_tasks.normalize_preset_for_active_loss_streak(user_ctx, preset_name)
+                if applied_preset_name not in presets:
+                    applied_preset_name = preset_name
+                rt["current_preset_name"] = applied_preset_name
                 user_ctx.save_state()
                 mes = f"预设保存成功: {preset_name} ({ys[0]} {ys[1]} {ys[2]} {ys[3]} {ys[4]} {ys[5]} {ys[6]})"
+                if applied_preset_name != preset_name:
+                    mes += (
+                        f"\n⚠️ 连输未结束，禁止降档到 `{preset_name}`，"
+                        f"当前执行档位保持 `{applied_preset_name}`"
+                    )
                 log_event(logging.INFO, 'user_cmd', '保存预设策略', user_id=user_ctx.user_id, preset=preset_name, params=ys)
                 message = await send_to_admin(client, mes, user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))

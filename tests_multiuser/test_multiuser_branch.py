@@ -734,6 +734,179 @@ def test_process_bet_on_recovers_when_source_message_id_invalid(tmp_path, monkey
     assert all("押注出错" not in msg for msg in sent_messages)
 
 
+def test_process_bet_on_recovers_by_button_payload_when_prompt_text_changed(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "40032"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "回溯按钮匹配用户"},
+            "telegram": {"user_id": 40032},
+            "groups": {"admin_chat": 40032, "zq_bot": 9001},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["bet_on"] = True
+    rt["mode_stop"] = True
+    rt["stop_count"] = 0
+    rt["initial_amount"] = 500
+    rt["bet_amount"] = 500
+    rt["lose_count"] = 0
+    rt["win_count"] = 0
+
+    sent_messages = []
+
+    async def fake_predict(user_ctx, global_cfg):
+        user_ctx.state.runtime["last_predict_info"] = "test-payload-recover"
+        user_ctx.state.predictions.append(1)
+        return 1
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=1, id=len(sent_messages))
+
+    async def fake_delete_later(*args, **kwargs):
+        return None
+
+    async def fake_sleep(*args, **kwargs):
+        return None
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "predict_next_bet_v10", fake_predict)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "delete_later", fake_delete_later)
+    monkeypatch.setattr(zm.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    class DummyEvent:
+        def __init__(self):
+            history = " ".join((["0", "1"] * 20))
+            self.message = SimpleNamespace(message=f"[近 40 次结果][由近及远][0 小 1 大] {history}")
+            self.reply_markup = object()
+            self.chat_id = 1
+            self.id = 132
+            self.clicks = []
+
+        async def click(self, data):
+            self.clicks.append(data)
+            raise Exception("The specified message ID is invalid or you can't do that operation on such message (caused by GetBotCallbackAnswerRequest)")
+
+    class DummyFreshMsg:
+        def __init__(self):
+            button_data = constants.BIG_BUTTON[500]
+            self.sender_id = 9001
+            self.message = "盘口已刷新，请直接选择方向"
+            self.raw_text = self.message
+            self.id = 133
+            self.clicked = []
+            self.reply_markup = SimpleNamespace(
+                rows=[SimpleNamespace(buttons=[SimpleNamespace(data=button_data)])]
+            )
+
+        async def click(self, data):
+            self.clicked.append(data)
+
+    fresh_msg = DummyFreshMsg()
+
+    class DummyClient:
+        def __init__(self):
+            self._fresh_msg = fresh_msg
+
+        def iter_messages(self, chat_id, limit=20):
+            async def _gen():
+                yield self._fresh_msg
+            return _gen()
+
+    event = DummyEvent()
+    asyncio.run(zm.process_bet_on(DummyClient(), event, ctx, {}))
+
+    assert fresh_msg.clicked
+    assert len(ctx.state.bet_sequence_log) == 1
+    assert all("押注出错" not in msg for msg in sent_messages)
+
+
+def test_process_bet_on_expired_window_without_latest_message_skips_round(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "40031"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "失效窗口兜底用户"},
+            "telegram": {"user_id": 40031},
+            "groups": {"admin_chat": 40031, "zq_bot": 9001},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["bet_on"] = True
+    rt["mode_stop"] = True
+    rt["stop_count"] = 0
+    rt["initial_amount"] = 500
+    rt["bet_amount"] = 500
+    rt["lose_count"] = 0
+    rt["win_count"] = 0
+
+    sent_messages = []
+
+    async def fake_predict(user_ctx, global_cfg):
+        user_ctx.state.runtime["last_predict_info"] = "test-expired-no-latest"
+        user_ctx.state.predictions.append(1)
+        return 1
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=1, id=len(sent_messages))
+
+    async def fake_delete_later(*args, **kwargs):
+        return None
+
+    async def fake_sleep(*args, **kwargs):
+        return None
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "predict_next_bet_v10", fake_predict)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "delete_later", fake_delete_later)
+    monkeypatch.setattr(zm.asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    class DummyEvent:
+        def __init__(self):
+            history = " ".join((["0", "1"] * 20))
+            self.message = SimpleNamespace(message=f"[近 40 次结果][由近及远][0 小 1 大] {history}")
+            self.reply_markup = object()
+            self.chat_id = 1
+            self.id = 131
+            self.clicks = []
+
+        async def click(self, data):
+            self.clicks.append(data)
+            raise Exception("The specified message ID is invalid or you can't do that operation on such message (caused by GetBotCallbackAnswerRequest)")
+
+    class DummyClient:
+        def iter_messages(self, chat_id, limit=20):
+            async def _gen():
+                if False:
+                    yield None
+            return _gen()
+
+    event = DummyEvent()
+    asyncio.run(zm.process_bet_on(DummyClient(), event, ctx, {}))
+
+    assert len(ctx.state.bet_sequence_log) == 0
+    assert any("本轮下注窗口已失效，已自动跳过" in msg for msg in sent_messages)
+    assert all("押注出错" not in msg for msg in sent_messages)
+
+
 def test_process_bet_on_prediction_timeout_pauses_and_skips_bet(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "4004"
     _write_json(
@@ -2587,6 +2760,43 @@ def test_st_command_triggers_auto_yc_report(tmp_path, monkeypatch):
     assert any("🔮 已根据当前预设自动测算" in msg for msg in sent_messages)
     assert any("🎯 策略参数" in msg for msg in sent_messages)
     assert any("连数|倍率|下注| 盈利 |所需本金" in msg for msg in sent_messages)
+
+def test_st_command_blocks_downgrade_during_loss_streak(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "50081"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "连输降档保护用户"},
+            "telegram": {"user_id": 50081},
+            "groups": {"admin_chat": 50081},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["lose_count"] = 3
+    rt["current_preset_name"] = "yc5"
+    rt["lose_floor_preset"] = "yc5"
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=50081, id=len(sent_messages))
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    cmd_event = SimpleNamespace(raw_text="st yc1", chat_id=50081, id=22)
+    asyncio.run(zm.process_user_command(SimpleNamespace(), cmd_event, ctx, {}))
+
+    assert ctx.state.runtime.get("current_preset_name") == "yc5"
+    assert any("禁止降档到 `yc1`" in msg for msg in sent_messages)
+    assert any("预设启动成功: yc5" in msg for msg in sent_messages)
 
 
 def test_task_show_without_name_defaults_to_current_task(tmp_path, monkeypatch):
