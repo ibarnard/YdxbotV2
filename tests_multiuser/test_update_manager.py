@@ -55,6 +55,30 @@ def test_resolve_github_token_from_global_config(monkeypatch, tmp_path):
     assert token == "token_cfg_value"
 
 
+def test_resolve_update_target_branch_prefers_env(monkeypatch, tmp_path):
+    monkeypatch.setenv("YDXBOT_UPDATE_TARGET_BRANCH", "feature/only-v2")
+    branch = um.resolve_update_target_branch(str(tmp_path))
+    assert branch == "feature/only-v2"
+
+
+def test_resolve_update_target_branch_from_global_config(monkeypatch, tmp_path):
+    monkeypatch.delenv("YDXBOT_UPDATE_TARGET_BRANCH", raising=False)
+    monkeypatch.delenv("UPDATE_TARGET_BRANCH", raising=False)
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    (config_dir / "global_config.json").write_text(
+        """{
+  "update": {
+    "target_branch": "codex/v2-adaptive"
+  }
+}
+""",
+        encoding="utf-8",
+    )
+    branch = um.resolve_update_target_branch(str(tmp_path))
+    assert branch == "codex/v2-adaptive"
+
+
 def test_get_latest_release_gives_private_repo_hint_on_auth_errors(monkeypatch):
     class DummyResp:
         status_code = 404
@@ -155,6 +179,72 @@ def test_update_to_version_without_target_uses_latest_tag(monkeypatch):
     result = um.update_to_version("/tmp/repo", "")
     assert result["success"] is True
     assert result["resolved_target"] == "v1.0.9"
+
+
+def test_update_to_ref_rejects_ref_outside_limited_branch(monkeypatch, tmp_path):
+    monkeypatch.setattr(um, "_acquire_update_lock", lambda repo_root: {"success": True})
+    monkeypatch.setattr(um, "_release_update_lock", lambda repo_root: None)
+    monkeypatch.setattr(um, "get_blocking_dirty_paths", lambda repo_root=None: [])
+    monkeypatch.setattr(
+        um,
+        "detect_repo_remote",
+        lambda repo_root=None: {"name": "origin", "url": "https://github.com/ibarnard/YdxbotV2.git", "slug": "ibarnard/YdxbotV2"},
+    )
+    monkeypatch.setattr(um, "resolve_github_token", lambda repo_root=None, remote_url="": "")
+    monkeypatch.setattr(um, "resolve_update_target_branch", lambda repo_root=None: "codex/v2-adaptive")
+    monkeypatch.setattr(um, "_save_rollback_point", lambda *args, **kwargs: None)
+    monkeypatch.setattr(um, "run_health_check", lambda repo_root=None: {"success": True})
+    monkeypatch.setattr(um, "mark_release_applied", lambda *args, **kwargs: None)
+    monkeypatch.setattr(um, "mark_release_notified", lambda *args, **kwargs: None)
+
+    info_calls = {"count": 0}
+
+    def fake_get_current_repo_info(repo_root=None):
+        info_calls["count"] += 1
+        if info_calls["count"] == 1:
+            return {
+                "commit": "aaaaaaaa11111111",
+                "short_commit": "aaaaaaaa",
+                "branch": "codex/v2-adaptive",
+                "current_tag": "",
+                "nearest_tag": "",
+                "display_version": "codex/v2-adaptive@aaaaaaaa",
+            }
+        return {
+            "commit": "bbbbbbbb22222222",
+            "short_commit": "bbbbbbbb",
+            "branch": "",
+            "current_tag": "",
+            "nearest_tag": "",
+            "display_version": "bbbbbbbb",
+        }
+
+    monkeypatch.setattr(um, "get_current_repo_info", fake_get_current_repo_info)
+
+    checkout_calls = {"count": 0}
+
+    def fake_run_cmd(args, cwd, timeout=30):
+        if args == ["git", "fetch", "origin", "+refs/heads/codex/v2-adaptive:refs/remotes/origin/codex/v2-adaptive"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args == ["git", "fetch", "--force", "--tags", "origin"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args == ["git", "rev-parse", "--verify", "refs/remotes/origin/codex/v2-adaptive"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="cccccccc33333333\n", stderr="")
+        if args == ["git", "rev-parse", "--verify", "deadbeef^{commit}"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="bbbbbbbb22222222\n", stderr="")
+        if args == ["git", "merge-base", "--is-ancestor", "bbbbbbbb22222222", "refs/remotes/origin/codex/v2-adaptive"]:
+            return subprocess.CompletedProcess(args=args, returncode=1, stdout="", stderr="")
+        if args and args[:2] == ["git", "checkout"]:
+            checkout_calls["count"] += 1
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(um, "_run_cmd", fake_run_cmd)
+
+    result = um.update_to_ref(str(tmp_path), "deadbeef")
+    assert result["success"] is False
+    assert "不在受限更新分支" in result["error"]
+    assert checkout_calls["count"] == 0
 
 
 def test_reback_to_version_requires_target():

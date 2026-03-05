@@ -33,6 +33,8 @@ ROLLBACK_FILE = ".release_rollback.json"
 UPDATE_LOCK_FILE = ".update.lock"
 GITHUB_TOKEN_ENV_KEYS = ("YDXBOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
 SYSTEMD_SERVICE_ENV_KEYS = ("YDXBOT_SYSTEMD_SERVICE", "SYSTEMD_SERVICE")
+UPDATE_TARGET_BRANCH_ENV_KEYS = ("YDXBOT_UPDATE_TARGET_BRANCH", "UPDATE_TARGET_BRANCH")
+DEFAULT_UPDATE_TARGET_BRANCH = "codex/v2-adaptive"
 GLOBAL_CONFIG_CANDIDATES = (
     "global_config.json",
     "global_config.example.json",
@@ -234,6 +236,30 @@ def resolve_systemd_service_name(repo_root: Optional[str] = None) -> str:
     return ""
 
 
+def resolve_update_target_branch(repo_root: Optional[str] = None) -> str:
+    """读取受限更新分支（环境变量优先，其次 shared/config）。"""
+    for env_key in UPDATE_TARGET_BRANCH_ENV_KEYS:
+        branch_name = (os.getenv(env_key) or "").strip()
+        if branch_name:
+            return branch_name
+
+    root = _repo_root(repo_root)
+    shared_cfg = _load_shared_global_config(root)
+    update_cfg = shared_cfg.get("update", {}) if isinstance(shared_cfg.get("update", {}), dict) else {}
+
+    cfg_candidates = [
+        update_cfg.get("target_branch"),
+        update_cfg.get("branch"),
+        update_cfg.get("allowed_branch"),
+    ]
+    for item in cfg_candidates:
+        branch_name = (item or "").strip()
+        if branch_name:
+            return branch_name
+
+    return DEFAULT_UPDATE_TARGET_BRANCH
+
+
 def _run_systemd_restart(service_name: str) -> Dict[str, Any]:
     if not service_name:
         return {"success": False, "error": "未配置 systemd 服务名"}
@@ -271,6 +297,19 @@ def _git_fetch_tags(root: Path, remote_name: str, github_token: str = "") -> sub
     if token:
         cmd += ["-c", f"http.extraheader={_build_git_auth_header(token)}"]
     cmd += ["fetch", "--force", "--tags", remote_name]
+    return _run_cmd(cmd, root, timeout=120)
+
+
+def _git_fetch_branch(root: Path, remote_name: str, branch_name: str, github_token: str = "") -> subprocess.CompletedProcess:
+    if not remote_name or not branch_name:
+        return subprocess.CompletedProcess(args=[], returncode=0, stdout="", stderr="")
+    cmd = ["git"]
+    token = (github_token or "").strip()
+    if token:
+        cmd += ["-c", f"http.extraheader={_build_git_auth_header(token)}"]
+    # 显式 refspec，确保本地 remote-tracking 引用被更新。
+    refspec = f"+refs/heads/{branch_name}:refs/remotes/{remote_name}/{branch_name}"
+    cmd += ["fetch", remote_name, refspec]
     return _run_cmd(cmd, root, timeout=120)
 
 
@@ -371,20 +410,23 @@ def _list_recent_commits(root: Path, ref: str, limit: int) -> List[Dict[str, str
     return entries
 
 
-def _resolve_remote_ref(root: Path, remote_name: str, preferred_branch: str = "") -> str:
+def _resolve_remote_ref(root: Path, remote_name: str, preferred_branch: str = "", locked_branch: str = "") -> str:
     if not remote_name:
         return ""
 
     candidates: List[str] = []
 
-    head_ref_res = _run_cmd(["git", "symbolic-ref", f"refs/remotes/{remote_name}/HEAD"], root, timeout=10)
-    if head_ref_res.returncode == 0 and head_ref_res.stdout.strip():
-        candidates.append(head_ref_res.stdout.strip())
+    if locked_branch:
+        candidates.append(f"refs/remotes/{remote_name}/{locked_branch}")
+    else:
+        head_ref_res = _run_cmd(["git", "symbolic-ref", f"refs/remotes/{remote_name}/HEAD"], root, timeout=10)
+        if head_ref_res.returncode == 0 and head_ref_res.stdout.strip():
+            candidates.append(head_ref_res.stdout.strip())
 
-    if preferred_branch:
-        candidates.append(f"refs/remotes/{remote_name}/{preferred_branch}")
-    candidates.append(f"refs/remotes/{remote_name}/main")
-    candidates.append(f"refs/remotes/{remote_name}/master")
+        if preferred_branch:
+            candidates.append(f"refs/remotes/{remote_name}/{preferred_branch}")
+        candidates.append(f"refs/remotes/{remote_name}/main")
+        candidates.append(f"refs/remotes/{remote_name}/master")
 
     seen = set()
     for ref in candidates:
@@ -395,6 +437,36 @@ def _resolve_remote_ref(root: Path, remote_name: str, preferred_branch: str = ""
         if verify.returncode == 0:
             return ref
     return ""
+
+
+def _resolve_target_branch_ref(root: Path, remote_name: str, target_branch: str, preferred_branch: str = "") -> str:
+    remote_ref = _resolve_remote_ref(root, remote_name, preferred_branch=preferred_branch, locked_branch=target_branch)
+    if remote_ref:
+        return remote_ref
+    if not target_branch:
+        return ""
+    local_ref = f"refs/heads/{target_branch}"
+    verify = _run_cmd(["git", "rev-parse", "--verify", local_ref], root, timeout=10)
+    if verify.returncode == 0:
+        return local_ref
+    return ""
+
+
+def _is_ancestor(root: Path, ancestor_ref: str, descendant_ref: str) -> bool:
+    if not ancestor_ref or not descendant_ref:
+        return False
+    check_res = _run_cmd(["git", "merge-base", "--is-ancestor", ancestor_ref, descendant_ref], root, timeout=20)
+    return check_res.returncode == 0
+
+
+def _filter_tags_by_ref(root: Path, tags: List[str], target_ref: str) -> List[str]:
+    if not target_ref:
+        return []
+    filtered: List[str] = []
+    for tag in tags:
+        if _is_ancestor(root, tag, target_ref):
+            filtered.append(tag)
+    return filtered
 
 
 def _list_version_tags(root: Path, limit: int = 0) -> List[str]:
@@ -454,24 +526,32 @@ def list_version_catalog(repo_root: Optional[str] = None, limit: int = 20) -> Di
     remote = detect_repo_remote(root)
     remote_name = remote.get("name", "")
     github_token = resolve_github_token(root, remote.get("url", ""))
+    target_branch = resolve_update_target_branch(root)
 
     fetch_warning = ""
     if remote_name:
-        fetch_main_res = _run_cmd(["git", "fetch", remote_name], root, timeout=120)
-        if fetch_main_res.returncode != 0:
-            fetch_warning = (fetch_main_res.stderr or fetch_main_res.stdout).strip()[:200]
+        fetch_branch_res = _git_fetch_branch(root, remote_name, target_branch, github_token)
+        if fetch_branch_res.returncode != 0:
+            fetch_warning = (fetch_branch_res.stderr or fetch_branch_res.stdout).strip()[:200]
         fetch_tag_res = _git_fetch_tags(root, remote_name, github_token)
         if fetch_tag_res.returncode != 0 and not fetch_warning:
             fetch_warning = (fetch_tag_res.stderr or fetch_tag_res.stdout).strip()[:200]
 
+    branch_ref = _resolve_target_branch_ref(root, remote_name, target_branch, preferred_branch=current.get("branch", ""))
+    if not branch_ref:
+        branch_missing_msg = f"未找到受限更新分支：{target_branch}"
+        fetch_warning = f"{fetch_warning}；{branch_missing_msg}" if fetch_warning else branch_missing_msg
+
     all_tags = _list_version_tags(root)
-    remote_ref = _resolve_remote_ref(root, remote_name, current.get("branch", ""))
-    remote_commits = _list_recent_commits(root, remote_ref, max(1, int(limit)) if isinstance(limit, int) else 20)
+    if target_branch:
+        all_tags = _filter_tags_by_ref(root, all_tags, branch_ref)
+
+    remote_commits = _list_recent_commits(root, branch_ref, max(1, int(limit)) if isinstance(limit, int) else 20)
     remote_head = remote_commits[0] if remote_commits else {}
     remote_head_tag = _get_commit_tag(root, remote_head.get("commit", ""))
     pending_commits_count = 0
-    if remote_ref:
-        pending_count_res = _run_cmd(["git", "rev-list", "--count", f"HEAD..{remote_ref}"], root, timeout=20)
+    if branch_ref:
+        pending_count_res = _run_cmd(["git", "rev-list", "--count", f"HEAD..{branch_ref}"], root, timeout=20)
         if pending_count_res.returncode == 0:
             try:
                 pending_commits_count = int((pending_count_res.stdout or "0").strip() or "0")
@@ -492,7 +572,8 @@ def list_version_catalog(repo_root: Optional[str] = None, limit: int = 20) -> Di
             "remote_head": remote_head,
             "remote_head_tag": remote_head_tag,
             "pending_commits_count": pending_commits_count,
-            "remote_ref": remote_ref,
+            "remote_ref": branch_ref,
+            "target_branch": target_branch,
             "fetch_warning": fetch_warning,
         }
 
@@ -518,7 +599,7 @@ def list_version_catalog(repo_root: Optional[str] = None, limit: int = 20) -> Di
     else:
         pending_tags = list(all_tags)
 
-    remote_commits = _list_recent_commits(root, remote_ref, max_entries)
+    remote_commits = _list_recent_commits(root, branch_ref, max_entries)
     remote_head = remote_commits[0] if remote_commits else remote_head
     remote_head_tag = _get_commit_tag(root, remote_head.get("commit", ""))
 
@@ -535,7 +616,8 @@ def list_version_catalog(repo_root: Optional[str] = None, limit: int = 20) -> Di
         "remote_head": remote_head,
         "remote_head_tag": remote_head_tag,
         "pending_commits_count": pending_commits_count,
-        "remote_ref": remote_ref,
+        "remote_ref": branch_ref,
+        "target_branch": target_branch,
         "fetch_warning": fetch_warning,
     }
 
@@ -554,7 +636,8 @@ def update_to_version(repo_root: Optional[str] = None, target: Optional[str] = N
         return {"success": False, "error": catalog.get("error", "获取版本列表失败")}
     latest_tag = catalog.get("latest_tag", "")
     if not latest_tag:
-        return {"success": False, "error": "未找到可更新的版本标签"}
+        target_branch = catalog.get("target_branch", resolve_update_target_branch(repo_root))
+        return {"success": False, "error": f"未找到可更新的版本标签（受限分支：{target_branch}）"}
 
     result = update_to_ref(repo_root, latest_tag)
     if result.get("success"):
@@ -983,18 +1066,23 @@ def update_to_ref(repo_root: Optional[str] = None, target_ref: Optional[str] = N
         remote = detect_repo_remote(root)
         remote_name = remote.get("name", "")
         github_token = resolve_github_token(root, remote.get("url", ""))
+        target_branch = resolve_update_target_branch(root)
 
         if remote_name:
-            fetch_main_res = _run_cmd(["git", "fetch", remote_name], root, timeout=120)
+            fetch_branch_res = _git_fetch_branch(root, remote_name, target_branch, github_token)
             fetch_tag_res = _git_fetch_tags(root, remote_name, github_token)
-            if fetch_main_res.returncode != 0 and fetch_tag_res.returncode != 0:
+            if fetch_branch_res.returncode != 0 and fetch_tag_res.returncode != 0:
                 verify_local = _run_cmd(["git", "rev-parse", "--verify", f"{final_ref}^{{commit}}"], root, timeout=20)
                 if verify_local.returncode != 0:
                     return {
                         "success": False,
                         "error": f"git fetch --tags {remote_name} 失败，且本地不存在目标 ref",
-                        "detail": ((fetch_main_res.stderr or fetch_main_res.stdout or fetch_tag_res.stderr or fetch_tag_res.stdout).strip())[:600],
+                        "detail": ((fetch_branch_res.stderr or fetch_branch_res.stdout or fetch_tag_res.stderr or fetch_tag_res.stdout).strip())[:600],
                     }
+
+        branch_ref = _resolve_target_branch_ref(root, remote_name, target_branch, preferred_branch=current.get("branch", ""))
+        if not branch_ref:
+            return {"success": False, "error": f"未找到受限更新分支：{target_branch}"}
 
         resolve_res = _run_cmd(["git", "rev-parse", "--verify", f"{final_ref}^{{commit}}"], root, timeout=20)
         if resolve_res.returncode != 0:
@@ -1004,6 +1092,12 @@ def update_to_ref(repo_root: Optional[str] = None, target_ref: Optional[str] = N
                 "detail": (resolve_res.stderr or resolve_res.stdout).strip()[:600],
             }
         target_commit = resolve_res.stdout.strip()
+
+        if not _is_ancestor(root, target_commit, branch_ref):
+            return {
+                "success": False,
+                "error": f"目标 ref 不在受限更新分支 {target_branch} 上: {final_ref}",
+            }
 
         if current.get("commit") == target_commit:
             return {
@@ -1017,7 +1111,7 @@ def update_to_ref(repo_root: Optional[str] = None, target_ref: Optional[str] = N
 
         _save_rollback_point(root, current, final_ref)
 
-        checkout_res = _run_cmd(["git", "checkout", final_ref], root, timeout=60)
+        checkout_res = _run_cmd(["git", "checkout", target_commit], root, timeout=60)
         if checkout_res.returncode != 0:
             return {
                 "success": False,
@@ -1046,6 +1140,7 @@ def update_to_ref(repo_root: Optional[str] = None, target_ref: Optional[str] = N
             "after": after,
             "target_ref": final_ref,
             "target_commit": target_commit,
+            "target_branch": target_branch,
         }
     finally:
         _release_update_lock(root)

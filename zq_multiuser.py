@@ -5358,7 +5358,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
 **版本与维护**
 - `ver` : 查看版本概览
-- `update [版本|提交]` / `reback [版本|提交]` : 更新或回退
+- `update [版本|提交]` / `reback [版本|提交]` : 仅在受限更新分支内更新或回退
 - `restart` : 重启进程
 """
             mes += f"\n\n{_build_task_usage_text()}"
@@ -6181,6 +6181,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 pending_tags = result.get("pending_tags", [])
                 recent_tags = result.get("recent_tags", []) or []
                 recent_commits = result.get("recent_commits", []) or []
+                target_branch = result.get("target_branch", "") or "-"
+                fetch_warning = str(result.get("fetch_warning", "") or "").strip()
 
                 latest_tag_target = pending_tags[0] if pending_tags else ""
                 if latest_tag_target:
@@ -6200,6 +6202,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
                 lines = [
                     "📦 版本信息概览",
+                    f"受限更新分支：{target_branch}",
                     f"当前 Tag：{current_tag_display}",
                     f"当前Commit：{current_short}",
                     f"最新 Tag：{latest_tag_line}",
@@ -6212,6 +6215,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "",
                     "🔖 最近 3 个正式版本（Tag，新→旧）",
                 ]
+                if fetch_warning:
+                    lines.insert(7, f"远端同步提示：{fetch_warning}")
 
                 if recent_tags:
                     for idx, item in enumerate(recent_tags[:3], 1):
@@ -6273,7 +6278,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         if cmd in ("reback", "rollback", "uprollback"):
             target_ref = my[1].strip() if len(my) > 1 else ""
             if not target_ref:
-                await send_to_admin(client, "用法：`reback <版本号|commit|branch>`", user_ctx, global_config)
+                await send_to_admin(client, "用法：`reback <版本号|commit>`", user_ctx, global_config)
                 return
 
             await send_to_admin(client, f"↩️ 开始回退到：{target_ref}", user_ctx, global_config)

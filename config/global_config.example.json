@@ -20,6 +20,8 @@
 
     # 更新配置（私有仓库才需要）
     "update": {
-        "github_token": ""
+        "github_token": "",
+        # 受限更新分支（ver/update/reback 仅在该分支内生效）
+        "target_branch": "codex/v2-adaptive"
     }
 }
