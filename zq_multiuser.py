@@ -14,11 +14,12 @@ import requests
 import aiohttp
 import time
 import math
+import uuid
 from collections import Counter
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
 from user_manager import UserContext
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Optional, Tuple
 import constants
 from update_manager import (
     get_current_repo_info,
@@ -255,6 +256,211 @@ def format_number(num):
     return f"{int(num):,}"
 
 
+def _safe_int(value: Any, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def _generate_decision_id() -> str:
+    return f"dec_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{uuid.uuid4().hex[:8]}"
+
+
+def _append_jsonl_record(file_path: str, record: Dict[str, Any]) -> None:
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+    with open(file_path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+
+
+def append_replay_event(user_ctx: UserContext, event_type: str, payload: Dict[str, Any]) -> None:
+    """
+    统一写入可回放事件流（决策/下注/结算）。
+    文件：<user_dir>/replay_events.log（JSONL）
+    """
+    account_name = str(getattr(user_ctx.config, "name", "") or "").strip() or f"user-{user_ctx.user_id}"
+    record = {
+        "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "event_type": str(event_type or "").strip().lower() or "unknown",
+        "user_id": int(user_ctx.user_id),
+        "account_name": account_name,
+        "payload": payload if isinstance(payload, dict) else {"raw": str(payload)},
+    }
+    replay_path = os.path.join(user_ctx.user_dir, "replay_events.log")
+    try:
+        _append_jsonl_record(replay_path, record)
+    except Exception as e:
+        log_event(
+            logging.WARNING,
+            "replay",
+            "写入 replay_events.log 失败",
+            user_id=user_ctx.user_id,
+            data=str(e),
+        )
+
+
+def _snapshot_last_decision(rt: Dict[str, Any]) -> Dict[str, Any]:
+    decision_prediction = _safe_int(rt.get("last_decision_prediction", -1), -1)
+    return {
+        "decision_id": str(rt.get("last_decision_id", "") or ""),
+        "decision_timestamp": str(rt.get("last_decision_timestamp", "") or ""),
+        "decision_source": str(rt.get("last_decision_source", "") or ""),
+        "decision_model_id": str(rt.get("last_decision_model_id", "") or ""),
+        "decision_prediction": decision_prediction,
+        "decision_direction": "big" if decision_prediction == 1 else ("small" if decision_prediction == 0 else "skip"),
+        "decision_confidence": _safe_int(rt.get("last_decision_confidence", 0), 0),
+        "decision_tag": str(rt.get("last_decision_tag", "") or ""),
+        "decision_reason": str(rt.get("last_decision_reason", "") or ""),
+        "decision_round": _safe_int(rt.get("last_decision_round", 0), 0),
+        "decision_mode": str(rt.get("last_decision_mode", "M-SMP") or "M-SMP"),
+    }
+
+
+def _persist_decision_audit(
+    user_ctx: UserContext,
+    rt: Dict[str, Any],
+    audit_log: Dict[str, Any],
+) -> None:
+    """
+    持久化决策审计并更新 runtime 的“最近决策快照”。
+    """
+    decision_id = str(audit_log.get("decision_id", "") or "")
+    output = audit_log.get("output", {}) if isinstance(audit_log.get("output", {}), dict) else {}
+    decision_prediction = _safe_int(output.get("prediction", -1), -1)
+    decision_confidence = _safe_int(output.get("confidence", 0), 0)
+    decision_source = str(audit_log.get("prediction_source", "") or "")
+    decision_tag = str(audit_log.get("pattern_tag", "") or "")
+    decision_reason = str(output.get("reason", output.get("logic", "")) or "")
+
+    rt["last_decision_id"] = decision_id
+    rt["last_decision_timestamp"] = str(audit_log.get("timestamp", "") or "")
+    rt["last_decision_source"] = decision_source
+    rt["last_decision_model_id"] = str(audit_log.get("model_id", "") or "")
+    rt["last_decision_prediction"] = decision_prediction
+    rt["last_decision_confidence"] = decision_confidence
+    rt["last_decision_tag"] = decision_tag
+    rt["last_decision_reason"] = decision_reason
+    rt["last_decision_round"] = _safe_int(audit_log.get("round", 0), 0)
+    rt["last_decision_mode"] = str(audit_log.get("mode", "M-SMP") or "M-SMP")
+    rt["last_logic_audit"] = json.dumps(audit_log, ensure_ascii=False, indent=2)
+
+    decisions_log_path = os.path.join(user_ctx.user_dir, "decisions.log")
+    try:
+        _append_jsonl_record(decisions_log_path, audit_log)
+    except Exception as e:
+        log_event(
+            logging.WARNING,
+            "predict_v10",
+            "写入decisions.log失败",
+            user_id=user_ctx.user_id,
+            data=str(e),
+        )
+
+    append_replay_event(
+        user_ctx,
+        "decision",
+        {
+            "decision_id": decision_id,
+            "round": _safe_int(audit_log.get("round", 0), 0),
+            "mode": str(audit_log.get("mode", "M-SMP") or "M-SMP"),
+            "prediction": decision_prediction,
+            "direction": "big" if decision_prediction == 1 else ("small" if decision_prediction == 0 else "skip"),
+            "confidence": decision_confidence,
+            "source": decision_source,
+            "tag": decision_tag,
+            "model_id": str(audit_log.get("model_id", "") or ""),
+            "martingale_step": _safe_int(
+                (audit_log.get("input_payload", {}) or {}).get("current_status", {}).get("martingale_step", 0),
+                0,
+            ),
+            "total_profit_to_date": _safe_int(
+                (audit_log.get("input_payload", {}) or {}).get("current_status", {}).get("total_profit_to_date", 0),
+                0,
+            ),
+            "reason": decision_reason,
+        },
+    )
+
+
+def _find_pending_bet_entry(state, pending_bet_id: str = "") -> Tuple[int, Optional[Dict[str, Any]]]:
+    logs = state.bet_sequence_log if isinstance(state.bet_sequence_log, list) else []
+    if not logs:
+        return -1, None
+
+    pending_bet_id = str(pending_bet_id or "").strip()
+    if pending_bet_id:
+        for idx in range(len(logs) - 1, -1, -1):
+            item = logs[idx]
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("bet_id", "")) != pending_bet_id:
+                continue
+            if item.get("result") in ("赢", "输", "异常未结算"):
+                continue
+            return idx, item
+
+    for idx in range(len(logs) - 1, -1, -1):
+        item = logs[idx]
+        if not isinstance(item, dict):
+            continue
+        if item.get("result") in ("赢", "输", "异常未结算"):
+            continue
+        return idx, item
+
+    return -1, None
+
+
+def _compute_replay_linkage_coverage(state, limit: int = 300) -> Dict[str, Any]:
+    logs = state.bet_sequence_log if isinstance(state.bet_sequence_log, list) else []
+    settled = [item for item in logs if isinstance(item, dict) and item.get("result") in ("赢", "输")]
+    if limit > 0:
+        settled = settled[-limit:]
+
+    total = len(settled)
+    linked = sum(1 for item in settled if str(item.get("decision_id", "")).strip())
+    coverage = round((linked / total * 100.0), 2) if total > 0 else 0.0
+    return {"total": total, "linked": linked, "coverage_pct": coverage}
+
+
+def build_replay_focus_message(user_ctx: UserContext, limit: int = 20) -> str:
+    state = user_ctx.state
+    logs = state.bet_sequence_log if isinstance(state.bet_sequence_log, list) else []
+    if not logs:
+        return "暂无复盘数据（bet_sequence_log 为空）"
+
+    limit = max(1, min(100, _safe_int(limit, 20)))
+    recent = [item for item in logs if isinstance(item, dict)][-limit:]
+    coverage = _compute_replay_linkage_coverage(state, limit=300)
+
+    lines = [
+        "📚 复盘重点（最近记录）",
+        f"展示条数：{len(recent)} / 请求 {limit}",
+        (
+            "链路覆盖（最近300笔已结算）："
+            f"{coverage['linked']}/{coverage['total']} ({coverage['coverage_pct']:.2f}%)"
+        ),
+        "",
+        "格式：bet_id | 结果/盈亏 | seq | 方向 | 决策来源/标签/置信度 | decision_id",
+    ]
+
+    for item in reversed(recent):
+        bet_id = str(item.get("bet_id", "-") or "-")
+        result = str(item.get("result", "pending") or "pending")
+        profit = _safe_int(item.get("profit", 0), 0)
+        seq = _safe_int(item.get("sequence", 0), 0)
+        direction = str(item.get("direction", "-") or "-")
+        source = str(item.get("decision_source", "-") or "-")
+        tag = str(item.get("decision_tag", "-") or "-")
+        conf = _safe_int(item.get("decision_confidence", 0), 0)
+        decision_id = str(item.get("decision_id", "") or "")
+        decision_id_short = decision_id[:20] + "..." if len(decision_id) > 23 else (decision_id or "-")
+        lines.append(
+            f"- {bet_id} | {result}/{profit} | seq{seq} | {direction} | {source}/{tag}/{conf}% | {decision_id_short}"
+        )
+
+    return "\n".join(lines)
+
+
 def _sync_fund_from_account_when_insufficient(rt: Dict[str, Any], required_amount: int = 0) -> bool:
     """
     仅在“资金不足”场景触发的修正：
@@ -304,6 +510,9 @@ def heal_stale_pending_bets(user_ctx: UserContext) -> Dict[str, Any]:
         item["result"] = "异常未结算"
         if item.get("profit") is None:
             item["profit"] = 0
+        item["status"] = "healed_abnormal"
+        item["settled_at"] = now_text
+        item["settle_result_type"] = "异常未结算"
         item["heal_time"] = now_text
         item["heal_note"] = "startup_auto_heal_pending_bet"
         healed_items.append(str(item.get("bet_id") or f"index:{idx}"))
@@ -1134,27 +1343,21 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
         else:
             rt["last_predict_source"] = "model" if model_used else "fallback"
         rt["last_predict_reason"] = reason
-        
-        # 审计日志
+
+        # 审计日志（用于复盘：决策链路唯一ID）
+        decision_id = _generate_decision_id()
         audit_log = {
+            "decision_id": decision_id,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "round": current_round,
             "mode": "M-SMP",
             "input_payload": payload,
             "output": final_result,
             "model_id": current_model_id,
+            "prediction_source": rt.get("last_predict_source", "unknown"),
+            "pattern_tag": pattern_tag,
         }
-        rt["last_logic_audit"] = json.dumps(audit_log, ensure_ascii=False, indent=2)
-        
-        # 写入用户目录下的decisions.log
-        user_dir = user_ctx.user_dir
-        decisions_log_path = os.path.join(user_dir, "decisions.log")
-        try:
-            with open(decisions_log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(audit_log, ensure_ascii=False) + "\n")
-        except Exception as e:
-            log_event(logging.WARNING, 'predict_v10', '写入decisions.log失败', 
-                      user_id=user_ctx.user_id, data=str(e))
+        _persist_decision_audit(user_ctx, rt, audit_log)
         
         # 记录预测
         state.predictions.append(prediction)
@@ -1171,12 +1374,41 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
         recent_20 = history[-20:] if len(history) >= 20 else history
         recent_sum = sum(recent_20)
         fallback = 0 if recent_sum >= len(recent_20) / 2 else 1
-        
+
+        fallback_reason = "M-SMP异常终极保底"
         rt["last_predict_info"] = f"M-SMP终极保底 | 强制预测:{fallback}"
-        rt["last_predict_tag"] = "FALLBACK"
+        rt["last_predict_tag"] = "FALLBACK_HARD"
         rt["last_predict_confidence"] = 0
         rt["last_predict_source"] = "hard_fallback"
-        rt["last_predict_reason"] = "M-SMP异常终极保底"
+        rt["last_predict_reason"] = fallback_reason
+
+        fallback_audit = {
+            "decision_id": _generate_decision_id(),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "round": current_round,
+            "mode": "M-SMP",
+            "input_payload": {
+                "current_status": {
+                    "martingale_step": _safe_int(rt.get("lose_count", 0), 0) + 1,
+                    "total_profit_to_date": _safe_int(rt.get("earnings", 0), 0),
+                    "entropy_tag": "Fallback",
+                },
+                "history_views": {
+                    "short_term_20": "".join(['1' if x == 1 else '0' for x in recent_20]),
+                },
+                "pattern_analysis": {"tag": "FALLBACK_HARD"},
+            },
+            "output": {
+                "prediction": fallback,
+                "confidence": 0,
+                "reason": fallback_reason,
+            },
+            "model_id": rt.get("current_model_id", "unknown"),
+            "prediction_source": "hard_fallback",
+            "pattern_tag": "FALLBACK_HARD",
+            "error": str(e),
+        }
+        _persist_decision_audit(user_ctx, rt, fallback_audit)
         state.predictions.append(fallback)
         return fallback
 
@@ -1875,7 +2107,8 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         _clear_hand_stall_guard(rt)
 
         bet_id = generate_bet_id(user_ctx)
-        state.bet_sequence_log.append({
+        decision_snapshot = _snapshot_last_decision(rt)
+        bet_entry = {
             "bet_id": bet_id,
             "sequence": rt.get("bet_sequence_count", 0),
             "direction": direction_en,
@@ -1883,9 +2116,46 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             "result": None,
             "profit": 0,
             "lose_stop": rt.get("lose_stop", 13),
-            "profit_target": rt.get("profit", 1000000)
-        })
+            "profit_target": rt.get("profit", 1000000),
+            "placed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "settled_at": "",
+            "status": "placed",
+            "round": _safe_int(rt.get("current_round", 1), 1),
+            "decision_id": decision_snapshot.get("decision_id", ""),
+            "decision_timestamp": decision_snapshot.get("decision_timestamp", ""),
+            "decision_source": decision_snapshot.get("decision_source", ""),
+            "decision_model_id": decision_snapshot.get("decision_model_id", ""),
+            "decision_prediction": decision_snapshot.get("decision_prediction", -1),
+            "decision_direction": decision_snapshot.get("decision_direction", "skip"),
+            "decision_confidence": decision_snapshot.get("decision_confidence", 0),
+            "decision_tag": decision_snapshot.get("decision_tag", ""),
+            "decision_reason": decision_snapshot.get("decision_reason", ""),
+            "decision_mode": decision_snapshot.get("decision_mode", "M-SMP"),
+            "decision_round": decision_snapshot.get("decision_round", 0),
+            "settle_result_num": None,
+            "settle_result_type": "",
+            "settle_history_index": -1,
+        }
+        state.bet_sequence_log.append(bet_entry)
         state.bet_sequence_log = state.bet_sequence_log[-5000:]
+        rt["pending_bet_id"] = bet_id
+
+        append_replay_event(
+            user_ctx,
+            "bet_placed",
+            {
+                "bet_id": bet_id,
+                "sequence": _safe_int(bet_entry.get("sequence", 0), 0),
+                "round": _safe_int(bet_entry.get("round", 1), 1),
+                "direction": direction_en,
+                "amount": _safe_int(rt.get("bet_amount", 0), 0),
+                "decision_id": decision_snapshot.get("decision_id", ""),
+                "decision_source": decision_snapshot.get("decision_source", ""),
+                "decision_tag": decision_snapshot.get("decision_tag", ""),
+                "decision_confidence": _safe_int(decision_snapshot.get("decision_confidence", 0), 0),
+                "decision_prediction": _safe_int(decision_snapshot.get("decision_prediction", -1), -1),
+            },
+        )
 
         bet_report = generate_mobile_bet_report(
             state.history,
@@ -3614,11 +3884,20 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
 
         if rt.get("bet", False):
                 try:
-                    if state.bet_sequence_log and state.bet_sequence_log[-1].get("result") in ("赢", "输"):
-                        # 异常兜底：如果最后一笔已结算但 bet 标记未清理，防止重复发送“押注结果”。
+                    pending_bet_id = str(rt.get("pending_bet_id", "") or "")
+                    pending_idx, pending_entry = _find_pending_bet_entry(state, pending_bet_id)
+                    if pending_entry is None:
+                        # 异常兜底：如果 bet 标记未清理但找不到待结算订单，防止重复结算。
                         rt["bet"] = False
+                        rt["pending_bet_id"] = ""
                         user_ctx.save_state()
-                        log_event(logging.WARNING, 'settle', '检测到已结算下注，跳过重复结算', user_id=user_ctx.user_id)
+                        log_event(
+                            logging.WARNING,
+                            'settle',
+                            '未找到待结算押注，跳过重复结算',
+                            user_id=user_ctx.user_id,
+                            data=f'pending_bet_id={pending_bet_id or "none"}',
+                        )
                         return
 
                     prediction = int(rt.get("bet_type", -1))
@@ -3626,6 +3905,9 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     bet_amount = int(rt.get("bet_amount", 500))
                     profit = int(bet_amount * 0.99) if win else -bet_amount
                     settle_round, settle_seq = get_settle_position(state, rt)
+                    if isinstance(pending_entry, dict):
+                        settle_round = _safe_int(pending_entry.get("round", settle_round), settle_round)
+                        settle_seq = _safe_int(pending_entry.get("sequence", settle_seq), settle_seq)
                     
                     # 记录连输状态用于回补播报
                     old_lose_count = rt.get("lose_count", 0)
@@ -3634,6 +3916,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     result_text = "赢" if win else "输"
                     # 一笔下注只允许被结算一次；后续重复结算消息不再重复记账。
                     rt["bet"] = False
+                    rt["pending_bet_id"] = ""
                     state.bet_type_history.append(prediction)
                     rt["gambling_fund"] = rt.get("gambling_fund", 0) + profit
                     rt["earnings"] = rt.get("earnings", 0) + profit
@@ -3771,16 +4054,57 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     
                     log_event(logging.INFO, 'settle', '结算结果', 
                               user_id=user_ctx.user_id, data=f'result={result_text}, profit={profit}, fund={rt.get("gambling_fund", 0)}')
-                    
-                    user_ctx.save_state()
-                    
+
+                    settled_entry = None
+                    if pending_idx >= 0 and pending_idx < len(state.bet_sequence_log):
+                        settled_entry = state.bet_sequence_log[pending_idx]
+                    elif state.bet_sequence_log:
+                        settled_entry = state.bet_sequence_log[-1]
+
                     # 更新押注日志（存储在 state 中，不是 rt 中）
-                    if state.bet_sequence_log:
-                        state.bet_sequence_log[-1]["result"] = result_text
-                        state.bet_sequence_log[-1]["profit"] = profit
-                    
+                    if isinstance(settled_entry, dict):
+                        settled_entry["result"] = result_text
+                        settled_entry["profit"] = profit
+                        settled_entry["status"] = "settled"
+                        settled_entry["settled_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                        settled_entry["settle_result_num"] = result_num
+                        settled_entry["settle_result_type"] = result_type
+                        settled_entry["settle_history_index"] = len(state.history) - 1
+                        if not str(settled_entry.get("decision_id", "")).strip():
+                            decision_snapshot = _snapshot_last_decision(rt)
+                            settled_entry["decision_id"] = decision_snapshot.get("decision_id", "")
+                            settled_entry["decision_source"] = decision_snapshot.get("decision_source", "")
+                            settled_entry["decision_tag"] = decision_snapshot.get("decision_tag", "")
+                            settled_entry["decision_confidence"] = decision_snapshot.get("decision_confidence", 0)
+                        append_replay_event(
+                            user_ctx,
+                            "bet_settled",
+                            {
+                                "bet_id": str(settled_entry.get("bet_id", "")),
+                                "sequence": _safe_int(settled_entry.get("sequence", 0), 0),
+                                "round": _safe_int(settled_entry.get("round", settle_round), settle_round),
+                                "direction": str(settled_entry.get("direction", direction.lower()) or direction.lower()),
+                                "amount": _safe_int(settled_entry.get("amount", bet_amount), bet_amount),
+                                "result": result_text,
+                                "profit": profit,
+                                "decision_id": str(settled_entry.get("decision_id", "") or ""),
+                                "decision_source": str(settled_entry.get("decision_source", "") or ""),
+                                "decision_tag": str(settled_entry.get("decision_tag", "") or ""),
+                                "decision_confidence": _safe_int(settled_entry.get("decision_confidence", 0), 0),
+                                "settle_result_num": result_num,
+                                "settle_result_type": result_type,
+                                "history_index": len(state.history) - 1,
+                            },
+                        )
+
+                    user_ctx.save_state()
+
                     result_amount = format_number(int(bet_amount * 0.99) if win else bet_amount)
-                    last_bet_id = state.bet_sequence_log[-1].get("bet_id", "") if state.bet_sequence_log else ""
+                    last_bet_id = ""
+                    if isinstance(settled_entry, dict):
+                        last_bet_id = str(settled_entry.get("bet_id", "") or "")
+                    elif state.bet_sequence_log:
+                        last_bet_id = str(state.bet_sequence_log[-1].get("bet_id", "") or "")
                     bet_id = format_bet_id(last_bet_id) if last_bet_id else f"{datetime.now().strftime('%m月%d日')}第 {rt.get('current_round', 1)} 轮第 {rt.get('current_bet_seq', 1)} 次"
                     
                     mes = f"🔢 **{bet_id}押注结果：**\n"
@@ -4325,6 +4649,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `res tj` : 重置统计数据
 - `res state` : 清空历史与状态
 - `res bet` : 重置押注策略
+- `replay [条数]` : 查看最近复盘重点（决策链路/输赢/金额，默认20条）
 - `explain` : 查看AI决策解释
 - `stats` : 查看连大、连小、连输统计
 - `balance` : 查询账户余额
@@ -4957,6 +5282,32 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             if message:
                 asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))
+            return
+
+        # replay - 查看复盘重点（决策链路/输赢/金额）
+        if cmd == "replay":
+            limit = 20
+            if len(my) > 2:
+                await send_to_admin(client, "参数格式错误，用法：`replay [条数]`", user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                return
+
+            if len(my) == 2:
+                try:
+                    limit = int(my[1])
+                    if limit <= 0:
+                        raise ValueError
+                except ValueError:
+                    await send_to_admin(client, "参数无效，条数必须是大于0的整数", user_ctx, global_config)
+                    asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                    return
+
+            mes = build_replay_focus_message(user_ctx, limit=limit)
+            log_event(logging.INFO, 'user_cmd', '查看复盘重点', user_id=user_ctx.user_id, limit=limit)
+            message = await send_to_admin(client, mes, user_ctx, global_config)
+            asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+            if message:
+                asyncio.create_task(delete_later(client, message.chat_id, message.id, 120))
             return
         
         # explain - 查看AI决策解释 - 与master一致

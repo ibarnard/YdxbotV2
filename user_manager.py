@@ -175,6 +175,16 @@ def get_default_runtime() -> Dict[str, Any]:
         "lose_notify_pending": False,
         "lose_start_info": {},
         "last_logic_audit": "",
+        "last_decision_id": "",
+        "last_decision_timestamp": "",
+        "last_decision_source": "",
+        "last_decision_model_id": "",
+        "last_decision_prediction": -1,
+        "last_decision_confidence": 0,
+        "last_decision_tag": "",
+        "last_decision_reason": "",
+        "last_decision_round": 0,
+        "last_decision_mode": "M-SMP",
         "last_settle_message_id": 0,
         # 自动风控暂停周期状态
         "risk_pause_acc_rounds": 0,
@@ -235,6 +245,7 @@ def get_default_runtime() -> Dict[str, Any]:
         "model_monitor_last_settled": 0,
         "fund_pause_notified": False,
         "limit_stop_notified": False,
+        "pending_bet_id": "",
         
         # 统计和仪表盘变量
         "total": 0,
