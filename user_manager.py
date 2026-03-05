@@ -182,6 +182,9 @@ def get_default_runtime() -> Dict[str, Any]:
         "risk_pause_cycle_active": False,
         "risk_pause_recovery_passes": 0,
         "risk_base_hit_streak": 0,
+        # 账号级默认风控开关：脚本启动时会按该默认值恢复当前开关状态。
+        "risk_base_default_enabled": True,
+        "risk_deep_default_enabled": True,
         "risk_base_enabled": True,
         "risk_deep_enabled": True,
         "risk_pause_level1_hit": False,
@@ -417,6 +420,15 @@ class UserContext:
                 # 合并默认运行时变量和保存的运行时变量
                 saved_runtime = data.get("runtime", {})
                 merged_runtime = {**default_rt, **saved_runtime}
+                # 兼容旧状态：新增“账号默认风控开关”时，优先沿用历史当前开关，避免升级后被重置。
+                if "risk_base_default_enabled" not in saved_runtime:
+                    merged_runtime["risk_base_default_enabled"] = bool(
+                        merged_runtime.get("risk_base_enabled", True)
+                    )
+                if "risk_deep_default_enabled" not in saved_runtime:
+                    merged_runtime["risk_deep_default_enabled"] = bool(
+                        merged_runtime.get("risk_deep_enabled", True)
+                    )
                 
                 self.state = UserState(
                     history=data.get("history", [])[-2000:],

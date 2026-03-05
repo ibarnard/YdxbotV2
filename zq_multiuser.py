@@ -323,6 +323,94 @@ def get_bet_status_text(rt: Dict[str, Any]) -> str:
     return "已暂停"
 
 
+def _to_bool_switch(value: Any, default: bool = True) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "on", "yes", "y", "enable", "enabled", "开", "开启"}:
+            return True
+        if normalized in {"0", "false", "off", "no", "n", "disable", "disabled", "关", "关闭"}:
+            return False
+    return bool(default)
+
+
+def _risk_switch_label(enabled: bool) -> str:
+    return "ON ✅" if enabled else "OFF ⏸"
+
+
+def _normalize_risk_switches(rt: Dict[str, Any], apply_default: bool = False) -> Dict[str, bool]:
+    """
+    统一维护风控“当前开关 + 账号默认开关”。
+    apply_default=True 时，会把当前开关重置为账号默认值（用于启动恢复）。
+    """
+    current_base = _to_bool_switch(rt.get("risk_base_enabled", True), True)
+    current_deep = _to_bool_switch(rt.get("risk_deep_enabled", True), True)
+    default_base = _to_bool_switch(rt.get("risk_base_default_enabled", current_base), current_base)
+    default_deep = _to_bool_switch(rt.get("risk_deep_default_enabled", current_deep), current_deep)
+
+    if apply_default:
+        current_base = default_base
+        current_deep = default_deep
+
+    rt["risk_base_enabled"] = current_base
+    rt["risk_deep_enabled"] = current_deep
+    rt["risk_base_default_enabled"] = default_base
+    rt["risk_deep_default_enabled"] = default_deep
+
+    return {
+        "base_enabled": current_base,
+        "deep_enabled": current_deep,
+        "base_default_enabled": default_base,
+        "deep_default_enabled": default_deep,
+    }
+
+
+def apply_account_risk_default_mode(rt: Dict[str, Any]) -> Dict[str, bool]:
+    """启动/重启时应用账号默认风控模式。"""
+    return _normalize_risk_switches(rt, apply_default=True)
+
+
+def _build_risk_state_text(rt: Dict[str, Any], include_usage: bool = True) -> str:
+    risk_modes = _normalize_risk_switches(rt, apply_default=False)
+    mes = (
+        "🛡️ 当前风控开关（账号默认模式）\n"
+        f"- 基础风控：{_risk_switch_label(risk_modes['base_enabled'])}"
+        f"（默认：{_risk_switch_label(risk_modes['base_default_enabled'])}）\n"
+        f"- 深度风控（含高倍入场门控）：{_risk_switch_label(risk_modes['deep_enabled'])}"
+        f"（默认：{_risk_switch_label(risk_modes['deep_default_enabled'])}）\n\n"
+        "说明：`risk` 命令会同步写入当前账号默认，脚本重启后按默认模式生效。"
+    )
+    if include_usage:
+        mes += "\n用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`"
+    return mes
+
+
+def build_startup_focus_reminder(user_ctx: UserContext) -> str:
+    """启动重点设置提醒：风控开关 + 预设 + 入口命令。"""
+    rt = user_ctx.state.runtime
+    risk_modes = _normalize_risk_switches(rt, apply_default=False)
+    preset_name = str(rt.get("current_preset_name", "")).strip() or "未设置"
+    try:
+        mode_code = int(rt.get("mode", 1) or 1)
+    except (TypeError, ValueError):
+        mode_code = 1
+    mode_text = {0: "反投", 1: "预测", 2: "追投"}.get(mode_code, "未知")
+    status_text = get_bet_status_text(rt)
+    return (
+        "📌 启动重点设置提醒\n"
+        f"🛡️ 风控提醒：基础 {_risk_switch_label(risk_modes['base_enabled'])} / "
+        f"深度 {_risk_switch_label(risk_modes['deep_enabled'])}\n"
+        f"🧭 默认模式：基础 {_risk_switch_label(risk_modes['base_default_enabled'])} / "
+        f"深度 {_risk_switch_label(risk_modes['deep_default_enabled'])}（可用 `risk ...` 开关）\n"
+        f"🎯 预设提醒：当前 `{preset_name}`（可用 `st <预设名>` 切换）\n"
+        f"📊 当前状态：{status_text}，模式：{mode_text}\n"
+        "ℹ️ 更多命令：`help`"
+    )
+
+
 # 消息分发规则表（与 master 一致）
 MESSAGE_ROUTING_TABLE = {
     "win": {"channels": ["admin", "priority"], "priority": True},
@@ -4068,7 +4156,13 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `pause` : 仅暂停当前账号押注（不影响其他账号）
 - `resume` : 恢复当前账号押注
 - `open/off` : 兼容旧命令（分别等同 `resume/pause`）
-- `risk [base|deep|all] [on|off]` : 风控开关 (例: `risk deep off`)
+
+**风控说明（重点）**
+- `risk` : 查看当前风控状态与账号默认模式
+- `risk base on|off` : 切换基础风控（并写入当前账号默认）
+- `risk deep on|off` : 切换深度风控（并写入当前账号默认）
+- `risk all on|off` : 同步切换基础/深度风控（并写入当前账号默认）
+- 说明：风控会直接影响暂停与入场门槛，进而影响押注收益；脚本重启后按账号默认模式自动生效
 
 **参数设置**
 - `gf [金额]` : 设置本金 (例: `gf 1000000`)
@@ -4216,18 +4310,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
         # risk - 基础/深度风控开关
         if cmd == "risk":
-            def _risk_state_text() -> str:
-                base_status = "ON ✅" if bool(rt.get("risk_base_enabled", True)) else "OFF ⏸"
-                deep_status = "ON ✅" if bool(rt.get("risk_deep_enabled", True)) else "OFF ⏸"
-                return (
-                    "🛡️ 当前风控开关\n"
-                    f"- 基础风控：{base_status}\n"
-                    f"- 深度风控（含高倍入场门控）：{deep_status}\n\n"
-                    "用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`"
-                )
+            _normalize_risk_switches(rt, apply_default=False)
 
             if len(my) == 1:
-                message = await send_to_admin(client, _risk_state_text(), user_ctx, global_config)
+                message = await send_to_admin(client, _build_risk_state_text(rt), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
                 if message:
                     asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
@@ -4256,6 +4342,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             enabled = action == "on"
             if target in {"base", "all"}:
                 rt["risk_base_enabled"] = enabled
+                rt["risk_base_default_enabled"] = enabled
                 if not enabled:
                     # 关闭基础风控时顺便清理其周期计数，避免再次开启时吃到旧状态。
                     rt["risk_pause_cycle_active"] = False
@@ -4266,13 +4353,15 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["risk_pause_priority_notified"] = False
             if target in {"deep", "all"}:
                 rt["risk_deep_enabled"] = enabled
+                rt["risk_deep_default_enabled"] = enabled
                 if not enabled:
                     rt["risk_deep_triggered_milestones"] = []
 
+            _normalize_risk_switches(rt, apply_default=False)
             user_ctx.save_state()
             scope_text = {"base": "基础风控", "deep": "深度风控", "all": "基础+深度风控"}[target]
             status_text = "开启" if enabled else "关闭"
-            mes = f"✅ 已{status_text}{scope_text}\n\n{_risk_state_text()}"
+            mes = f"✅ 已{status_text}{scope_text}（已写入账号默认模式）\n\n{_build_risk_state_text(rt)}"
             message = await send_to_admin(client, mes, user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             if message:

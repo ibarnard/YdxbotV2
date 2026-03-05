@@ -273,6 +273,37 @@ def test_user_context_supports_hash_comments_in_config(tmp_path):
     assert ctx.config.name == "注释用户"
 
 
+def test_user_context_migrates_risk_default_switches_from_legacy_runtime(tmp_path):
+    user_dir = tmp_path / "users" / "risk_migrate_user"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "迁移用户"},
+            "telegram": {"user_id": 6122},
+        },
+    )
+    _write_json(
+        user_dir / "state.json",
+        {
+            "history": [],
+            "bet_type_history": [],
+            "predictions": [],
+            "bet_sequence_log": [],
+            "runtime": {
+                "risk_base_enabled": False,
+                "risk_deep_enabled": True,
+            },
+        },
+    )
+
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    assert rt["risk_base_enabled"] is False
+    assert rt["risk_deep_enabled"] is True
+    assert rt["risk_base_default_enabled"] is False
+    assert rt["risk_deep_default_enabled"] is True
+
+
 def test_user_context_refreshes_builtin_presets_but_keeps_custom(tmp_path):
     user_dir = tmp_path / "users" / "preset_user"
     _write_json(
@@ -1416,15 +1447,61 @@ def test_risk_command_can_toggle_base_and_deep_switches(tmp_path, monkeypatch):
 
     asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="risk deep off", chat_id=5030, id=1), ctx, {}))
     assert rt["risk_deep_enabled"] is False
+    assert rt["risk_deep_default_enabled"] is False
     assert rt["risk_base_enabled"] is True
 
     asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="risk base off", chat_id=5030, id=2), ctx, {}))
     assert rt["risk_base_enabled"] is False
+    assert rt["risk_base_default_enabled"] is False
 
     asyncio.run(zm.process_user_command(SimpleNamespace(), SimpleNamespace(raw_text="risk all on", chat_id=5030, id=3), ctx, {}))
     assert rt["risk_base_enabled"] is True
     assert rt["risk_deep_enabled"] is True
+    assert rt["risk_base_default_enabled"] is True
+    assert rt["risk_deep_default_enabled"] is True
     assert any("当前风控开关" in msg for msg in sent_messages)
+
+
+def test_apply_account_risk_default_mode_resets_current_switches():
+    rt = {
+        "risk_base_enabled": True,
+        "risk_deep_enabled": False,
+        "risk_base_default_enabled": False,
+        "risk_deep_default_enabled": True,
+    }
+
+    result = zm.apply_account_risk_default_mode(rt)
+
+    assert result["base_enabled"] is False
+    assert result["deep_enabled"] is True
+    assert rt["risk_base_enabled"] is False
+    assert rt["risk_deep_enabled"] is True
+
+
+def test_build_startup_focus_reminder_contains_risk_and_preset_guidance(tmp_path):
+    user_dir = tmp_path / "users" / "startup_notice_user"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "提醒用户"},
+            "telegram": {"user_id": 6130},
+            "groups": {"admin_chat": 6130},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["current_preset_name"] = "yc05"
+    rt["risk_base_enabled"] = True
+    rt["risk_deep_enabled"] = False
+    rt["risk_base_default_enabled"] = True
+    rt["risk_deep_default_enabled"] = False
+
+    msg = zm.build_startup_focus_reminder(ctx)
+
+    assert "启动重点设置提醒" in msg
+    assert "风控提醒" in msg
+    assert "st <预设名>" in msg
+    assert "help" in msg
 
 
 def test_check_bet_status_does_not_resume_when_manual_pause(tmp_path, monkeypatch):

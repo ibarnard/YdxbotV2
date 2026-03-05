@@ -489,8 +489,21 @@ async def start_user(user_ctx: UserContext, global_config: dict):
         user_ctx.set_runtime("gambling_fund", balance)
         user_ctx.set_runtime("account_balance", balance)
 
-        # 启动自愈：清理历史遗留 result=None 的挂单记录，避免统计/资金对账被旧脏数据干扰。
-        from zq_multiuser import heal_stale_pending_bets
+        # 启动恢复：按账号默认风控模式生效，并清理历史遗留挂单。
+        from zq_multiuser import (
+            apply_account_risk_default_mode,
+            build_startup_focus_reminder,
+            heal_stale_pending_bets,
+        )
+        risk_mode = apply_account_risk_default_mode(user_ctx.state.runtime)
+        log_event(
+            logging.INFO,
+            'start',
+            '应用账号默认风控模式',
+            user_id=user_ctx.user_id,
+            base=risk_mode.get("base_enabled"),
+            deep=risk_mode.get("deep_enabled"),
+        )
         heal_result = heal_stale_pending_bets(user_ctx)
 
         user_ctx.save_state()
@@ -525,6 +538,19 @@ async def start_user(user_ctx: UserContext, global_config: dict):
                         user_id=user_ctx.user_id,
                         error=str(e),
                     )
+
+        if admin_chat:
+            try:
+                focus_msg = build_startup_focus_reminder(user_ctx)
+                await client.send_message(admin_chat, focus_msg)
+            except Exception as e:
+                log_event(
+                    logging.ERROR,
+                    'start',
+                    '启动重点设置提醒发送失败',
+                    user_id=user_ctx.user_id,
+                    error=str(e),
+                )
         
         log_event(logging.INFO, 'start', '用户启动成功',
                   user_id=user_ctx.user_id, name=user_ctx.config.name, balance=balance)
