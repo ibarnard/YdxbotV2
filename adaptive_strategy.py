@@ -356,6 +356,64 @@ def get_preset_initial_amount(preset_name: str) -> int:
     return _safe_int(vals[6], 500)
 
 
+def _extract_current_fund(user_ctx: Any) -> int:
+    state = getattr(user_ctx, "state", None)
+    rt = getattr(state, "runtime", {}) if state is not None else {}
+    if not isinstance(rt, dict):
+        return 0
+    return max(0, _safe_int(rt.get("gambling_fund", 0), 0))
+
+
+def _apply_fund_gate(
+    candidate_names: List[str],
+    current_fund: int,
+    task_cfg: Dict[str, Any],
+) -> Dict[str, Any]:
+    """
+    资金优先门控：
+    1) 单档初始底注不得超过当前资金；
+    2) 单档初始底注默认不得超过“资金的 5%”（可通过 task 参数微调）；
+    3) 为避免低资金场景完全无档位，默认给 1000 的最小底注通道。
+    """
+    current_fund = max(0, _safe_int(current_fund, 0))
+    reserve_amount = max(0, _safe_int(task_cfg.get("fund_reserve_amount", 0), 0))
+    effective_fund = max(0, current_fund - reserve_amount)
+    base_ratio_limit = _clamp(_safe_float(task_cfg.get("fund_base_ratio_limit", 0.05), 0.05), 0.001, 1.0)
+    min_base_floor = max(0, _safe_int(task_cfg.get("fund_min_base_floor", 1000), 1000))
+
+    ratio_cap = int(effective_fund * base_ratio_limit)
+    max_base_allowed = min(effective_fund, max(ratio_cap, min_base_floor))
+
+    def _base_ok(name: str, cap: int) -> bool:
+        amount = get_preset_initial_amount(name)
+        return amount > 0 and amount <= cap and amount <= effective_fund
+
+    ratio_allowed = [name for name in candidate_names if _base_ok(name, max_base_allowed)]
+    fund_only_allowed = [name for name in candidate_names if _base_ok(name, effective_fund)]
+
+    if ratio_allowed:
+        selected = ratio_allowed
+        mode = "ratio"
+    elif fund_only_allowed:
+        selected = fund_only_allowed
+        mode = "fund_only"
+    else:
+        selected = []
+        mode = "blocked"
+
+    min_required_base = min((get_preset_initial_amount(name) for name in candidate_names), default=0)
+    return {
+        "selected_candidates": selected,
+        "mode": mode,
+        "current_fund": current_fund,
+        "effective_fund": effective_fund,
+        "max_base_allowed": max_base_allowed,
+        "base_ratio_limit": base_ratio_limit,
+        "min_base_floor": min_base_floor,
+        "min_required_base": min_required_base,
+    }
+
+
 def build_recommendation(
     user_ctx: Any,
     task_cfg: Dict[str, Any],
@@ -373,6 +431,34 @@ def build_recommendation(
     candidate_names = [str(x) for x in candidates if str(x) in PRESET_LADDER]
     if not candidate_names:
         candidate_names = list(PRESET_LADDER)
+
+    current_fund = _extract_current_fund(user_ctx)
+    fund_gate = _apply_fund_gate(candidate_names, current_fund=current_fund, task_cfg=task_cfg)
+    gated_candidates = list(fund_gate.get("selected_candidates", []) or [])
+    if not gated_candidates:
+        return {
+            "error": (
+                "fund_insufficient_for_candidates"
+                f"(current={fund_gate.get('current_fund', 0)}, "
+                f"min_base={fund_gate.get('min_required_base', 0)})"
+            ),
+            "regime": str(current_sig.get("regime", REGIME_CHAOS)),
+            "regime_confidence": round(_safe_float(current_sig.get("confidence", 0.58), 0.58), 3),
+            "drift_band": str(current_sig.get("drift_band", "medium")),
+            "drift_score": _safe_float(current_sig.get("drift_score", 0.0), 0.0),
+            "recommended_preset": "",
+            "planned_rounds": 0,
+            "recheck_interval": adaptive_recheck_interval(str(current_sig.get("drift_band", "medium"))),
+            "top_cases_count": len(top_cases),
+            "preset_scores": {},
+            "preset_stats": preset_stats,
+            "fund_guard": fund_gate,
+            "evidence": {
+                "features": current_sig.get("features", {}),
+                "top_cases": top_cases[:10],
+            },
+        }
+    candidate_names = gated_candidates
 
     regime_conf = _safe_float(current_sig.get("confidence", 0.58), 0.58)
     drift_band = str(current_sig.get("drift_band", "medium"))
@@ -457,6 +543,7 @@ def build_recommendation(
         "top_cases_count": len(top_cases),
         "preset_scores": score_details,
         "preset_stats": preset_stats,
+        "fund_guard": fund_gate,
         "evidence": {
             "features": current_sig.get("features", {}),
             "top_cases": top_cases[:10],

@@ -5,6 +5,7 @@ from pathlib import Path
 
 import adaptive_analytics as analytics
 import adaptive_tasks
+import constants
 from user_manager import UserContext
 
 
@@ -62,6 +63,39 @@ def test_adaptive_task_create_and_manual_run(tmp_path):
     assert rt.get("current_task_name") == "daily_mix"
     assert rt.get("current_task_run_id", "") != ""
     assert rt.get("current_preset_name", "") != ""
+
+
+def test_adaptive_task_start_respects_fund_gate_for_preset(tmp_path):
+    ctx = _make_user(tmp_path, user_name="fund_gate_user", user_id=10010)
+    ctx.state.history = [0, 1] * 40
+    ctx.state.runtime["gambling_fund"] = 300_000
+
+    created = adaptive_tasks.create_task(ctx, "fund_gate_task", cron_minutes=10, mode="hybrid")
+    assert created["ok"] is True
+
+    started = adaptive_tasks.start_task(ctx, "fund_gate_task", trigger_type="manual")
+    assert started["ok"] is True
+    rec = started.get("recommendation", {})
+    fund_guard = rec.get("fund_guard", {})
+    assert int(fund_guard.get("current_fund", 0)) == 300_000
+    assert int(fund_guard.get("max_base_allowed", 0)) == 15_000
+
+    preset_name = str(started.get("preset", "") or "")
+    preset_base = int(constants.PRESETS[preset_name][6])
+    assert preset_base <= 15_000
+
+
+def test_adaptive_task_start_fails_when_fund_below_min_base(tmp_path):
+    ctx = _make_user(tmp_path, user_name="fund_low_user", user_id=10011)
+    ctx.state.history = [0, 1] * 40
+    ctx.state.runtime["gambling_fund"] = 300
+
+    created = adaptive_tasks.create_task(ctx, "fund_low_task", cron_minutes=10, mode="hybrid")
+    assert created["ok"] is True
+
+    started = adaptive_tasks.start_task(ctx, "fund_low_task", trigger_type="manual")
+    assert started["ok"] is False
+    assert "fund_insufficient_for_candidates" in str(started.get("error", ""))
 
 
 def test_adaptive_task_on_settle_triggers_risk_pause_without_ending_task(tmp_path):

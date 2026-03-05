@@ -2504,7 +2504,7 @@ def test_format_dashboard_hides_task_hint_when_not_running(tmp_path, monkeypatch
     assert "详情：`task panel`" not in msg
 
 
-def test_format_dashboard_shows_task_hint_when_task_mode_idle(tmp_path, monkeypatch):
+def test_format_dashboard_shows_run_mode_when_task_mode_idle(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "51130"
     _write_json(
         user_dir / "config.json",
@@ -2525,8 +2525,8 @@ def test_format_dashboard_shows_task_hint_when_task_mode_idle(tmp_path, monkeypa
 
     monkeypatch.setattr(zm, "get_current_repo_info", lambda: {"current_tag": "v1.0.10", "nearest_tag": "v1.0.10", "short_commit": "abcd1234"})
     msg = zm.format_dashboard(ctx)
-    assert "🧩 **任务状态栏**｜待机" in msg
-    assert "task run <name>" in msg
+    assert "🧭 **运行模式：任务模式**" in msg
+    assert "🧩 **任务状态栏**" not in msg
 
 
 def test_format_dashboard_highlights_task_mode_when_running(tmp_path, monkeypatch):
@@ -2549,9 +2549,8 @@ def test_format_dashboard_highlights_task_mode_when_running(tmp_path, monkeypatc
 
     monkeypatch.setattr(zm, "get_current_repo_info", lambda: {"current_tag": "v1.0.10", "nearest_tag": "v1.0.10", "short_commit": "abcd1234"})
     msg = zm.format_dashboard(ctx)
-    assert "🧩 **任务状态栏**｜运行中" in msg
-    assert "`daily_mix`" in msg
-    assert "`task panel`" in msg
+    assert "🧭 **运行模式：任务模式**" in msg
+    assert "🧩 **任务状态栏**" not in msg
 
 
 def test_st_command_triggers_auto_yc_report(tmp_path, monkeypatch):

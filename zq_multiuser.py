@@ -639,11 +639,6 @@ def format_dashboard(user_ctx: UserContext) -> str:
     mes += f"🤖 **模型 API：{rt.get('current_model_id', 'unknown')}**\n"
     mes += f"🚦 **当前押注状态：{get_bet_status_text(rt)}**\n"
     mes += f"🧭 **运行模式：{_dashboard_run_mode_label(rt)}**\n\n"
-    task_hint = ""
-    try:
-        task_hint = adaptive_tasks.format_task_dashboard_hint(user_ctx)
-    except Exception:
-        task_hint = "__ERR__"
     preset_name = rt.get("current_preset_name", "none")
     preset_params = (
         f"{rt.get('continuous', 1)} {rt.get('lose_stop', 13)} "
@@ -679,10 +674,6 @@ def format_dashboard(user_ctx: UserContext) -> str:
     if win_total > 0 or total > 0:
         win_rate = (win_total / total * 100) if total > 0 else 0.00
         mes += f"🎯 **押注次数：{total}**\n🏆 **胜率：{win_rate:.2f}%**\n💰 **收益：{format_number(rt.get('earnings', 0))}**"
-    if task_hint == "__ERR__":
-        mes += "\n\n🧩 **任务状态栏：读取失败**"
-    elif task_hint:
-        mes += f"\n\n{task_hint}"
     
     return mes
 
@@ -696,6 +687,39 @@ def get_bet_status_text(rt: Dict[str, Any]) -> str:
     if rt.get("bet_on", False):
         return "运行中"
     return "已暂停"
+
+
+async def _clear_task_status_message(client, user_ctx: UserContext) -> None:
+    if hasattr(user_ctx, "task_status_message") and user_ctx.task_status_message:
+        await cleanup_message(client, user_ctx.task_status_message)
+    user_ctx.task_status_message = None
+
+
+async def _refresh_task_status_message(
+    client,
+    user_ctx: UserContext,
+    global_config: dict,
+    delay_seconds: float = 1.0,
+) -> None:
+    try:
+        if delay_seconds > 0:
+            await asyncio.sleep(delay_seconds)
+        rt = user_ctx.state.runtime
+        if not _is_task_mode_guard_active(rt):
+            await _clear_task_status_message(client, user_ctx)
+            return
+        status_text = adaptive_tasks.format_task_dashboard_hint(user_ctx)
+        if not status_text:
+            await _clear_task_status_message(client, user_ctx)
+            return
+        await _clear_task_status_message(client, user_ctx)
+        user_ctx.task_status_message = await send_to_admin(client, status_text, user_ctx, global_config)
+    except Exception as e:
+        log_event(logging.WARNING, "task", "刷新任务状态栏失败", user_id=user_ctx.user_id, data=str(e))
+
+
+def _schedule_task_status_refresh(client, user_ctx: UserContext, global_config: dict, delay_seconds: float = 1.0) -> None:
+    asyncio.create_task(_refresh_task_status_message(client, user_ctx, global_config, delay_seconds=delay_seconds))
 
 
 def _to_bool_switch(value: Any, default: bool = True) -> bool:
@@ -1010,12 +1034,23 @@ def _pct_text(value: Any, default: float) -> str:
 
 
 def _build_task_trigger_notice(result: Dict[str, Any], rec: Dict[str, Any], title: str = "任务已触发") -> str:
+    fund_guard = rec.get("fund_guard", {}) if isinstance(rec.get("fund_guard", {}), dict) else {}
+    current_fund = int(fund_guard.get("current_fund", 0) or 0)
+    max_base_allowed = int(fund_guard.get("max_base_allowed", 0) or 0)
+    allowed_presets = fund_guard.get("selected_candidates", [])
+    if isinstance(allowed_presets, list) and allowed_presets:
+        allowed_text = ", ".join(str(x) for x in allowed_presets[:6])
+        if len(allowed_presets) > 6:
+            allowed_text += f" ...（共 {len(allowed_presets)} 个）"
+    else:
+        allowed_text = "-"
     return (
         f"{title}\n"
         f"任务：{result.get('task_name', '-')}\n"
         f"run_id：{result.get('task_run_id', '-')}\n"
         f"盘面：{_task_regime_text(rec.get('regime', '-'))}\n"
         f"档位：{result.get('preset', '-')}\n"
+        f"资金门控：当前 {current_fund / 10000:.2f} 万 | 最大底注 {max_base_allowed} | 可用档位 {allowed_text}\n"
         f"本阶段计划：{rec.get('planned_rounds', 0)} 局（会按复评动态重算）"
     )
 
@@ -1068,6 +1103,23 @@ def _format_task_start_error(user_ctx: UserContext, error_text: str) -> str:
         return f"❌ 启动失败：任务配置处于暂停态\n- 详情：{err}\n- 处理方式：先 `task enable <name>` 或检查任务状态"
     if low.startswith("preset `") and low.endswith("` missing"):
         return f"❌ 启动失败：推荐预设不存在\n- 详情：{err}\n- 处理方式：检查预设配置（`yss`）后重试"
+    if "fund_insufficient_for_candidates" in low:
+        current_fund = int(rt.get("gambling_fund", 0) or 0)
+        current_wan = current_fund / 10000.0
+        min_base = 0
+        matched = re.search(r"min_base\s*=\s*(\d+)", low)
+        if matched:
+            try:
+                min_base = int(matched.group(1))
+            except Exception:
+                min_base = 0
+        min_base_text = f"{min_base / 10000.0:.2f} 万" if min_base > 0 else "未知"
+        return (
+            "❌ 启动失败：资金门控未通过（任务模式先资金、后策略）\n"
+            f"- 当前菠菜资金：{current_wan:.2f} 万\n"
+            f"- 最低可用底注：{min_base_text}\n"
+            "- 处理方式：先 `gf <金额>` 补充资金，或降低任务候选档位后重试"
+        )
     return f"❌ 启动失败：{err}"
 
 
@@ -1958,6 +2010,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 await cleanup_message(client, user_ctx.dashboard_message)
             dashboard = format_dashboard(user_ctx)
             user_ctx.dashboard_message = await send_to_admin(client, dashboard, user_ctx, global_config)
+            _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
             log_event(
                 logging.INFO,
                 "bet_on",
@@ -2849,6 +2902,7 @@ async def process_red_packet(client, event, user_ctx: UserContext, global_config
                     bonus=bonus,
                 )
                 await send_to_admin(client, mes, user_ctx, global_config)
+                _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
                 return
 
             if any(flag in response_msg for flag in ("不能重复领取", "来晚了", "领过")):
@@ -2861,6 +2915,7 @@ async def process_red_packet(client, event, user_ctx: UserContext, global_config
                     response=response_msg,
                 )
                 await send_to_admin(client, mes, user_ctx, global_config)
+                _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
                 return
 
             log_event(
@@ -4944,6 +4999,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         dashboard = format_dashboard(user_ctx)
         log_event(logging.INFO, 'settle', '发送仪表盘', user_id=user_ctx.user_id)
         user_ctx.dashboard_message = await send_to_admin(client, dashboard, user_ctx, global_config)
+        _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
         
         # 保存状态
         user_ctx.save_state()
@@ -5365,6 +5421,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 else:
                     mes = "⏸ 任务模式已手动暂停（当前无运行中的 task run）"
                 await send_to_admin(client, mes, user_ctx, global_config)
+                _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
                 log_event(logging.INFO, 'user_cmd', '任务模式手动暂停', user_id=user_ctx.user_id)
                 return
 
@@ -5408,6 +5465,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 else:
                     mes = "▶️ 任务模式已恢复（等待下一次任务触发）"
                 await send_to_admin(client, mes, user_ctx, global_config)
+                _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
                 log_event(logging.INFO, 'user_cmd', '任务模式手动恢复', user_id=user_ctx.user_id)
                 return
 
@@ -5636,6 +5694,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     else:
                         mes = "❌ 任务模式恢复失败"
                 await send_to_admin(client, mes, user_ctx, global_config)
+                _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
                 return
 
             if sub_cmd in {"disable", "enable"}:
@@ -5667,11 +5726,22 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     user_ctx.save_state()
                     rec = result.get("recommendation", {})
                     limits = result.get("limits", {}) if isinstance(result.get("limits", {}), dict) else {}
+                    fund_guard = rec.get("fund_guard", {}) if isinstance(rec.get("fund_guard", {}), dict) else {}
+                    current_fund = int(fund_guard.get("current_fund", rt.get("gambling_fund", 0)) or 0)
+                    max_base_allowed = int(fund_guard.get("max_base_allowed", 0) or 0)
+                    allowed_presets = fund_guard.get("selected_candidates", [])
+                    if isinstance(allowed_presets, list) and allowed_presets:
+                        allowed_text = ", ".join(str(x) for x in allowed_presets[:6])
+                        if len(allowed_presets) > 6:
+                            allowed_text += f" ...（共 {len(allowed_presets)} 个）"
+                    else:
+                        allowed_text = "-"
                     mes = (
                         f"✅ 任务 `{task_name}` 已启动\n"
                         f"- run_id：{result.get('task_run_id', '-')}\n"
                         f"- 盘面：{_task_regime_text(rec.get('regime', '-'))}\n"
                         f"- 档位：{result.get('preset', '-')}\n"
+                        f"- 资金门控：当前 {current_fund / 10000:.2f} 万 | 最大底注 {max_base_allowed} | 可用档位 {allowed_text}\n"
                         f"- 本阶段计划：{rec.get('planned_rounds', 0)} 局（约每 {rec.get('recheck_interval', 0)} 局复评，后续会动态重算）\n"
                         "- 风控：任务模式下已关闭基础/深度/轻度风控\n"
                         f"- 风控阈值：任务止损 {limits.get('run_loss_limit', 0)} | 日损 {limits.get('day_loss_limit', 0)}\n"
@@ -5680,6 +5750,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 else:
                     mes = _format_task_start_error(user_ctx, result.get("error", result.get("reason", "unknown")))
                 await send_to_admin(client, mes, user_ctx, global_config)
+                if _is_task_mode_guard_active(rt):
+                    _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
+                else:
+                    await _clear_task_status_message(client, user_ctx)
                 return
 
             if sub_cmd in {"stop", "end", "exit"}:
@@ -5695,6 +5769,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                             user_ctx,
                             global_config,
                         )
+                        await _clear_task_status_message(client, user_ctx)
                     else:
                         await send_to_admin(
                             client,
@@ -5717,6 +5792,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 else:
                     mes = f"❌ 结束任务失败：{result.get('error', 'unknown')}"
                 await send_to_admin(client, mes, user_ctx, global_config)
+                if _is_task_mode_guard_active(rt):
+                    _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
+                else:
+                    await _clear_task_status_message(client, user_ctx)
                 return
 
             if sub_cmd == "auto":
@@ -5909,6 +5988,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         if cmd == "status":
             dashboard = format_dashboard(user_ctx)
             message = await send_to_admin(client, dashboard, user_ctx, global_config)
+            _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             if message:
                 asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
@@ -5991,6 +6071,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "用法: warn <次数> 或 wlc <次数>"
                 )
             message = await send_to_admin(client, mes, user_ctx, global_config)
+            if _is_task_mode_guard_active(rt):
+                _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
+            else:
+                await _clear_task_status_message(client, user_ctx)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             if message:
                 asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))
@@ -6266,6 +6350,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 mes = "请指定重置类型：res tj / res state / res bet / res task"
             
             message = await send_to_admin(client, mes, user_ctx, global_config)
+            if _is_task_mode_guard_active(rt):
+                _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
+            else:
+                await _clear_task_status_message(client, user_ctx)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             if message:
                 asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))
@@ -6450,6 +6538,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 )
             
             message = await send_to_admin(client, mes, user_ctx, global_config)
+            if _is_task_mode_guard_active(rt):
+                _schedule_task_status_refresh(client, user_ctx, global_config, delay_seconds=1.0)
+            else:
+                await _clear_task_status_message(client, user_ctx)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             if message:
                 asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))

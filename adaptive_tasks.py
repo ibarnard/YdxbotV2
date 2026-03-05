@@ -227,6 +227,9 @@ def _normalize_new_task(
         "task_loss_pct": float(task_loss_pct),
         "daily_loss_pct": float(daily_loss_pct),
         "max_consecutive_losses": int(max_consecutive_losses),
+        "fund_base_ratio_limit": 0.05,
+        "fund_min_base_floor": 1000,
+        "fund_reserve_amount": 0,
         "high_tier_sample_min": 120,
         "high_tier_conf_min": 0.78,
         "high_tier_win_rate_min": 0.57,
@@ -458,6 +461,12 @@ def format_task_detail(user_ctx: Any, name: str) -> str:
             f"日损 {_pct_text(task.get('daily_loss_pct', 0.02), 0.02)} | "
             f"最大连输 {max(1, _safe_int(task.get('max_consecutive_losses', 4), 4))}"
         ),
+        (
+            "- 资金门控："
+            f"底注≤资金×{_safe_float(task.get('fund_base_ratio_limit', 0.05), 0.05) * 100.0:.1f}%"
+            f"（最低底注 {_safe_int(task.get('fund_min_base_floor', 1000), 1000)}，"
+            f"预留资金 {_safe_int(task.get('fund_reserve_amount', 0), 0)}）"
+        ),
         f"- 最近触发时间：{_fmt_time_text(runtime.get('last_trigger_at', ''))}",
         f"- 最近运行ID：{str(runtime.get('last_run_id', '') or '-')}",
         f"- 最近运行状态：{_status_text(last_run_status_raw) if last_run_status_raw else '-'}",
@@ -688,6 +697,9 @@ def start_task(user_ctx: Any, task_name: str, trigger_type: str = "manual") -> D
         return {"ok": False, "error": f"task `{_active_task_name(user_ctx)}` is running"}
 
     rec = build_recommendation(user_ctx, task_cfg=task)
+    rec_error = str(rec.get("error", "") or "").strip()
+    if rec_error:
+        return {"ok": False, "error": rec_error, "recommendation": rec}
     preset_name = str(rec.get("recommended_preset", "yc1") or "yc1")
     if preset_name not in PRESET_LADDER:
         preset_name = "yc1"
@@ -936,6 +948,8 @@ def _recheck_if_needed(user_ctx: Any, task_cfg: Dict[str, Any]) -> Optional[Dict
         run_max_dd=_safe_int(rt.get("task_run_max_dd", 0), 0),
         run_loss_limit=max(1, _safe_int(rt.get("task_run_loss_limit", 1), 1)),
     )
+    if str(rec.get("error", "") or "").strip():
+        return rec
     next_preset = str(rec.get("recommended_preset", rt.get("current_preset_name", "yc1")) or "yc1")
     if next_preset in PRESET_LADDER:
         _apply_preset(user_ctx, next_preset)
@@ -1046,7 +1060,7 @@ def format_current_task_brief(user_ctx: Any) -> str:
 
 
 def format_task_dashboard_hint(user_ctx: Any) -> str:
-    """仪表盘底部任务状态栏（任务模式常驻，2行以内）。"""
+    """任务状态栏简版（独立消息）。"""
     rt = _get_rt(user_ctx)
     run_mode = str(rt.get("run_mode", "normal") or "normal").strip().lower()
     run_id = str(rt.get("current_task_run_id", "") or "").strip()
@@ -1054,16 +1068,7 @@ def format_task_dashboard_hint(user_ctx: Any) -> str:
         return ""
 
     mode_state = _task_mode_state(rt)
-    pause_reason = str(rt.get("task_mode_pause_reason", "") or "").strip()
-    if not run_id:
-        return (
-            "🧩 **任务状态栏**｜"
-            f"{_task_mode_state_text(mode_state)}\n"
-            f"当前无运行任务 ｜ 操作：`task run <name>` / `task panel`"
-        )
-
     task_name = str(rt.get("current_task_name", "") or "-")
-    short_run_id = f"{run_id[:10]}..." if len(run_id) > 10 else run_id
     executed = _safe_int(rt.get("task_step_executed_rounds", 0), 0)
     planned = _safe_int(rt.get("task_step_planned_rounds", 0), 0)
     remaining = _safe_int(rt.get("task_step_remaining_rounds", 0), 0)
@@ -1071,21 +1076,18 @@ def format_task_dashboard_hint(user_ctx: Any) -> str:
     max_dd = _safe_int(rt.get("task_run_max_dd", 0), 0)
     preset_name = str(rt.get("current_preset_name", "") or "-")
     regime = regime_text(rt.get("task_regime", "-"))
-    line2 = (
-        f"盘面：{regime} ｜ 预设：{preset_name} ｜ 进度：{executed}/{planned}（剩{remaining}）"
-        f" ｜ 累计：{run_pnl} / 回撤：{max_dd} ｜ `task panel`"
-    )
-    if mode_state == "paused_risk" and pause_reason:
-        line2 = (
-            f"盘面：{regime} ｜ 预设：{preset_name} ｜ 进度：{executed}/{planned}（剩{remaining}）"
-            f" ｜ 暂停原因：{pause_reason} ｜ `task panel`"
-        )
-
-    return (
-        "🧩 **任务状态栏**｜"
-        f"{_task_mode_state_text(mode_state)} ｜ 任务：`{task_name}`（{short_run_id}）\n"
-        f"{line2}"
-    )
+    lines = [
+        "🧩 任务状态栏🧩",
+        "",
+        f"状态：{_task_mode_state_text(mode_state)}",
+        f"任务：{task_name}",
+        f"盘面：{regime}",
+        f"预设：{preset_name}",
+        f"进度：{executed}/{planned}（剩{remaining}）",
+        f"累计：{run_pnl}",
+        f"回撤：{max_dd}",
+    ]
+    return "\n".join(lines)
 
 
 def format_task_runtime_panel(user_ctx: Any) -> str:
