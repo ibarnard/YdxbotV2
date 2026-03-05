@@ -33,16 +33,135 @@ from update_manager import (
 logger = logging.getLogger('zq_multiuser')
 logger.setLevel(logging.DEBUG)
 
+ACCOUNT_LOG_ROOT = os.path.join("logs", "accounts")
+_ACCOUNT_NAME_REGISTRY: Dict[str, str] = {}
+
+
+def _sanitize_account_slug(text: str, fallback: str = "unknown") -> str:
+    raw = str(text or "").strip().lower().replace(" ", "-")
+    cleaned = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_"})
+    return cleaned or fallback
+
+
+def register_user_log_identity(user_ctx: UserContext) -> str:
+    """注册账号日志标识，供统一日志前缀和分流使用。"""
+    user_id = str(getattr(user_ctx, "user_id", 0) or 0)
+    account_name = str(getattr(getattr(user_ctx, "config", None), "name", "") or "").strip()
+    if not account_name:
+        account_name = f"user-{user_id}"
+    _ACCOUNT_NAME_REGISTRY[user_id] = account_name
+    return account_name
+
+
+def _infer_log_category(level: int, module: str, event: str) -> str:
+    if level >= logging.WARNING:
+        return "warning"
+    text = f"{module}:{event}".lower()
+    business_tokens = (
+        "bet", "settle", "risk", "predict", "user_cmd", "balance", "fund",
+        "profit", "preset", "pause", "resume", "restart", "update", "reback",
+        "model", "apikey", "stats", "status", "yc", "dashboard",
+    )
+    if any(token in text for token in business_tokens):
+        return "business"
+    return "runtime"
+
+
+class _LogDefaultsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "user_id"):
+            record.user_id = "0"
+        if not hasattr(record, "mod"):
+            record.mod = "zq"
+        if not hasattr(record, "event"):
+            record.event = "general"
+        if not hasattr(record, "data"):
+            record.data = ""
+        if not hasattr(record, "category"):
+            record.category = _infer_log_category(record.levelno, str(record.mod), str(record.event))
+        if not hasattr(record, "account_slug"):
+            fallback_slug = f"user-{record.user_id}" if str(record.user_id) != "0" else "unknown"
+            record.account_slug = _sanitize_account_slug("", fallback=fallback_slug)
+        if not hasattr(record, "account_tag"):
+            record.account_tag = f"【ydx-{record.account_slug}】"
+        return True
+
+
+class _AccountCategoryRouterHandler(logging.Handler):
+    """按账号+分类分流到独立日志文件：logs/accounts/<账号>/<runtime|warning|business>.log"""
+
+    def __init__(self, root_dir: str, backup_count: int = 7):
+        super().__init__(level=logging.DEBUG)
+        self.root_dir = root_dir
+        self.backup_count = backup_count
+        self._handlers: Dict[tuple, TimedRotatingFileHandler] = {}
+        self._default_filter = _LogDefaultsFilter()
+        self._formatter = logging.Formatter(
+            '%(asctime)s | %(levelname)s | [%(category)s] [%(account_tag)s] [%(mod)s:%(event)s] %(message)s | %(data)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+
+    def _get_handler(self, account_slug: str, category: str) -> TimedRotatingFileHandler:
+        key = (account_slug, category)
+        if key in self._handlers:
+            return self._handlers[key]
+
+        account_dir = os.path.join(self.root_dir, account_slug)
+        os.makedirs(account_dir, exist_ok=True)
+        log_path = os.path.join(account_dir, f"{category}.log")
+        handler = TimedRotatingFileHandler(
+            log_path,
+            when='midnight',
+            interval=1,
+            backupCount=self.backup_count,
+            encoding='utf-8'
+        )
+        handler.setFormatter(self._formatter)
+        handler.addFilter(self._default_filter)
+        self._handlers[key] = handler
+        return handler
+
+    def emit(self, record: logging.LogRecord):
+        try:
+            self._default_filter.filter(record)
+            account_slug = str(getattr(record, "account_slug", "unknown") or "unknown")
+            category = str(getattr(record, "category", "runtime") or "runtime")
+            handler = self._get_handler(account_slug, category)
+            handler.emit(record)
+        except Exception:
+            self.handleError(record)
+
+    def close(self):
+        for handler in self._handlers.values():
+            try:
+                handler.close()
+            except Exception:
+                pass
+        self._handlers.clear()
+        super().close()
+
+
+_default_log_filter = _LogDefaultsFilter()
+
 file_handler = TimedRotatingFileHandler('bot.log', when='midnight', interval=1, backupCount=7, encoding='utf-8')
 file_handler.setFormatter(logging.Formatter(
-    '%(asctime)s - %(levelname)s - [%(user_id)s/%(event)s] - %(message)s - [%(data)s]',
+    '%(asctime)s | %(levelname)s | [%(category)s] [%(account_tag)s] [%(mod)s:%(event)s] %(message)s | %(data)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 ))
+file_handler.addFilter(_default_log_filter)
 logger.addHandler(file_handler)
 
 console_handler = logging.StreamHandler()
-console_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+console_handler.setFormatter(logging.Formatter(
+    '%(asctime)s | %(levelname)s | [%(category)s] [%(account_tag)s] %(message)s',
+    datefmt='%H:%M:%S'
+))
+console_handler.addFilter(_default_log_filter)
 logger.addHandler(console_handler)
+
+account_category_handler = _AccountCategoryRouterHandler(ACCOUNT_LOG_ROOT, backup_count=7)
+account_category_handler.addFilter(_default_log_filter)
+logger.addHandler(account_category_handler)
 
 # 自动统计推送节奏：每 10 局一次，保留 10 分钟后自动删除
 AUTO_STATS_INTERVAL_ROUNDS = 10
@@ -102,10 +221,32 @@ def log_event(level, module, event, message=None, **kwargs):
         message = event
         event = module
         module = 'zq'
-    data = ', '.join(f'{k}={v}' for k, v in kwargs.items())
+    category = str(kwargs.pop("category", "")).strip().lower()
+    account_name = str(kwargs.pop("account_name", "")).strip()
     user_id = kwargs.get('user_id', 0)
+    user_id_text = str(user_id)
+    if not account_name:
+        account_name = _ACCOUNT_NAME_REGISTRY.get(user_id_text, "")
+    if not account_name and user_id_text not in {"", "0"}:
+        account_name = f"user-{user_id_text}"
+    account_slug = _sanitize_account_slug(account_name, fallback=(f"user-{user_id_text}" if user_id_text not in {"", "0"} else "unknown"))
+    if category not in {"runtime", "warning", "business"}:
+        category = _infer_log_category(level, str(module), str(event))
+    data = ', '.join(f'{k}={v}' for k, v in kwargs.items())
     # 使用 'mod' 而不是 'module'，因为 'module' 是 logging 的保留字段
-    logger.log(level, message, extra={'user_id': str(user_id), 'mod': module, 'event': event, 'data': data})
+    logger.log(
+        level,
+        message,
+        extra={
+            'user_id': user_id_text,
+            'mod': module,
+            'event': event,
+            'data': data,
+            'category': category,
+            'account_slug': account_slug,
+            'account_tag': f"【ydx-{account_slug}】",
+        },
+    )
 
 
 # 格式化数字

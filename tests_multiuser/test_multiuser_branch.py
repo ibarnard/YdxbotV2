@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import re
 import threading
 from pathlib import Path
@@ -273,6 +274,49 @@ def test_user_context_supports_hash_comments_in_config(tmp_path):
     assert ctx.config.name == "注释用户"
 
 
+def test_zq_log_event_includes_account_prefix_and_business_category(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "log_user"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "Musk Xu"},
+            "telegram": {"user_id": 7001},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    zm.register_user_log_identity(ctx)
+
+    captured = {}
+
+    def fake_log(level, message, extra=None):
+        captured["level"] = level
+        captured["message"] = message
+        captured["extra"] = extra or {}
+
+    monkeypatch.setattr(zm.logger, "log", fake_log)
+    zm.log_event(logging.INFO, "user_cmd", "处理用户命令", "ok", user_id=7001)
+
+    assert captured["level"] == logging.INFO
+    assert captured["extra"]["account_tag"] == "【ydx-musk-xu】"
+    assert captured["extra"]["category"] == "business"
+    assert captured["extra"]["user_id"] == "7001"
+
+
+def test_zq_log_event_warning_level_goes_to_warning_category(monkeypatch):
+    captured = {}
+
+    def fake_log(level, message, extra=None):
+        captured["level"] = level
+        captured["extra"] = extra or {}
+
+    monkeypatch.setattr(zm.logger, "log", fake_log)
+    zm.log_event(logging.ERROR, "start", "用户启动失败", "fail", user_id=9001)
+
+    assert captured["level"] == logging.ERROR
+    assert captured["extra"]["category"] == "warning"
+    assert captured["extra"]["account_tag"] == "【ydx-user-9001】"
+
+
 def test_user_context_migrates_risk_default_switches_from_legacy_runtime(tmp_path):
     user_dir = tmp_path / "users" / "risk_migrate_user"
     _write_json(
@@ -363,6 +407,26 @@ def test_main_multiuser_session_lock_prevents_duplicate_acquire(tmp_path):
     finally:
         mm._release_session_lock(ctx1)
         mm._release_session_lock(ctx2)
+
+
+def test_main_log_event_includes_account_prefix(monkeypatch):
+    captured = {}
+    fake_ctx = SimpleNamespace(
+        user_id=8801,
+        config=SimpleNamespace(name="Musk Xu"),
+    )
+    mm.register_main_user_log_identity(fake_ctx)
+
+    def fake_log(level, message, extra=None):
+        captured["level"] = level
+        captured["extra"] = extra or {}
+
+    monkeypatch.setattr(mm.logger, "log", fake_log)
+    mm.log_event(logging.INFO, "start", "用户启动成功", "ok", user_id=8801)
+
+    assert captured["level"] == logging.INFO
+    assert captured["extra"]["account_tag"] == "【ydx-musk-xu】"
+    assert captured["extra"]["category"] in {"runtime", "business"}
 
 
 def test_user_isolation_between_two_contexts(tmp_path):

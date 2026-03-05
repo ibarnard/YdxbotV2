@@ -12,7 +12,7 @@ import time
 import sys
 import errno
 import fcntl
-from typing import Any, List
+from typing import Any, Dict, List
 from telethon import TelegramClient, events
 from logging.handlers import TimedRotatingFileHandler
 from user_manager import UserManager, UserContext
@@ -22,20 +22,71 @@ from update_manager import periodic_release_check_loop
 logger = logging.getLogger('main_multiuser')
 logger.setLevel(logging.DEBUG)
 
+_MAIN_ACCOUNT_NAME_REGISTRY: Dict[str, str] = {}
+
+
+def _sanitize_account_slug(text: str, fallback: str = "unknown") -> str:
+    raw = str(text or "").strip().lower().replace(" ", "-")
+    cleaned = "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_"})
+    return cleaned or fallback
+
+
+def register_main_user_log_identity(user_ctx: UserContext) -> str:
+    user_id = str(getattr(user_ctx, "user_id", 0) or 0)
+    account_name = str(getattr(getattr(user_ctx, "config", None), "name", "") or "").strip()
+    if not account_name:
+        account_name = f"user-{user_id}"
+    _MAIN_ACCOUNT_NAME_REGISTRY[user_id] = account_name
+    return account_name
+
+
+def _infer_main_log_category(level: int, module: str, event: str) -> str:
+    if level >= logging.WARNING:
+        return "warning"
+    text = f"{module}:{event}".lower()
+    if any(token in text for token in ("start", "login", "release", "check", "health")):
+        return "runtime"
+    return "business"
+
+
+class _MainLogDefaultsFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not hasattr(record, "custom_module"):
+            record.custom_module = "main"
+        if not hasattr(record, "event"):
+            record.event = "general"
+        if not hasattr(record, "data"):
+            record.data = ""
+        if not hasattr(record, "user_id"):
+            record.user_id = "0"
+        if not hasattr(record, "category"):
+            record.category = _infer_main_log_category(record.levelno, str(record.custom_module), str(record.event))
+        if not hasattr(record, "account_slug"):
+            fallback_slug = f"user-{record.user_id}" if str(record.user_id) != "0" else "unknown"
+            record.account_slug = _sanitize_account_slug("", fallback=fallback_slug)
+        if not hasattr(record, "account_tag"):
+            record.account_tag = f"【ydx-{record.account_slug}】"
+        return True
+
+
+_main_log_filter = _MainLogDefaultsFilter()
+
 file_handler = TimedRotatingFileHandler('numai.log', when='midnight', interval=1, backupCount=3, encoding='utf-8')
 file_handler.setFormatter(logging.Formatter(
-    '%(asctime)s | %(levelname)s | [%(custom_module)s:%(event)s] | %(message)s | %(data)s',
+    '%(asctime)s | %(levelname)s | [%(category)s] [%(account_tag)s] [%(custom_module)s:%(event)s] %(message)s | %(data)s',
     datefmt='%Y-%m-%d %H:%M:%S'
 ))
 file_handler.setLevel(logging.DEBUG)
+file_handler.addFilter(_main_log_filter)
 logger.addHandler(file_handler)
 
 console_handler = logging.StreamHandler()
 console_handler.setFormatter(logging.Formatter(
-    '%(asctime)s | %(levelname)s | %(message)s | %(data)s',
+    '%(asctime)s | %(levelname)s | [%(category)s] [%(account_tag)s] %(message)s | %(data)s',
     datefmt='%H:%M:%S'
 ))
 console_handler.setLevel(logging.INFO)
+console_handler.addFilter(_main_log_filter)
 logger.addHandler(console_handler)
 
 
@@ -50,8 +101,30 @@ def log_event(level, module, event=None, message='', **kwargs):
         message = event
         event = module
         module = 'main'
+    category = str(kwargs.pop("category", "")).strip().lower()
+    account_name = str(kwargs.pop("account_name", "")).strip()
+    user_id = str(kwargs.get("user_id", 0))
+    if not account_name:
+        account_name = _MAIN_ACCOUNT_NAME_REGISTRY.get(user_id, "")
+    if not account_name and user_id not in {"", "0"}:
+        account_name = f"user-{user_id}"
+    account_slug = _sanitize_account_slug(account_name, fallback=(f"user-{user_id}" if user_id not in {"", "0"} else "unknown"))
+    if category not in {"runtime", "warning", "business"}:
+        category = _infer_main_log_category(level, str(module), str(event))
     data = ', '.join(f'{k}={v}' for k, v in kwargs.items())
-    logger.log(level, message, extra={'custom_module': module, 'event': event, 'data': data})
+    logger.log(
+        level,
+        message,
+        extra={
+            'custom_module': module,
+            'event': event,
+            'data': data,
+            'user_id': user_id,
+            'category': category,
+            'account_slug': account_slug,
+            'account_tag': f"【ydx-{account_slug}】",
+        },
+    )
 
 
 async def create_client(user_ctx: UserContext, global_config: dict) -> TelegramClient:
@@ -422,6 +495,20 @@ async def fetch_account_balance(user_ctx: UserContext) -> int:
 async def start_user(user_ctx: UserContext, global_config: dict):
     lock_acquired = False
     try:
+        register_main_user_log_identity(user_ctx)
+        try:
+            from zq_multiuser import register_user_log_identity
+            register_user_log_identity(user_ctx)
+        except Exception as e:
+            log_event(
+                logging.WARNING,
+                'start',
+                '注册业务日志账号标识失败',
+                user_id=user_ctx.user_id,
+                error=str(e),
+                category='warning',
+            )
+
         zq_group_targets = _iter_targets(user_ctx.config.groups.get("zq_group", []))
         zq_bot_targets = _iter_targets(user_ctx.config.groups.get("zq_bot"))
         admin_chat = _resolve_admin_chat(user_ctx)
