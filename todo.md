@@ -69,7 +69,7 @@
 ## 4. 当前执行阶段
 
 ### [x] D. 任务包 V1
-状态：已完成，待提交/推送
+状态：已完成，已提交，待推送
 
 对应文档：
 - [docs/task-package-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/task-package-v1-tech-spec.md)
