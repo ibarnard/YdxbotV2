@@ -125,7 +125,7 @@
 ## 7. 当前执行阶段
 
 ### [x] G. 多账号编排 V1
-状态：已完成，已提交，待推送
+状态：已完成，已提交，已推送
 
 对应文档：
 - [docs/multi-account-orchestration-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/multi-account-orchestration-v1-tech-spec.md)
