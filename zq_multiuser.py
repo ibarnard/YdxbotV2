@@ -4188,6 +4188,19 @@ def _sync_lose_floor_preset(rt: dict) -> None:
     if current_preset:
         rt["lose_floor_preset"] = current_preset
 
+
+def _compute_lose_end_total_profit(current_fund: int, start_fund: int) -> int:
+    """
+    连输终止口径：展示“回补盈利”，最小为 0，不展示负值。
+    """
+    try:
+        current_val = int(current_fund)
+        start_val = int(start_fund)
+    except (TypeError, ValueError):
+        return 0
+    return max(0, current_val - start_val)
+
+
 def _is_valid_lose_range(start_round, start_seq, end_round, end_seq) -> bool:
     """校验连输区间是否有效（起点不晚于终点）。"""
     try:
@@ -4662,7 +4675,10 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                             start_seq = lose_start_info.get("seq", "?")
                             end_round = settle_round
                             end_seq = settle_seq
-                            total_profit = rt.get("gambling_fund", 0) - lose_start_info.get("fund", rt.get("gambling_fund", 0))
+                            total_profit = _compute_lose_end_total_profit(
+                                rt.get("gambling_fund", 0),
+                                lose_start_info.get("fund", rt.get("gambling_fund", 0)),
+                            )
 
                             if (
                                 int(old_lose_count) >= warning_lose_count
@@ -6076,12 +6092,16 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     if new_fund < 0:
                         mes = "菠菜资金不能设置为负数"
                     else:
-                        account_balance = rt.get("account_balance", 0)
-                        if new_fund > account_balance:
+                        account_balance = _safe_int(rt.get("account_balance", 0), 0)
+                        balance_status = str(rt.get("balance_status", "unknown") or "unknown").lower()
+                        enforce_balance_cap = balance_status == "success"
+                        if enforce_balance_cap and new_fund > account_balance:
                             new_fund = account_balance
                             mes = f"设置的资金超过账户余额，已调整为 {new_fund / 10000:.2f} 万"
                         else:
                             mes = f"菠菜资金已设置为 {new_fund / 10000:.2f} 万"
+                            if (not enforce_balance_cap) and new_fund > account_balance:
+                                mes += "\n⚠️ 账户余额暂不可用，已临时跳过“资金<=账户余额”校验"
                         rt["gambling_fund"] = new_fund
                 except ValueError:
                     mes = "无效的金额格式，请输入整数"

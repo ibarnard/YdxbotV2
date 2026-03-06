@@ -606,7 +606,7 @@ def _preset_base_amount(user_ctx: Any, preset_name: str) -> int:
 def normalize_preset_for_active_loss_streak(user_ctx: Any, preset_name: str) -> str:
     """
     连输阶段禁止降档：
-    - `lose_floor_preset` 记录本轮连输已锁定的最低档位（会随升档抬高）；
+    - `lose_floor_preset` 记录本轮连输“首注档位”并作为最低档位；
     - 仅在 lose_count > 0 时生效，连输结束后自动清空。
     """
     rt = _get_rt(user_ctx)
@@ -637,9 +637,6 @@ def normalize_preset_for_active_loss_streak(user_ctx: Any, preset_name: str) -> 
 
     if target_amount < floor_amount:
         return floor_name
-
-    if target_amount > floor_amount:
-        rt["lose_floor_preset"] = target_name
     return target_name
 
 

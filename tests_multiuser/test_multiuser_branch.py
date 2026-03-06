@@ -1699,6 +1699,130 @@ def test_risk_command_can_toggle_base_and_deep_switches(tmp_path, monkeypatch):
     assert any("当前风控开关" in msg for msg in sent_messages)
 
 
+def test_gf_command_skips_balance_cap_when_balance_unavailable(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5032"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "镜像资金用户"},
+            "telegram": {"user_id": 5032},
+            "groups": {"admin_chat": 5032},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["account_balance"] = 500_000
+    rt["balance_status"] = "network_error"
+    rt["gambling_fund"] = 100_000
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5032, id=len(sent_messages))
+
+    async def fake_check_bet_status(*args, **kwargs):
+        return None
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "check_bet_status", fake_check_bet_status)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="gf 1000000", chat_id=5032, id=120),
+            ctx,
+            {},
+        )
+    )
+
+    assert rt["gambling_fund"] == 1_000_000
+
+
+def test_gf_command_caps_to_balance_when_balance_success(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5033"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "余额校验用户"},
+            "telegram": {"user_id": 5033},
+            "groups": {"admin_chat": 5033},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["account_balance"] = 500_000
+    rt["balance_status"] = "success"
+    rt["gambling_fund"] = 100_000
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        return SimpleNamespace(chat_id=5033, id=1)
+
+    async def fake_check_bet_status(*args, **kwargs):
+        return None
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "check_bet_status", fake_check_bet_status)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="gf 1000000", chat_id=5033, id=121),
+            ctx,
+            {},
+        )
+    )
+
+    assert rt["gambling_fund"] == 500_000
+
+
+def test_compute_lose_end_total_profit_clamps_negative_to_zero():
+    assert zm._compute_lose_end_total_profit(998_990, 1_000_000) == 0
+
+
+def test_compute_lose_end_total_profit_keeps_positive():
+    assert zm._compute_lose_end_total_profit(1_000_990, 1_000_000) == 990
+
+
+def test_normalize_preset_for_active_loss_streak_uses_first_floor(tmp_path):
+    user_dir = tmp_path / "users" / "5034"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "首注档位用户"},
+            "telegram": {"user_id": 5034},
+            "groups": {"admin_chat": 5034},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["lose_count"] = 2
+    rt["lose_floor_preset"] = "yc20"
+    rt["current_preset_name"] = "yc20"
+
+    up_name = zm.adaptive_tasks.normalize_preset_for_active_loss_streak(ctx, "yc50")
+    back_name = zm.adaptive_tasks.normalize_preset_for_active_loss_streak(ctx, "yc20")
+    down_name = zm.adaptive_tasks.normalize_preset_for_active_loss_streak(ctx, "yc10")
+
+    assert up_name == "yc50"
+    assert back_name == "yc20"
+    assert down_name == "yc20"
+    assert rt["lose_floor_preset"] == "yc20"
+
+
 def test_apply_account_risk_default_mode_resets_current_switches():
     rt = {
         "risk_base_enabled": True,
