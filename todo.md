@@ -68,89 +68,68 @@
 
 ## 4. 当前执行阶段
 
-### [ ] D. 任务包 V1
-状态：下一阶段，准备开始
+### [x] D. 任务包 V1
+状态：已完成，待提交/推送
 
-目标：
-- 让多个任务组成一个任务包
-- 按盘面、风控、近期收益状态切换任务
-- 保持单账户同一时刻只运行一个实际任务
+对应文档：
+- [docs/task-package-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/task-package-v1-tech-spec.md)
 
-本阶段完成标准：
-
-#### D1. 数据结构
-- [ ] 新增 `task_packages.json`
-- [ ] 定义 `package_id / name / enabled / tasks / switch_mode / status`
-- [ ] 定义包内任务优先级和切换条件
-
-#### D2. 运行态
-- [ ] 增加当前任务包字段
-- [ ] 记录当前包、当前任务、上次切换原因
-- [ ] 启动提醒显示任务包摘要
-
-#### D3. 切换逻辑
-- [ ] 根据盘面标签选择更合适的任务
-- [ ] 根据 `fk1` 和动态档位做降级
-- [ ] 根据近期收益/回撤切换保守任务
-- [ ] 保证一个账户同一时刻只有一个任务实际运行
-
-#### D4. 命令入口
-- [ ] `pkg`
-- [ ] `pkg list`
-- [ ] `pkg show <id>`
-- [ ] `pkg tpl`
-- [ ] `pkg new <模板> [名称]`
-- [ ] `pkg run <id>`
-- [ ] `pkg pause <id>`
-
-#### D5. 记录与复盘
-- [ ] 包级运行日志写入 `analytics.db`
-- [ ] 能看到“为什么从任务 A 切到任务 B”
-- [ ] 能区分单任务收益和任务包收益
-
-#### D6. 测试
-- [ ] 单测：包创建、包切换、互斥运行
-- [ ] 集成：下注主流程里包切换不破坏现有风控和任务链路
-- [ ] 回归：现有主测试继续通过
-
-#### D7. 文档
-- [ ] 新增 `docs/task-package-v1-tech-spec.md`
-- [ ] 更新 [docs/README.md](D:/OneDrive/06Code/YdxbotV2/docs/README.md)
-- [ ] 更新本文件阶段状态
-
-#### D8. 提交
-- [ ] 功能代码单独 commit
-- [ ] 文档单独 commit
-- [ ] 推送到远端分支
+已交付：
+- `task_packages.json`
+- 任务包运行态
+- 任务包模板与 `pkg` 命令
+- 包级选任务逻辑
+- `analytics.db.package_runs`
+- `process_bet_on` / `process_settle` 接入任务包
+- 包级测试与回归
 
 ---
 
-## 5. 当前之后的顺序
+## 5. 当前执行阶段
+
+### [ ] E. 模板参数可覆盖 V1
+状态：下一阶段，准备开始
+
+目标：
+- 保留模板创建
+- 创建时可覆盖预设、目标笔数、止损
+- 尽量不回退到长参数 `task add`
+
+完成标准：
+- [ ] `task new <模板> [名称] [覆盖参数]`
+- [ ] `pkg new <模板> [名称] [覆盖参数]`
+- [ ] 参数校验
+- [ ] 对应说明书
+- [ ] 对应测试
+- [ ] 中文 commit
+
+---
+
+## 6. 当前之后的顺序
 当前默认顺序：
 
-1. `D. 任务包 V1`
-2. 模板参数可覆盖 V1
-3. 策略版本化与 prompt 回写 V1
-4. 多账号编排 V1
-5. 自学习 V1
+1. `E. 模板参数可覆盖 V1`
+2. 策略版本化与 prompt 回写 V1
+3. 多账号编排 V1
+4. 自学习 V1
 
 详细拆解、时间预估、风险、确认点，请看：
 - [docs/refactor-roadmap.md](D:/OneDrive/06Code/YdxbotV2/docs/refactor-roadmap.md)
 
 ---
 
-## 6. 回归标准
+## 7. 回归标准
 每个阶段结束前至少执行：
 
 ```powershell
-.\venv_win\Scripts\python.exe -m pytest tests_multiuser\test_multiuser_branch.py tests_multiuser\test_risk_history_v1.py tests_multiuser\test_dynamic_betting.py tests_multiuser\test_task_engine_v1.py -q
+.\venv_win\Scripts\python.exe -m pytest tests_multiuser\test_multiuser_branch.py tests_multiuser\test_risk_history_v1.py tests_multiuser\test_dynamic_betting.py tests_multiuser\test_task_engine_v1.py tests_multiuser\test_task_package_engine_v1.py -q
 ```
 
 如果阶段新增新的测试文件，要一并纳入回归。
 
 ---
 
-## 7. 更新规则
+## 8. 更新规则
 后续每次推进，按这个顺序更新：
 
 1. 先改代码
