@@ -144,14 +144,53 @@
 ## 8. 当前之后的顺序
 当前默认顺序：
 
-1. 自学习 V1
+### [ ] H. 受控自学习 V1
+状态：设计完成，待实现
+
+对应文档：
+- [docs/controlled-self-learning-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/controlled-self-learning-v1-tech-spec.md)
+
+执行子阶段：
+- [ ] H1 候选中心
+  - `learning_center.json`
+  - `learning_candidates / learning_evaluations / learning_shadows / learning_promotions`
+  - `learn` / `learn list` / `learn show`
+- [ ] H2 候选生成器
+  - 基于复盘事实生成候选策略
+  - `learn gen`
+- [ ] H3 离线评估器
+  - 样本覆盖、收益、回撤、稳定性评分
+  - `learn eval`
+- [ ] H4 影子验证器
+  - 在线候选影子对比
+  - `learn shadow`
+- [ ] H5 灰度与转正
+  - `learn gray`
+  - `learn promote`
+  - `learn rollback`
+
+设计结论：
+- 不允许自动转正
+- 不允许覆盖硬风控
+- 只允许单账户灰度
+
+---
+
+## 9. 当前之后的顺序
+当前默认顺序：
+
+1. H1 候选中心
+2. H2 候选生成器
+3. H3 离线评估器
+4. H4 影子验证器
+5. H5 灰度与转正
 
 详细拆解、时间预估、风险、确认点，请看：
 - [docs/refactor-roadmap.md](D:/OneDrive/06Code/YdxbotV2/docs/refactor-roadmap.md)
 
 ---
 
-## 9. 回归标准
+## 10. 回归标准
 每个阶段结束前至少执行：
 
 ```powershell
@@ -162,7 +201,7 @@
 
 ---
 
-## 10. 更新规则
+## 11. 更新规则
 后续每次推进，按这个顺序更新：
 
 1. 先改代码
