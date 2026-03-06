@@ -1853,6 +1853,32 @@ def record_learning_candidate(user_ctx, candidate: Dict[str, Any]) -> None:
     )
 
 
+def record_learning_evaluation(user_ctx, evaluation: Dict[str, Any]) -> None:
+    _write_analytics(
+        user_ctx,
+        [
+            (
+                """
+                INSERT OR REPLACE INTO learning_evaluations (
+                    evaluation_id, candidate_id, candidate_version, status, sample_size,
+                    score_total, metrics_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(evaluation.get("evaluation_id", "") or ""),
+                    str(evaluation.get("candidate_id", "") or ""),
+                    str(evaluation.get("candidate_version", "") or ""),
+                    str(evaluation.get("status", "watch") or "watch"),
+                    _safe_int_value(evaluation.get("sample_size", 0), 0),
+                    float(evaluation.get("score_total", 0.0) or 0.0),
+                    _json_text(evaluation.get("metrics", {})),
+                    str(evaluation.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")) or ""),
+                ),
+            ),
+        ],
+    )
+
+
 def record_risk_action(
     user_ctx,
     *,

@@ -4905,7 +4905,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `policy use <vX>` / `policy rollback` : 切换或回滚策略版本
 - `learn` : 查看受控自学习中心
 - `learn gen` / `learn list` / `learn show <id|cX>` : 生成、查看学习候选
-- `learn eval` / `learn shadow` / `learn gray` / `learn promote` / `learn rollback` : 受控自学习后续阶段入口
+- `learn eval [id|cX]` : 对候选执行离线评估
+- `learn shadow` / `learn gray` / `learn promote` / `learn rollback` : 受控自学习后续阶段入口
 - `fleet` / `users` : 查看多账号总览
 - `fleet task` : 查看多账号任务/任务包视图
 - `fleet policy` : 查看多账号策略灰度视图
@@ -5402,7 +5403,13 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 ident = my[2] if len(my) >= 3 else ""
                 await send_to_admin(client, self_learning_engine.build_learning_detail_text(user_ctx, ident), user_ctx, global_config)
                 return
-            if subcmd in {"eval", "shadow", "gray", "promote", "rollback"}:
+            if subcmd == "eval":
+                ident = my[2] if len(my) >= 3 else ""
+                result = self_learning_engine.evaluate_candidate_offline(user_ctx, ident)
+                user_ctx.save_state()
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd in {"shadow", "gray", "promote", "rollback"}:
                 await send_to_admin(client, self_learning_engine.build_learning_pending_text(subcmd), user_ctx, global_config)
                 return
 
@@ -5415,7 +5422,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "`learn gen`\n"
                     "`learn list`\n"
                     "`learn show <id|cX>`\n"
-                    "`learn eval`\n"
+                    "`learn eval [id|cX]`\n"
                     "`learn shadow`\n"
                     "`learn gray`\n"
                     "`learn promote`\n"
