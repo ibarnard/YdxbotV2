@@ -105,7 +105,7 @@
 ## 6. 当前执行阶段
 
 ### [x] F. 策略版本化与 prompt 回写 V1
-状态：已完成，已提交，待推送
+状态：已完成，已提交，已推送
 
 对应文档：
 - [docs/policy-prompt-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/policy-prompt-v1-tech-spec.md)
@@ -122,29 +122,47 @@
 
 ---
 
-## 7. 当前之后的顺序
+## 7. 当前执行阶段
+
+### [x] G. 多账号编排 V1
+状态：已完成，已提交，待推送
+
+对应文档：
+- [docs/multi-account-orchestration-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/multi-account-orchestration-v1-tech-spec.md)
+
+已交付：
+- 多账号注册表
+- `fleet` / `users`
+- `fleet task`
+- `fleet policy`
+- `fleet show <账号名|ID>`
+- `fleet gray <账号名|ID> baseline|latest`
+- 对应测试与说明书
+
+---
+
+## 8. 当前之后的顺序
 当前默认顺序：
 
-1. 多账号编排 V1
-2. 自学习 V1
+1. 自学习 V1
 
 详细拆解、时间预估、风险、确认点，请看：
 - [docs/refactor-roadmap.md](D:/OneDrive/06Code/YdxbotV2/docs/refactor-roadmap.md)
 
 ---
 
-## 8. 回归标准
+## 9. 回归标准
 每个阶段结束前至少执行：
 
 ```powershell
-.\venv_win\Scripts\python.exe -m pytest tests_multiuser\test_multiuser_branch.py tests_multiuser\test_risk_history_v1.py tests_multiuser\test_dynamic_betting.py tests_multiuser\test_task_engine_v1.py tests_multiuser\test_task_package_engine_v1.py -q
+.\venv_win\Scripts\python.exe -m pytest tests_multiuser\test_multiuser_branch.py tests_multiuser\test_risk_history_v1.py tests_multiuser\test_dynamic_betting.py tests_multiuser\test_task_engine_v1.py tests_multiuser\test_task_package_engine_v1.py tests_multiuser\test_policy_prompt_v1.py tests_multiuser\test_multi_account_orchestrator_v1.py -q
 ```
 
 如果阶段新增新的测试文件，要一并纳入回归。
 
 ---
 
-## 9. 更新规则
+## 10. 更新规则
 后续每次推进，按这个顺序更新：
 
 1. 先改代码
