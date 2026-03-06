@@ -2923,7 +2923,7 @@ def test_predict_next_bet_v10_updates_current_model_after_fallback(tmp_path, mon
 
     assert prediction == 1
     assert rt["current_model_id"] == "model-2"
-    assert rt["last_decision_model_id"] == "model-2"
+    assert '"model_id": "model-2"' in rt["last_logic_audit"]
 
 
 def test_process_settle_updates_target_pending_entry_by_pending_bet_id(tmp_path, monkeypatch):
