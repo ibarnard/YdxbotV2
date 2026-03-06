@@ -32,6 +32,55 @@ REGIME_LABELS = {
     history_analysis.REGIME_CHAOS,
 }
 
+TASK_TEMPLATES = {
+    "保守巡航": {
+        "description": "只在延续盘接管，默认低档保守跑",
+        "trigger_mode": TASK_MODE_REGIME,
+        "interval_minutes": 0,
+        "regimes": [history_analysis.REGIME_CONTINUATION],
+        "base_preset": "yc5",
+        "max_bets": 8,
+        "max_loss": 10000,
+    },
+    "趋势跟随": {
+        "description": "延续盘优先，衰竭盘保守跟随",
+        "trigger_mode": TASK_MODE_REGIME,
+        "interval_minutes": 0,
+        "regimes": [
+            history_analysis.REGIME_CONTINUATION,
+            history_analysis.REGIME_EXHAUSTION,
+        ],
+        "base_preset": "yc20",
+        "max_bets": 12,
+        "max_loss": 30000,
+    },
+    "定时巡航": {
+        "description": "按固定时间间隔巡航，适合低档灰度",
+        "trigger_mode": TASK_MODE_SCHEDULE,
+        "interval_minutes": 30,
+        "regimes": [],
+        "base_preset": "yc5",
+        "max_bets": 10,
+        "max_loss": 12000,
+    },
+    "混合值守": {
+        "description": "定时 + 延续盘双条件，适合稳健值守",
+        "trigger_mode": TASK_MODE_HYBRID,
+        "interval_minutes": 30,
+        "regimes": [history_analysis.REGIME_CONTINUATION],
+        "base_preset": "yc10",
+        "max_bets": 10,
+        "max_loss": 18000,
+    },
+}
+
+TASK_TEMPLATE_ALIASES = {
+    "保守": "保守巡航",
+    "趋势": "趋势跟随",
+    "定时": "定时巡航",
+    "混合": "混合值守",
+}
+
 
 def _now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -100,6 +149,52 @@ def _normalize_regimes(values: Any) -> List[str]:
         if item and item not in result:
             result.append(item)
     return result
+
+
+def _task_template_name(name: str) -> str:
+    text = str(name or "").strip()
+    if not text:
+        return ""
+    return TASK_TEMPLATE_ALIASES.get(text, text)
+
+
+def get_task_template(name: str) -> Optional[Dict[str, Any]]:
+    template_name = _task_template_name(name)
+    if not template_name:
+        return None
+    template = TASK_TEMPLATES.get(template_name)
+    if not template:
+        return None
+    return {
+        "template_name": template_name,
+        "description": str(template.get("description", "") or ""),
+        "trigger_mode": str(template.get("trigger_mode", TASK_MODE_MANUAL) or TASK_MODE_MANUAL),
+        "interval_minutes": _safe_int(template.get("interval_minutes", 0), 0),
+        "regimes": _normalize_regimes(template.get("regimes", [])),
+        "base_preset": str(template.get("base_preset", "") or ""),
+        "max_bets": max(1, _safe_int(template.get("max_bets", 1), 1)),
+        "max_loss": max(0, _safe_int(template.get("max_loss", 0), 0)),
+    }
+
+
+def build_task_template_text() -> str:
+    lines = ["📦 任务模板", ""]
+    for index, name in enumerate(TASK_TEMPLATES.keys(), 1):
+        template = get_task_template(name) or {}
+        lines.append(
+            f"{index}. {name} | {template.get('description', '')} | "
+            f"基准 {template.get('base_preset', '')} | "
+            f"触发 {_trigger_text(str(template.get('trigger_mode', '') or ''), _safe_int(template.get('interval_minutes', 0), 0), _normalize_regimes(template.get('regimes', [])))} | "
+            f"目标 {template.get('max_bets', 0)} 笔 | 止损 {_safe_int(template.get('max_loss', 0), 0):,}"
+        )
+    lines.extend(
+        [
+            "",
+            "创建：`task new <模板>` 或 `task new <模板> <名称>`",
+            "示例：`task new 保守巡航` / `task new 趋势 巡航A`",
+        ]
+    )
+    return "\n".join(lines)
 
 
 def _task_defaults(task_id: str = "") -> Dict[str, Any]:
@@ -444,6 +539,30 @@ def create_task(
     return {"ok": True, "task": task, "message": f"任务已创建：{task['name']} ({task['task_id']})"}
 
 
+def create_task_from_template(
+    user_ctx,
+    template_name: str,
+    task_name: str = "",
+    *,
+    enabled: bool = False,
+) -> Dict[str, Any]:
+    template = get_task_template(template_name)
+    if not template:
+        return {"ok": False, "message": f"任务模板不存在：{template_name}"}
+    task_label = str(task_name or "").strip() or str(template.get("template_name", "") or "")
+    return create_task(
+        user_ctx,
+        name=task_label,
+        base_preset=str(template.get("base_preset", "") or ""),
+        max_bets=_safe_int(template.get("max_bets", 1), 1),
+        trigger_mode=str(template.get("trigger_mode", TASK_MODE_MANUAL) or TASK_MODE_MANUAL),
+        interval_minutes=_safe_int(template.get("interval_minutes", 0), 0),
+        regimes=_normalize_regimes(template.get("regimes", [])),
+        max_loss=_safe_int(template.get("max_loss", 0), 0),
+        enabled=bool(enabled),
+    )
+
+
 def parse_create_args(args: List[str]) -> Dict[str, Any]:
     if len(args) < 3:
         return {"ok": False, "message": "用法：task add <名称> <预设> <局数> [manual|schedule|regime|hybrid] [分钟] [盘面列表] [max_loss]"}
@@ -746,7 +865,7 @@ def build_task_overview_text(user_ctx) -> str:
         [
             "",
             f"任务总数：{len(tasks)} | 已启用：{enabled_count}",
-            "命令：`task list` / `task add ...` / `task show <id>` / `task run <id>` / `task pause <id>` / `task resume <id>` / `task logs [id]` / `task stats [id]`",
+            "命令：`task tpl` / `task new <模板>` / `task list` / `task add ...` / `task show <id>` / `task run <id>` / `task pause <id>` / `task resume <id>` / `task logs [id]` / `task stats [id]`",
         ]
     )
     return "\n".join(lines)
@@ -755,7 +874,7 @@ def build_task_overview_text(user_ctx) -> str:
 def build_task_list_text(user_ctx) -> str:
     tasks = sorted(normalize_tasks(user_ctx), key=_task_sort_key)
     if not tasks:
-        return "📦 暂无任务\n\n用法：`task add <名称> <预设> <局数> [manual|schedule|regime|hybrid] ...`"
+        return "📦 暂无任务\n\n先看模板：`task tpl`\n快速创建：`task new 保守巡航`\n完整创建：`task add <名称> <预设> <局数> [manual|schedule|regime|hybrid] ...`"
     lines = ["📦 任务列表", ""]
     for index, task in enumerate(tasks, 1):
         lines.append(

@@ -56,6 +56,22 @@ def test_create_task_and_persist(tmp_path):
     assert payload["tasks"][0]["name"] == "巡航"
 
 
+def test_create_task_from_template(tmp_path):
+    ctx = _make_user_context(tmp_path, user_id=9307)
+
+    tpl_text = task_engine.build_task_template_text()
+    assert "任务模板" in tpl_text
+    assert "保守巡航" in tpl_text
+
+    result = task_engine.create_task_from_template(ctx, "保守", "模板任务")
+
+    assert result["ok"] is True
+    assert ctx.tasks[0]["name"] == "模板任务"
+    assert ctx.tasks[0]["base_preset"] == "yc5"
+    assert ctx.tasks[0]["trigger_mode"] == task_engine.TASK_MODE_REGIME
+    assert ctx.tasks[0]["regimes"] == ["延续盘"]
+
+
 def test_prepare_task_for_round_starts_regime_task(tmp_path):
     ctx = _make_user_context(tmp_path, user_id=9302)
     rt = ctx.state.runtime
@@ -287,3 +303,35 @@ def test_task_stats_text_and_command_views(tmp_path, monkeypatch):
     assert any("任务列表" in msg for msg in sent_messages)
     assert any("任务详情" in msg and "统计任务" in msg for msg in sent_messages)
     assert any("任务统计" in msg and "累计真实下注：2 笔" in msg for msg in sent_messages)
+
+
+def test_process_user_command_task_templates(tmp_path, monkeypatch):
+    ctx = _make_user_context(tmp_path, user_id=9308)
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=1, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="task tpl", chat_id=9308, id=1),
+            ctx,
+            {},
+        )
+    )
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="task new 保守巡航 模板A", chat_id=9308, id=2),
+            ctx,
+            {},
+        )
+    )
+
+    assert any("任务模板" in msg and "保守巡航" in msg for msg in sent_messages)
+    assert any("任务已创建" in msg and "模板A" in msg for msg in sent_messages)
+    assert ctx.tasks[0]["name"] == "模板A"
