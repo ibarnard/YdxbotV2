@@ -4837,7 +4837,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `fp 6` : 查看链路覆盖与缺失
 - `task` : 查看任务总览
 - `task tpl` : 查看任务模板
-- `task new <模板> [名称]` : 按模板快速创建任务
+- `task new <模板> [名称] [preset=yc10] [bets=12] [loss=20000]` : 按模板快速创建任务
 - `task list` : 查看任务列表
 - `task add ...` : 创建任务（手动/定时/盘面/混合）
 - `task run <id>` : 立即手动启动任务
@@ -4846,7 +4846,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `task stats [id]` : 查看任务统计
 - `pkg` : 查看任务包总览
 - `pkg tpl` : 查看任务包模板
-- `pkg new <模板> [名称]` : 按模板快速创建任务包
+- `pkg new <模板> [名称] [preset=yc10] [bets=12] [loss=20000]` : 按模板快速创建任务包
 - `pkg list` / `pkg show <id>` : 查看任务包列表或详情
 - `pkg run <id>` / `pkg pause <id>` / `pkg resume <id>` : 启动、暂停、恢复任务包
 - `pkg logs [id]` / `pkg stats [id]` : 查看任务包日志与统计
@@ -5119,8 +5119,20 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 await send_to_admin(client, task_engine.build_task_template_text(), user_ctx, global_config)
                 return
             if subcmd == "new" and len(my) >= 3:
-                task_name = my[3] if len(my) >= 4 else ""
-                result = task_engine.create_task_from_template(user_ctx, my[2], task_name, enabled=False)
+                parsed = task_engine.parse_template_new_args(my[2:])
+                if not parsed.get("ok", False):
+                    await send_to_admin(client, str(parsed.get("message", "任务模板参数错误")), user_ctx, global_config)
+                    return
+                overrides = parsed.get("overrides", {}) if isinstance(parsed.get("overrides", {}), dict) else {}
+                result = task_engine.create_task_from_template(
+                    user_ctx,
+                    str(parsed.get("template_name", "") or ""),
+                    str(parsed.get("task_name", "") or ""),
+                    base_preset=str(overrides.get("base_preset", "") or ""),
+                    max_bets=int(overrides.get("max_bets", 0) or 0),
+                    max_loss=overrides.get("max_loss", None),
+                    enabled=False,
+                )
                 await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
                 return
             if subcmd == "list":
@@ -5183,7 +5195,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "用法：\n"
                     "`task`\n"
                     "`task tpl`\n"
-                    "`task new <模板> [名称]`\n"
+                    "`task new <模板> [名称] [preset=yc10] [bets=12] [loss=20000]`\n"
                     "`task list`\n"
                     "`task add <名称> <预设> <局数> [manual|schedule|regime|hybrid] [分钟] [盘面列表] [max_loss]`\n"
                     "`task show <id>` / `task on <id>` / `task off <id>` / `task run <id>`\n"
@@ -5205,8 +5217,20 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 await send_to_admin(client, task_package_engine.build_package_template_text(), user_ctx, global_config)
                 return
             if subcmd == "new" and len(my) >= 3:
-                package_name = my[3] if len(my) >= 4 else ""
-                result = task_package_engine.create_package_from_template(user_ctx, my[2], package_name, enabled=False)
+                parsed = task_engine.parse_template_new_args(my[2:])
+                if not parsed.get("ok", False):
+                    await send_to_admin(client, str(parsed.get("message", "任务包模板参数错误")), user_ctx, global_config)
+                    return
+                overrides = parsed.get("overrides", {}) if isinstance(parsed.get("overrides", {}), dict) else {}
+                result = task_package_engine.create_package_from_template(
+                    user_ctx,
+                    str(parsed.get("template_name", "") or ""),
+                    str(parsed.get("task_name", "") or ""),
+                    base_preset=str(overrides.get("base_preset", "") or ""),
+                    max_bets=int(overrides.get("max_bets", 0) or 0),
+                    max_loss=overrides.get("max_loss", None),
+                    enabled=False,
+                )
                 await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
                 return
             if subcmd == "list":
@@ -5243,7 +5267,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "用法：\n"
                     "`pkg`\n"
                     "`pkg tpl`\n"
-                    "`pkg new <模板> [名称]`\n"
+                    "`pkg new <模板> [名称] [preset=yc10] [bets=12] [loss=20000]`\n"
                     "`pkg list`\n"
                     "`pkg show <id>` / `pkg run <id>` / `pkg pause <id>` / `pkg resume <id>`\n"
                     "`pkg logs [id]` / `pkg stats [id]`"

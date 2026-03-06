@@ -191,10 +191,54 @@ def build_task_template_text() -> str:
         [
             "",
             "创建：`task new <模板>` 或 `task new <模板> <名称>`",
+            "覆盖：`task new <模板> [名称] preset=yc10 bets=12 loss=30000`",
             "示例：`task new 保守巡航` / `task new 趋势 巡航A`",
         ]
     )
     return "\n".join(lines)
+
+
+def parse_template_new_args(args: List[str]) -> Dict[str, Any]:
+    if not args:
+        return {"ok": False, "message": "用法：task new <模板> [名称] [preset=yc10] [bets=12] [loss=20000]"}
+    template_name = str(args[0] or "").strip()
+    if not template_name:
+        return {"ok": False, "message": "任务模板不能为空"}
+
+    task_name = ""
+    tokens = list(args[1:])
+    if tokens and "=" not in str(tokens[0]):
+        task_name = str(tokens[0] or "").strip()
+        tokens = tokens[1:]
+
+    overrides: Dict[str, Any] = {}
+    for token in tokens:
+        text = str(token or "").strip()
+        if not text:
+            continue
+        if "=" not in text:
+            return {"ok": False, "message": f"模板参数格式错误：{text}，应为 key=value"}
+        key, value = text.split("=", 1)
+        key = str(key or "").strip().lower()
+        value = str(value or "").strip()
+        if key in {"preset", "base_preset"}:
+            overrides["base_preset"] = value
+        elif key in {"bets", "max_bets"}:
+            parsed = _safe_int(value, 0)
+            if parsed <= 0:
+                return {"ok": False, "message": "bets 必须是大于 0 的整数"}
+            overrides["max_bets"] = parsed
+        elif key in {"loss", "max_loss"}:
+            parsed = _safe_int(value, -1)
+            if parsed < 0:
+                return {"ok": False, "message": "loss 不能为负数"}
+            overrides["max_loss"] = parsed
+        elif key == "name":
+            task_name = value
+        else:
+            return {"ok": False, "message": f"不支持的模板参数：{key}"}
+
+    return {"ok": True, "template_name": template_name, "task_name": task_name, "overrides": overrides}
 
 
 def _task_defaults(task_id: str = "") -> Dict[str, Any]:
@@ -544,21 +588,27 @@ def create_task_from_template(
     template_name: str,
     task_name: str = "",
     *,
+    base_preset: str = "",
+    max_bets: int = 0,
+    max_loss: Optional[int] = None,
     enabled: bool = False,
 ) -> Dict[str, Any]:
     template = get_task_template(template_name)
     if not template:
         return {"ok": False, "message": f"任务模板不存在：{template_name}"}
     task_label = str(task_name or "").strip() or str(template.get("template_name", "") or "")
+    preset_value = str(base_preset or template.get("base_preset", "") or "").strip()
+    max_bets_value = max(1, _safe_int(max_bets or template.get("max_bets", 1), 1))
+    max_loss_value = _safe_int(template.get("max_loss", 0), 0) if max_loss is None else max(0, _safe_int(max_loss, 0))
     return create_task(
         user_ctx,
         name=task_label,
-        base_preset=str(template.get("base_preset", "") or ""),
-        max_bets=_safe_int(template.get("max_bets", 1), 1),
+        base_preset=preset_value,
+        max_bets=max_bets_value,
         trigger_mode=str(template.get("trigger_mode", TASK_MODE_MANUAL) or TASK_MODE_MANUAL),
         interval_minutes=_safe_int(template.get("interval_minutes", 0), 0),
         regimes=_normalize_regimes(template.get("regimes", [])),
-        max_loss=_safe_int(template.get("max_loss", 0), 0),
+        max_loss=max_loss_value,
         enabled=bool(enabled),
     )
 

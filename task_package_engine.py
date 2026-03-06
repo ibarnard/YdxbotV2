@@ -381,7 +381,16 @@ def resume_package(user_ctx, ident: str) -> Dict[str, Any]:
     return _start_package(user_ctx, package, "手动恢复任务包")
 
 
-def create_package_from_template(user_ctx, template_name: str, package_name: str = "", *, enabled: bool = False) -> Dict[str, Any]:
+def create_package_from_template(
+    user_ctx,
+    template_name: str,
+    package_name: str = "",
+    *,
+    base_preset: str = "",
+    max_bets: int = 0,
+    max_loss: Optional[int] = None,
+    enabled: bool = False,
+) -> Dict[str, Any]:
     template = get_package_template(template_name)
     if not template:
         return {"ok": False, "message": f"任务包模板不存在：{template_name}"}
@@ -390,7 +399,15 @@ def create_package_from_template(user_ctx, template_name: str, package_name: str
     for item in list(template.get("members", []) or []):
         member_label = str(item.get("member_name", "") or item.get("task_template", "") or "").strip()
         task_label = f"{package_label}-{member_label}"
-        created = task_engine.create_task_from_template(user_ctx, str(item.get("task_template", "") or ""), task_label, enabled=False)
+        created = task_engine.create_task_from_template(
+            user_ctx,
+            str(item.get("task_template", "") or ""),
+            task_label,
+            base_preset=base_preset,
+            max_bets=max_bets,
+            max_loss=max_loss,
+            enabled=False,
+        )
         if not created.get("ok", False):
             return {"ok": False, "message": str(created.get("message", "任务模板创建失败"))}
         created_task = created.get("task", {}) if isinstance(created.get("task", {}), dict) else {}
@@ -487,7 +504,7 @@ def build_package_template_text() -> str:
         template = get_package_template(name) or {}
         members = [str(item.get("task_template", "") or "") for item in list(template.get("members", []) or [])]
         lines.append(f"{index}. {name} | {template.get('description', '')} | 任务：{', '.join(members)}")
-    lines.extend(["", "创建：`pkg new <模板>` 或 `pkg new <模板> <名称>`"])
+    lines.extend(["", "创建：`pkg new <模板>` 或 `pkg new <模板> <名称>`", "覆盖：`pkg new <模板> [名称] preset=yc10 bets=6 loss=18000`"])
     return "\n".join(lines)
 
 

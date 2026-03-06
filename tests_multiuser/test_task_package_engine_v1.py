@@ -51,6 +51,25 @@ def test_create_package_from_template(tmp_path):
     assert packages_path.exists()
 
 
+def test_create_package_from_template_with_overrides(tmp_path):
+    ctx = _make_user_context(tmp_path, user_id=9405)
+
+    result = task_package_engine.create_package_from_template(
+        ctx,
+        "稳健包",
+        "主包",
+        base_preset="yc10",
+        max_bets=6,
+        max_loss=18000,
+    )
+
+    assert result["ok"] is True
+    assert len(ctx.tasks) == 2
+    assert all(task["base_preset"] == "yc10" for task in ctx.tasks)
+    assert all(task["max_bets"] == 6 for task in ctx.tasks)
+    assert all(task["max_loss"] == 18000 for task in ctx.tasks)
+
+
 def test_prepare_package_for_round_selects_trend_task(tmp_path):
     ctx = _make_user_context(tmp_path, user_id=9402)
     result = task_package_engine.create_package_from_template(ctx, "稳健包", "主包")
@@ -210,3 +229,29 @@ def test_pkg_commands_and_process_bet_on_integration(tmp_path, monkeypatch):
     assert ctx.state.runtime["task_current_name"]
     assert any("任务包已创建" in msg for msg in sent_messages)
     assert any("任务包已启动" in msg for msg in sent_messages)
+
+
+def test_pkg_new_with_overrides(tmp_path, monkeypatch):
+    ctx = _make_user_context(tmp_path, user_id=9406)
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=1, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="pkg new 稳健包 主包 preset=yc10 bets=6 loss=18000", chat_id=9406, id=1),
+            ctx,
+            {},
+        )
+    )
+
+    assert any("任务包已创建" in msg and "主包" in msg for msg in sent_messages)
+    assert len(ctx.tasks) == 2
+    assert all(task["base_preset"] == "yc10" for task in ctx.tasks)
+    assert all(task["max_bets"] == 6 for task in ctx.tasks)
+    assert all(task["max_loss"] == 18000 for task in ctx.tasks)

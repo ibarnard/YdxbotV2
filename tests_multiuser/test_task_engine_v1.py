@@ -72,6 +72,29 @@ def test_create_task_from_template(tmp_path):
     assert ctx.tasks[0]["regimes"] == ["延续盘"]
 
 
+def test_create_task_from_template_with_overrides(tmp_path):
+    ctx = _make_user_context(tmp_path, user_id=9309)
+
+    parsed = task_engine.parse_template_new_args(["保守巡航", "模板任务", "preset=yc10", "bets=12", "loss=30000"])
+    assert parsed["ok"] is True
+
+    overrides = parsed["overrides"]
+    result = task_engine.create_task_from_template(
+        ctx,
+        parsed["template_name"],
+        parsed["task_name"],
+        base_preset=overrides["base_preset"],
+        max_bets=overrides["max_bets"],
+        max_loss=overrides["max_loss"],
+    )
+
+    assert result["ok"] is True
+    assert ctx.tasks[0]["name"] == "模板任务"
+    assert ctx.tasks[0]["base_preset"] == "yc10"
+    assert ctx.tasks[0]["max_bets"] == 12
+    assert ctx.tasks[0]["max_loss"] == 30000
+
+
 def test_prepare_task_for_round_starts_regime_task(tmp_path):
     ctx = _make_user_context(tmp_path, user_id=9302)
     rt = ctx.state.runtime
@@ -335,3 +358,28 @@ def test_process_user_command_task_templates(tmp_path, monkeypatch):
     assert any("任务模板" in msg and "保守巡航" in msg for msg in sent_messages)
     assert any("任务已创建" in msg and "模板A" in msg for msg in sent_messages)
     assert ctx.tasks[0]["name"] == "模板A"
+
+
+def test_process_user_command_task_template_with_overrides(tmp_path, monkeypatch):
+    ctx = _make_user_context(tmp_path, user_id=9310)
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=1, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="task new 保守巡航 模板B preset=yc10 bets=12 loss=30000", chat_id=9310, id=1),
+            ctx,
+            {},
+        )
+    )
+
+    assert any("任务已创建" in msg and "模板B" in msg for msg in sent_messages)
+    assert ctx.tasks[0]["base_preset"] == "yc10"
+    assert ctx.tasks[0]["max_bets"] == 12
+    assert ctx.tasks[0]["max_loss"] == 30000
