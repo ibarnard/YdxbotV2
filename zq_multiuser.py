@@ -24,6 +24,7 @@ import constants
 import dynamic_betting
 import history_analysis
 import risk_control
+import task_engine
 from update_manager import (
     get_current_repo_info,
     list_version_catalog,
@@ -64,7 +65,7 @@ def _infer_log_category(level: int, module: str, event: str) -> str:
     business_tokens = (
         "bet", "settle", "risk", "predict", "user_cmd", "balance", "fund",
         "profit", "preset", "pause", "resume", "restart", "update", "reback",
-        "model", "apikey", "stats", "status", "yc", "dashboard",
+        "model", "apikey", "stats", "status", "yc", "dashboard", "task",
     )
     if any(token in text for token in business_tokens):
         return "business"
@@ -643,6 +644,14 @@ def format_dashboard(user_ctx: UserContext) -> str:
         f"{rt.get('lose_three', 2.05)} {rt.get('lose_four', 2.0)} {rt.get('initial_amount', 500)}"
     )
     mes += f"📋 **预设名称：{preset_name}**\n"
+    current_task_name = str(rt.get("task_current_name", "") or "")
+    if current_task_name:
+        mes += (
+            f"📦 **当前任务：{current_task_name}**\n"
+            f"🧭 **任务进度：{rt.get('task_current_progress_bets', 0)} / {rt.get('task_current_target_bets', 0)}**\n"
+        )
+    else:
+        mes += "📦 **当前任务：无**\n"
     mes += f"🤖 **预设参数：{preset_params}**\n"
     mes += f"💰 **初始金额：{rt.get('initial_amount', 500)}**\n⏹ **押注 {rt.get('lose_stop', 13)} 次停止**\n"
     mes += f"💥 **炸 {rt.get('explode', 5)} 次，暂停 {rt.get('stop', 3)} 局**\n📚 **押注倍率：{rt.get('lose_once', 3.0)} / {rt.get('lose_twice', 2.1)} / {rt.get('lose_three', 2.05)} / {rt.get('lose_four', 2.0)}**\n\n"
@@ -736,11 +745,13 @@ def build_startup_focus_reminder(user_ctx: UserContext) -> str:
         mode_code = 1
     mode_text = {0: "反投", 1: "预测", 2: "追投"}.get(mode_code, "未知")
     status_text = get_bet_status_text(rt)
+    task_text = task_engine.build_task_focus_text(user_ctx)
     return (
         "🔔 启动重点设置提醒\n"
         f"🛡️ 风控提醒：fk1 盘面 {_risk_switch_label(risk_modes['fk1_enabled'])} / fk2 入场 {_risk_switch_label(risk_modes['fk2_enabled'])} / fk3 连输 {_risk_switch_label(risk_modes['fk3_enabled'])}\n"
         f"🧱 默认模式：fk1 {_risk_switch_label(risk_modes['fk1_default_enabled'])} / fk2 {_risk_switch_label(risk_modes['fk2_default_enabled'])} / fk3 {_risk_switch_label(risk_modes['fk3_default_enabled'])}（可用 `fk ...` 开关）\n"
         f"🎯 预设提醒：当前 `{preset_name}`（可用 `st <预设名>` 切换）\n"
+        f"{task_text}\n"
         f"📳 当前状态：{status_text}，模式：{mode_text}\n"
         "ℹ️ 更多命令：`help`"
     )
@@ -1519,6 +1530,26 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     # 自动风控暂停：基础风控(40局窗口) + 深度风控(每3连输里程碑)。
     # 同一已结算快照不重复触发，避免重复暂停。
     analysis_snapshot = _refresh_current_analysis_snapshot(user_ctx)
+    task_plan = task_engine.prepare_task_for_round(user_ctx, analysis_snapshot)
+    if task_plan.get("started", False):
+        task_info = task_plan.get("task", {}) if isinstance(task_plan.get("task", {}), dict) else {}
+        try:
+            await _send_transient_admin_notice(
+                client,
+                user_ctx,
+                global_config,
+                (
+                    "📦 任务已接管本轮\n"
+                    f"任务：{task_info.get('name', '')}\n"
+                    f"触发：{task_info.get('last_reason', '') or task_plan.get('message', '')}\n"
+                    f"基准预设：{task_info.get('base_preset', '')}\n"
+                    f"目标：{task_info.get('max_bets', 0)} 笔"
+                ),
+                ttl_seconds=90,
+                attr_name="task_transition_message",
+            )
+        except Exception:
+            pass
     dynamic_betting.clear_dynamic_decision(rt)
     next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
     settled_count = _count_settled_bets(state)
@@ -1774,6 +1805,11 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     )
                 except Exception as e:
                     log_event(logging.WARNING, 'analytics', '写入 analytics execution 失败', user_id=user_ctx.user_id, data=str(e))
+                task_engine.record_round_action(
+                    user_ctx,
+                    event_type="observe",
+                    note=str(rt.get("last_predict_info", "") or "策略观望"),
+                )
                 user_ctx.save_state()
                 return
 
@@ -1824,6 +1860,11 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 )
             except Exception as e:
                 log_event(logging.WARNING, 'analytics', '写入 analytics fk1 observe 失败', user_id=user_ctx.user_id, data=str(e))
+            task_engine.record_round_action(
+                user_ctx,
+                event_type="blocked_fk1",
+                note=str(fk1_result.get("reason_text", "") or "盘面风控建议观望"),
+            )
             await _send_transient_admin_notice(
                 client,
                 user_ctx,
@@ -2049,6 +2090,11 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     )
                 except Exception as e:
                     log_event(logging.WARNING, 'analytics', '写入 analytics fund block 失败', user_id=user_ctx.user_id, data=str(e))
+                task_engine.record_round_action(
+                    user_ctx,
+                    event_type="blocked_fund",
+                    note="资金风控阻断，本局不下注",
+                )
                 _clear_lose_recovery_tracking(rt)
                 user_ctx.save_state()
                 return
@@ -2195,6 +2241,13 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             )
         except Exception as e:
             log_event(logging.WARNING, 'analytics', '写入 analytics bet execution 失败', user_id=user_ctx.user_id, data=str(e))
+        task_engine.record_round_action(
+            user_ctx,
+            event_type="bet",
+            note="任务已执行真实下注",
+            applied_preset=actual_preset_name,
+            bet_id=bet_id,
+        )
 
         bet_report = generate_mobile_bet_report(
             state.history,
@@ -3026,6 +3079,11 @@ async def _apply_entry_gate_pause(
         )
     except Exception as e:
         log_event(logging.WARNING, 'analytics', '写入 analytics fk2 block 失败', user_id=user_ctx.user_id, data=str(e))
+    task_engine.record_round_action(
+        user_ctx,
+        event_type="blocked_fk2",
+        note=str(gate.get("reason_text", "入场风控未通过") or "入场风控未通过"),
+    )
 
     total = int(gate.get("total", 0) or 0)
     wins = int(gate.get("wins", 0) or 0)
@@ -3445,6 +3503,12 @@ async def _trigger_deep_risk_pause_after_settle(
         )
     except Exception as e:
         log_event(logging.WARNING, 'analytics', '写入 analytics fk3 pause 失败', user_id=user_ctx.user_id, data=str(e))
+    task_engine.record_round_action(
+        user_ctx,
+        event_type="pause_fk3",
+        note=f"连输风控暂停 {pause_rounds} 局",
+        profit_delta=0,
+    )
 
     wins = risk_pause.get("wins", 0)
     total = risk_pause.get("total", 0)
@@ -3581,6 +3645,11 @@ async def _handle_goal_pause_after_settle(
         user_ctx,
         global_config,
         remaining_rounds=configured_stop_rounds,
+    )
+    task_engine.record_round_action(
+        user_ctx,
+        event_type="pause_goal",
+        note=f"{pause_reason} {configured_stop_rounds} 局",
     )
     return True
 
@@ -4153,6 +4222,8 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     elif state.bet_sequence_log:
                         settled_entry = state.bet_sequence_log[-1]
 
+                    task_finish_result = {"task_finished": False, "summary": ""}
+
                     # 更新押注日志（存储在 state 中，不是 rt 中）
                     if isinstance(settled_entry, dict):
                         settled_entry["result"] = result_text
@@ -4194,6 +4265,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                             history_analysis.record_settlement(user_ctx, settled_entry, result_num, result_type)
                         except Exception as e:
                             log_event(logging.WARNING, 'analytics', '写入 analytics settlement 失败', user_id=user_ctx.user_id, data=str(e))
+                        task_finish_result = task_engine.record_settlement(user_ctx, settled_entry, profit)
 
                     user_ctx.save_state()
 
@@ -4216,6 +4288,8 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     log_event(logging.INFO, 'settle', '发送结算通知', 
                               user_id=user_ctx.user_id, data=f'bet_id={bet_id}')
                     await send_to_admin(client, mes, user_ctx, global_config)
+                    if task_finish_result.get("task_finished", False) and str(task_finish_result.get("summary", "")).strip():
+                        await send_to_admin(client, str(task_finish_result.get("summary", "")), user_ctx, global_config)
 
                     # 深度风控在结算阶段即时触发：每3连输命中后，立即评估并下发暂停通知。
                     if not win:
@@ -4733,6 +4807,13 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `fp 4` : 查看观望/阻断复盘
 - `fp 5` : 查看当前盘面证据
 - `fp 6` : 查看链路覆盖与缺失
+- `task` : 查看任务总览
+- `task list` : 查看任务列表
+- `task add ...` : 创建任务（手动/定时/盘面/混合）
+- `task run <id>` : 立即手动启动任务
+- `task pause|resume <id>` : 暂停/恢复任务
+- `task logs [id]` : 查看任务运行记录
+- `task stats [id]` : 查看任务统计
 - 说明：风控会直接影响观望、限档、入场阻断与连输暂停，进而影响押注收益；脚本重启后按账号默认模式自动生效
 
 **参数设置**
@@ -4987,6 +5068,82 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             await send_to_admin(
                 client,
                 "❌ 参数格式错误\n用法：`fp` / `fp 1` / `fp 2` / `fp 3` / `fp 4` / `fp 5` / `fp 6`",
+                user_ctx,
+                global_config,
+            )
+            return
+
+        if cmd == "task":
+            if len(my) == 1:
+                await send_to_admin(client, task_engine.build_task_overview_text(user_ctx), user_ctx, global_config)
+                return
+
+            subcmd = str(my[1]).strip().lower()
+            if subcmd == "list":
+                await send_to_admin(client, task_engine.build_task_list_text(user_ctx), user_ctx, global_config)
+                return
+            if subcmd == "show" and len(my) >= 3:
+                await send_to_admin(client, task_engine.build_task_detail_text(user_ctx, my[2]), user_ctx, global_config)
+                return
+            if subcmd == "logs":
+                ident = my[2] if len(my) >= 3 else ""
+                await send_to_admin(client, task_engine.build_task_logs_text(user_ctx, ident), user_ctx, global_config)
+                return
+            if subcmd == "stats":
+                ident = my[2] if len(my) >= 3 else ""
+                await send_to_admin(client, task_engine.build_task_stats_text(user_ctx, ident), user_ctx, global_config)
+                return
+            if subcmd == "add":
+                parsed = task_engine.parse_create_args(my[2:])
+                if not parsed.get("ok", False):
+                    await send_to_admin(client, str(parsed.get("message", "任务创建参数错误")), user_ctx, global_config)
+                    return
+                result = task_engine.create_task(
+                    user_ctx,
+                    name=str(parsed.get("name", "") or ""),
+                    base_preset=str(parsed.get("base_preset", "") or ""),
+                    max_bets=int(parsed.get("max_bets", 0) or 0),
+                    trigger_mode=str(parsed.get("trigger_mode", task_engine.TASK_MODE_MANUAL) or task_engine.TASK_MODE_MANUAL),
+                    interval_minutes=int(parsed.get("interval_minutes", 0) or 0),
+                    regimes=list(parsed.get("regimes", []) or []),
+                    max_loss=int(parsed.get("max_loss", 0) or 0),
+                    enabled=False,
+                )
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd in {"on", "off"} and len(my) >= 3:
+                result = task_engine.set_task_enabled(user_ctx, my[2], subcmd == "on")
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "pause" and len(my) >= 3:
+                result = task_engine.pause_task(user_ctx, my[2])
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "resume" and len(my) >= 3:
+                result = task_engine.resume_task(user_ctx, my[2])
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "run" and len(my) >= 3:
+                result = task_engine.run_task_now(user_ctx, my[2])
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "del" and len(my) >= 3:
+                result = task_engine.delete_task(user_ctx, my[2])
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+
+            await send_to_admin(
+                client,
+                (
+                    "❌ 参数格式错误\n"
+                    "用法：\n"
+                    "`task`\n"
+                    "`task list`\n"
+                    "`task add <名称> <预设> <局数> [manual|schedule|regime|hybrid] [分钟] [盘面列表] [max_loss]`\n"
+                    "`task show <id>` / `task on <id>` / `task off <id>` / `task run <id>`\n"
+                    "`task pause <id>` / `task resume <id>` / `task del <id>`\n"
+                    "`task logs [id]` / `task stats [id]`"
+                ),
                 user_ctx,
                 global_config,
             )

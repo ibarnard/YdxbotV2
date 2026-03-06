@@ -268,6 +268,16 @@ def get_default_runtime() -> Dict[str, Any]:
         "current_dynamic_ceiling_tier": "",
         "last_blocked_by": "",
         "last_execution_action": "",
+        "task_current_id": "",
+        "task_current_name": "",
+        "task_current_run_id": "",
+        "task_current_trigger_mode": "",
+        "task_current_base_preset": "",
+        "task_current_progress_bets": 0,
+        "task_current_target_bets": 0,
+        "task_last_action": "",
+        "task_last_reason": "",
+        "task_last_event_at": "",
         
         # 统计和仪表盘变量
         "total": 0,
@@ -301,6 +311,7 @@ class UserContext:
         self.config: Optional[UserConfig] = None
         self.state: Optional[UserState] = None
         self.presets: Dict[str, List] = {}
+        self.tasks: List[Dict[str, Any]] = []
         self.client = None
         self._model_manager = None
         self._model_manager_ai_sig = ""
@@ -313,6 +324,7 @@ class UserContext:
         self._load_config()
         self._load_state()
         self._load_presets()
+        self._load_tasks()
 
     def _resolve_user_config_path(self) -> str:
         """
@@ -621,6 +633,43 @@ class UserContext:
                 log_event(logging.DEBUG, 'save_presets', '保存用户预设成功', f'user_id={self.user_id}')
             except Exception as e:
                 log_event(logging.ERROR, 'save_presets', '保存用户预设失败', f'user_id={self.user_id}, error={str(e)}')
+
+    def _load_tasks(self):
+        tasks_path = os.path.join(self.user_dir, "tasks.json")
+        self.tasks = []
+        if not os.path.exists(tasks_path):
+            self.save_tasks()
+            return
+        try:
+            with open(tasks_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                task_items = payload.get("tasks", [])
+            elif isinstance(payload, list):
+                task_items = payload
+            else:
+                raise ValueError("tasks.json 必须是对象(dict)或数组(list)")
+            if not isinstance(task_items, list):
+                raise ValueError("tasks 字段必须是数组(list)")
+            self.tasks = [item for item in task_items if isinstance(item, dict)]
+            log_event(logging.DEBUG, 'load_tasks', '加载用户任务成功', f'user_id={self.user_id}, count={len(self.tasks)}')
+        except Exception as e:
+            self.tasks = []
+            log_event(logging.ERROR, 'load_tasks', '加载用户任务失败', f'user_id={self.user_id}, error={str(e)}')
+
+    def save_tasks(self):
+        with self._lock:
+            tasks_path = os.path.join(self.user_dir, "tasks.json")
+            payload = {
+                "version": 1,
+                "tasks": self.tasks,
+            }
+            try:
+                with open(tasks_path, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, indent=4, ensure_ascii=False)
+                log_event(logging.DEBUG, 'save_tasks', '保存用户任务成功', f'user_id={self.user_id}, count={len(self.tasks)}')
+            except Exception as e:
+                log_event(logging.ERROR, 'save_tasks', '保存用户任务失败', f'user_id={self.user_id}, error={str(e)}')
     
     def get_runtime(self, key: str, default=None):
         return self.state.runtime.get(key, default)

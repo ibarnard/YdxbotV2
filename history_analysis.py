@@ -1374,11 +1374,34 @@ def _ensure_analytics_schema(conn: sqlite3.Connection) -> None:
             reversal_score REAL NOT NULL,
             regime_label TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS task_runs (
+            task_event_id TEXT PRIMARY KEY,
+            task_id TEXT NOT NULL,
+            task_name TEXT NOT NULL,
+            run_id TEXT,
+            round_key TEXT,
+            decision_id TEXT,
+            bet_id TEXT,
+            event_type TEXT NOT NULL,
+            trigger_mode TEXT,
+            base_preset TEXT,
+            applied_preset TEXT,
+            status_text TEXT,
+            progress_bets INTEGER NOT NULL,
+            target_bets INTEGER NOT NULL,
+            profit_delta INTEGER NOT NULL,
+            cum_profit INTEGER NOT NULL,
+            cum_loss INTEGER NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_rounds_history_index ON rounds(history_index);
         CREATE INDEX IF NOT EXISTS idx_decisions_round_key ON decisions(round_key);
         CREATE INDEX IF NOT EXISTS idx_risk_round_key ON risk_records(round_key);
         CREATE INDEX IF NOT EXISTS idx_execution_round_key ON execution_records(round_key);
         CREATE INDEX IF NOT EXISTS idx_settlements_round_key ON settlements(round_key);
+        CREATE INDEX IF NOT EXISTS idx_task_runs_task_id ON task_runs(task_id);
+        CREATE INDEX IF NOT EXISTS idx_task_runs_created_at ON task_runs(created_at);
         """
     )
 
@@ -1631,6 +1654,64 @@ def record_settlement(user_ctx, settled_entry: Dict[str, Any], result_num: Any, 
                     _safe_int_value(settled_entry.get("lose_count_before", 0), 0),
                     lose_after,
                     "recover" if profit > 0 else (f"lose_{lose_after}" if lose_after > 0 else "flat"),
+                ),
+            ),
+        ],
+    )
+
+
+def record_task_event(
+    user_ctx,
+    *,
+    task_id: str,
+    task_name: str,
+    run_id: str = "",
+    round_key: str = "",
+    decision_id: str = "",
+    bet_id: str = "",
+    event_type: str,
+    trigger_mode: str = "",
+    base_preset: str = "",
+    applied_preset: str = "",
+    status_text: str = "",
+    progress_bets: int = 0,
+    target_bets: int = 0,
+    profit_delta: int = 0,
+    cum_profit: int = 0,
+    cum_loss: int = 0,
+    note: str = "",
+) -> None:
+    _write_analytics(
+        user_ctx,
+        [
+            (
+                """
+                INSERT INTO task_runs (
+                    task_event_id, task_id, task_name, run_id, round_key, decision_id, bet_id,
+                    event_type, trigger_mode, base_preset, applied_preset, status_text,
+                    progress_bets, target_bets, profit_delta, cum_profit, cum_loss, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"task_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{uuid.uuid4().hex[:8]}",
+                    str(task_id or ""),
+                    str(task_name or ""),
+                    str(run_id or ""),
+                    str(round_key or ""),
+                    str(decision_id or ""),
+                    str(bet_id or ""),
+                    str(event_type or ""),
+                    str(trigger_mode or ""),
+                    str(base_preset or ""),
+                    str(applied_preset or ""),
+                    str(status_text or ""),
+                    _safe_int_value(progress_bets, 0),
+                    _safe_int_value(target_bets, 0),
+                    _safe_int_value(profit_delta, 0),
+                    _safe_int_value(cum_profit, 0),
+                    _safe_int_value(cum_loss, 0),
+                    str(note or ""),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             ),
         ],
