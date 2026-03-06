@@ -170,6 +170,12 @@ class ModelManager:
         # 获取降级链
         fallback_chain = [str(x) for x in (self.fallback_chain or getattr(legacy_config, 'MODEL_FALLBACK_CHAIN', []))]
         target_model_id = str(model_id)
+        requested_model = self.get_model(target_model_id)
+        requested_actual_model_id = (
+            str(requested_model.get('model_id'))
+            if requested_model and requested_model.get('model_id')
+            else target_model_id
+        )
         
         # 确定尝试顺序
         try_models = []
@@ -207,6 +213,8 @@ class ModelManager:
                 continue
 
             provider = model_config.get('provider')
+            resolved_model_id = str(model_config.get('model_id', current_id))
+            resolved_model_key = str(model_config.get('idx', current_id))
             logger.info(f"正在尝试调用模型: {current_id} ({provider})")
             
             try:
@@ -223,8 +231,12 @@ class ModelManager:
                     result = {"success": False, "error": f"不支持的厂商: {provider}", "content": ""}
                 
                 if result['success']:
-                    if current_id != target_model_id:
+                    if resolved_model_id != requested_actual_model_id:
                         logger.warning(f"模型 {target_model_id} 调用失败，已降级并成功使用 {current_id}")
+                    result['model_id'] = resolved_model_id
+                    result['requested_model_id'] = requested_actual_model_id
+                    result['resolved_model_key'] = resolved_model_key
+                    result['fallback_used'] = resolved_model_id != requested_actual_model_id
                     return result
                 else:
                     error_msg = f"{current_id} 调用失败: {result['error']}"
