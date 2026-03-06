@@ -87,38 +87,55 @@
 
 ## 5. 当前执行阶段
 
-### [ ] E. 模板参数可覆盖 V1
+### [x] E. 模板参数可覆盖 V1
+状态：已完成，待提交/推送
+
+对应文档：
+- [docs/task-template-overrides-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/task-template-overrides-v1-tech-spec.md)
+
+已交付：
+- `task new <模板> [名称] [preset=...] [bets=...] [loss=...]`
+- `pkg new <模板> [名称] [preset=...] [bets=...] [loss=...]`
+- 模板参数解析器
+- 参数校验
+- 对应测试与说明书
+
+---
+
+## 6. 当前执行阶段
+
+### [ ] F. 策略版本化与 prompt 回写 V1
 状态：下一阶段，准备开始
 
 目标：
-- 保留模板创建
-- 创建时可覆盖预设、目标笔数、止损
-- 尽量不回退到长参数 `task add`
+- 把复盘事实回写到策略版本
+- 让提示词和策略上下文有版本、有灰度、有回滚
 
 完成标准：
-- [ ] `task new <模板> [名称] [覆盖参数]`
-- [ ] `pkg new <模板> [名称] [覆盖参数]`
-- [ ] 参数校验
+- [ ] `policy_id / policy_version`
+- [ ] 结构化证据包
+- [ ] prompt 回写机制
+- [ ] 单账户灰度
+- [ ] 回滚能力
 - [ ] 对应说明书
 - [ ] 对应测试
 - [ ] 中文 commit
 
 ---
 
-## 6. 当前之后的顺序
+## 7. 当前之后的顺序
 当前默认顺序：
 
-1. `E. 模板参数可覆盖 V1`
-2. 策略版本化与 prompt 回写 V1
-3. 多账号编排 V1
-4. 自学习 V1
+1. `F. 策略版本化与 prompt 回写 V1`
+2. 多账号编排 V1
+3. 自学习 V1
 
 详细拆解、时间预估、风险、确认点，请看：
 - [docs/refactor-roadmap.md](D:/OneDrive/06Code/YdxbotV2/docs/refactor-roadmap.md)
 
 ---
 
-## 7. 回归标准
+## 8. 回归标准
 每个阶段结束前至少执行：
 
 ```powershell
@@ -129,7 +146,7 @@
 
 ---
 
-## 8. 更新规则
+## 9. 更新规则
 后续每次推进，按这个顺序更新：
 
 1. 先改代码

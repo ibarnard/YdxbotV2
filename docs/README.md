@@ -5,6 +5,7 @@
 - [任务系统 V1 技术说明书](./task-system-v1-tech-spec.md)
 - [任务模板与快速创建 V1 技术说明书](./task-template-v1-tech-spec.md)
 - [任务包 V1 技术说明书](./task-package-v1-tech-spec.md)
+- [模板参数可覆盖 V1 技术说明书](./task-template-overrides-v1-tech-spec.md)
 - [重构路线图](./refactor-roadmap.md)
 
 ## 使用建议
