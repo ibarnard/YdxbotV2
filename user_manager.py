@@ -286,6 +286,12 @@ def get_default_runtime() -> Dict[str, Any]:
         "package_last_action": "",
         "package_last_reason": "",
         "package_last_event_at": "",
+        "policy_active_id": "",
+        "policy_active_version": "",
+        "policy_active_mode": "",
+        "policy_last_summary": "",
+        "policy_prompt_fragment": "",
+        "policy_last_synced_at": "",
         
         # 统计和仪表盘变量
         "total": 0,

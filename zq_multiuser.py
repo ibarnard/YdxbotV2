@@ -23,6 +23,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import constants
 import dynamic_betting
 import history_analysis
+import policy_engine
 import risk_control
 import task_engine
 import task_package_engine
@@ -384,6 +385,9 @@ def _persist_decision_audit(
             "source": decision_source,
             "tag": decision_tag,
             "model_id": str(audit_log.get("model_id", "") or ""),
+            "policy_id": str(audit_log.get("policy_id", "") or ""),
+            "policy_version": str(audit_log.get("policy_version", "") or ""),
+            "policy_mode": str(audit_log.get("policy_mode", "") or ""),
             "martingale_step": _safe_int(
                 (audit_log.get("input_payload", {}) or {}).get("current_status", {}).get("martingale_step", 0),
                 0,
@@ -638,6 +642,7 @@ def format_dashboard(user_ctx: UserContext) -> str:
     )}\n\n———————————————\n🎯 **策略设定**\n"""
     mes += f"🔢 **软件版本：{get_software_version_text()}**\n"
     mes += f"🤖 **模型 API：{rt.get('current_model_id', 'unknown')}**\n"
+    mes += f"{policy_engine.build_policy_focus_text(user_ctx)}\n"
     preset_name = rt.get("current_preset_name", "none")
     preset_params = (
         f"{rt.get('continuous', 1)} {rt.get('lose_stop', 13)} "
@@ -749,12 +754,14 @@ def build_startup_focus_reminder(user_ctx: UserContext) -> str:
         mode_code = 1
     mode_text = {0: "反投", 1: "预测", 2: "追投"}.get(mode_code, "未知")
     status_text = get_bet_status_text(rt)
+    policy_text = policy_engine.build_policy_focus_text(user_ctx)
     package_text = task_package_engine.build_package_focus_text(user_ctx)
     task_text = task_engine.build_task_focus_text(user_ctx)
     return (
         "🔔 启动重点设置提醒\n"
         f"🛡️ 风控提醒：fk1 盘面 {_risk_switch_label(risk_modes['fk1_enabled'])} / fk2 入场 {_risk_switch_label(risk_modes['fk2_enabled'])} / fk3 连输 {_risk_switch_label(risk_modes['fk3_enabled'])}\n"
         f"🧱 默认模式：fk1 {_risk_switch_label(risk_modes['fk1_default_enabled'])} / fk2 {_risk_switch_label(risk_modes['fk2_default_enabled'])} / fk3 {_risk_switch_label(risk_modes['fk3_default_enabled'])}（可用 `fk ...` 开关）\n"
+        f"{policy_text}\n"
         f"🎯 预设提醒：当前 `{preset_name}`（可用 `st <预设名>` 切换）\n"
         f"{package_text}\n"
         f"{task_text}\n"
@@ -1200,9 +1207,15 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
     state = user_ctx.state
     rt = state.runtime
     history = state.history
+    analysis_snapshot: Dict[str, Any] = {}
+    policy_context: Dict[str, Any] = {}
     
     try:
         # ========== 第一步：构建三维历史快照（交易员终端感） ==========
+        analysis_snapshot = rt.get("current_analysis_snapshot", {})
+        if not isinstance(analysis_snapshot, dict) or not analysis_snapshot:
+            analysis_snapshot = history_analysis.build_current_analysis_snapshot(user_ctx)
+        policy_context = policy_engine.build_policy_prompt_context(user_ctx, analysis_snapshot)
         
         # 1.1 短期精确抖动（20局）
         short_term_20 = history[-20:] if len(history) >= 20 else history[:]
@@ -1252,7 +1265,28 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
                 "tail_streak_len": tail_streak_len,
                 "tail_streak_char": tail_streak_char,
                 "gap": f"{gap:+d}"
+            },
+            "strategy_policy": {
+                "policy_id": str(policy_context.get("policy_id", "") or ""),
+                "policy_version": str(policy_context.get("policy_version", "") or ""),
+                "policy_mode": str(policy_context.get("policy_mode", "") or ""),
+                "policy_summary": str(policy_context.get("policy_summary", "") or ""),
+                "evidence_package": policy_context.get("evidence_package", {}),
             }
+        }
+        policy_evidence = policy_context.get("evidence_package", {}) if isinstance(policy_context.get("evidence_package", {}), dict) else {}
+        policy_prompt_payload = {
+            "current_regime": str(policy_evidence.get("current_regime", "") or ""),
+            "scores": policy_evidence.get("scores", {}),
+            "similar_cases": {
+                "similar_count": int(policy_evidence.get("similar_cases", {}).get("similar_count", 0) or 0),
+                "evidence_strength": str(policy_evidence.get("similar_cases", {}).get("evidence_strength", "insufficient") or "insufficient"),
+                "weighted_signal_hit_rate": float(policy_evidence.get("similar_cases", {}).get("weighted_signal_hit_rate", 0.0) or 0.0),
+                "recommended_tier_cap": str(policy_evidence.get("similar_cases", {}).get("recommended_tier_cap", "") or ""),
+            },
+            "recent_temperature": policy_evidence.get("recent_temperature", {}),
+            "overview_24h": policy_evidence.get("overview_24h", {}),
+            "tier_24h": policy_evidence.get("tier_24h", {}),
         }
         
         # ========== 第三步：深度博弈推理Prompt（M-SMP架构） ==========
@@ -1290,6 +1324,11 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
 当前形态: {pattern_tag} (尾部{tail_streak_len}连{'大' if tail_streak_char==1 else '小'})
 大数缺口: {gap:+d} (正=缺大, 负=缺小)
 倍投压力: 第{lose_count + 1}次 ({entropy_tag})
+
+[Policy Overlay]
+当前策略版本: {policy_context.get('policy_id', '')}@{policy_context.get('policy_version', '')} ({policy_context.get('policy_mode', '')})
+{policy_context.get('prompt_fragment', '')}
+结构化证据包: {json.dumps(policy_prompt_payload, ensure_ascii=False, sort_keys=True)}
 
 [Final Choice]
 当趋势与回归冲突时，不要“一刀切逆势”；请先比较证据强度：
@@ -1385,6 +1424,10 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
             "model_id": current_model_id,
             "prediction_source": rt.get("last_predict_source", "unknown"),
             "pattern_tag": pattern_tag,
+            "policy_id": str(policy_context.get("policy_id", "") or ""),
+            "policy_version": str(policy_context.get("policy_version", "") or ""),
+            "policy_mode": str(policy_context.get("policy_mode", "") or ""),
+            "policy_summary": str(policy_context.get("policy_summary", "") or ""),
         }
         _persist_decision_audit(user_ctx, rt, audit_log)
         
@@ -1435,6 +1478,10 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
             "model_id": rt.get("current_model_id", "unknown"),
             "prediction_source": "hard_fallback",
             "pattern_tag": "FALLBACK_HARD",
+            "policy_id": str(policy_context.get("policy_id", "") or ""),
+            "policy_version": str(policy_context.get("policy_version", "") or ""),
+            "policy_mode": str(policy_context.get("policy_mode", "") or ""),
+            "policy_summary": str(policy_context.get("policy_summary", "") or ""),
             "error": str(e),
         }
         _persist_decision_audit(user_ctx, rt, fallback_audit)
@@ -4850,6 +4897,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `pkg list` / `pkg show <id>` : 查看任务包列表或详情
 - `pkg run <id>` / `pkg pause <id>` / `pkg resume <id>` : 启动、暂停、恢复任务包
 - `pkg logs [id]` / `pkg stats [id]` : 查看任务包日志与统计
+- `policy` : 查看当前策略版本
+- `policy list` / `policy show [vX]` : 查看策略版本列表或详情
+- `policy sync` : 根据当前复盘事实生成并激活新策略版本（单账户灰度）
+- `policy use <vX>` / `policy rollback` : 切换或回滚策略版本
 - 说明：风控会直接影响观望、限档、入场阻断与连输暂停，进而影响押注收益；脚本重启后按账号默认模式自动生效
 
 **参数设置**
@@ -5271,6 +5322,52 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "`pkg list`\n"
                     "`pkg show <id>` / `pkg run <id>` / `pkg pause <id>` / `pkg resume <id>`\n"
                     "`pkg logs [id]` / `pkg stats [id]`"
+                ),
+                user_ctx,
+                global_config,
+            )
+            return
+
+        if cmd in {"policy", "pol"}:
+            if len(my) == 1:
+                await send_to_admin(client, policy_engine.build_policy_overview_text(user_ctx), user_ctx, global_config)
+                return
+
+            subcmd = str(my[1]).strip().lower()
+            if subcmd == "list":
+                await send_to_admin(client, policy_engine.build_policy_list_text(user_ctx), user_ctx, global_config)
+                return
+            if subcmd == "show":
+                ident = my[2] if len(my) >= 3 else ""
+                await send_to_admin(client, policy_engine.build_policy_detail_text(user_ctx, ident), user_ctx, global_config)
+                return
+            if subcmd == "sync":
+                result = policy_engine.sync_policy_from_evidence(user_ctx, rt.get("current_analysis_snapshot", {}))
+                user_ctx.save_state()
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "use" and len(my) >= 3:
+                result = policy_engine.activate_policy_version(user_ctx, my[2], reason="命令切换")
+                user_ctx.save_state()
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "rollback":
+                result = policy_engine.rollback_policy(user_ctx)
+                user_ctx.save_state()
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+
+            await send_to_admin(
+                client,
+                (
+                    "❌ 参数格式错误\n"
+                    "用法：\n"
+                    "`policy`\n"
+                    "`policy list`\n"
+                    "`policy show [vX]`\n"
+                    "`policy sync`\n"
+                    "`policy use <vX>`\n"
+                    "`policy rollback`"
                 ),
                 user_ctx,
                 global_config,

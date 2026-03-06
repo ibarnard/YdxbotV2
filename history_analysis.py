@@ -619,6 +619,105 @@ def build_current_analysis_snapshot(user_ctx) -> Dict[str, Any]:
     return snapshot
 
 
+def build_policy_evidence_package(user_ctx, analysis_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    snapshot = analysis_snapshot if isinstance(analysis_snapshot, dict) and analysis_snapshot else build_current_analysis_snapshot(user_ctx)
+    analytics = _recent_analytics_context(user_ctx, hours=24)
+    settlements = analytics.get("settlements", [])
+    executions = analytics.get("executions", [])
+    regimes_by_key = analytics.get("regimes_by_key", {})
+    rounds_by_key = analytics.get("rounds_by_key", {})
+
+    pnl24 = sum(int(item.get("profit", 0) or 0) for item in settlements)
+    wins24 = sum(int(item.get("is_win", 0) or 0) for item in settlements)
+    win_rate24 = round((wins24 / len(settlements)), 4) if settlements else 0.0
+    max_drawdown24 = _max_drawdown([int(item.get("profit", 0) or 0) for item in settlements])
+    observe_count = sum(1 for item in executions if str(item.get("action_type", "") or "") == "observe")
+    blocked_count = sum(1 for item in executions if str(item.get("action_type", "") or "") == "blocked")
+
+    regime_totals: Dict[str, Dict[str, Any]] = {}
+    tier_groups: Dict[str, Dict[str, Any]] = {
+        "low": {"count": 0, "pnl_total": 0, "wins": 0},
+        "mid": {"count": 0, "pnl_total": 0, "wins": 0},
+        "high": {"count": 0, "pnl_total": 0, "wins": 0},
+    }
+    for settlement in settlements:
+        round_key = str(settlement.get("round_key", "") or "")
+        regime_label = str(regimes_by_key.get(round_key, {}).get("regime_label", REGIME_RANGE) or REGIME_RANGE)
+        bucket = regime_totals.setdefault(regime_label, {"count": 0, "pnl_total": 0})
+        bucket["count"] += 1
+        bucket["pnl_total"] += int(settlement.get("profit", 0) or 0)
+
+    executions_by_key = analytics.get("executions_by_key", {})
+    for round_key, execution in executions_by_key.items():
+        if str(execution.get("action_type", "") or "") != "bet":
+            continue
+        settlement = analytics.get("settlements_by_key", {}).get(round_key, {})
+        preset_name = str(execution.get("preset_name", "") or "").strip().lower()
+        tier_group = _tier_group(preset_name)
+        bucket = tier_groups.setdefault(tier_group, {"count": 0, "pnl_total": 0, "wins": 0})
+        bucket["count"] += 1
+        bucket["pnl_total"] += int(settlement.get("profit", 0) or 0)
+        bucket["wins"] += int(settlement.get("is_win", 0) or 0)
+
+    best_regime = "-"
+    worst_regime = "-"
+    if regime_totals:
+        sorted_regimes = sorted(regime_totals.items(), key=lambda item: int(item[1].get("pnl_total", 0) or 0))
+        worst_regime = str(sorted_regimes[0][0] or "-")
+        best_regime = str(sorted_regimes[-1][0] or "-")
+
+    tier_summary: Dict[str, Dict[str, Any]] = {}
+    for group_name, bucket in tier_groups.items():
+        count = int(bucket.get("count", 0) or 0)
+        pnl_total_group = int(bucket.get("pnl_total", 0) or 0)
+        wins_group = int(bucket.get("wins", 0) or 0)
+        tier_summary[group_name] = {
+            "count": count,
+            "avg_pnl": round((pnl_total_group / count), 2) if count else 0.0,
+            "win_rate": round((wins_group / count), 4) if count else 0.0,
+        }
+
+    features = snapshot.get("features", {}) if isinstance(snapshot.get("features", {}), dict) else {}
+    similar = snapshot.get("similar_cases", {}) if isinstance(snapshot.get("similar_cases", {}), dict) else {}
+    temperature = snapshot.get("recent_temperature", {}) if isinstance(snapshot.get("recent_temperature", {}), dict) else {}
+
+    return {
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "round_key": str(snapshot.get("round_key", "") or ""),
+        "current_regime": str(snapshot.get("regime_label", REGIME_RANGE) or REGIME_RANGE),
+        "board_10": str(snapshot.get("board_10", "-") or "-"),
+        "board_40": str(snapshot.get("board_40", "-") or "-"),
+        "scores": {
+            "trend": int(features.get("trend_score", 0) or 0),
+            "chaos": int(features.get("chaos_score", 0) or 0),
+            "reversal": int(features.get("reversal_score", 0) or 0),
+        },
+        "similar_cases": {
+            "similar_count": int(similar.get("similar_count", 0) or 0),
+            "evidence_strength": str(similar.get("evidence_strength", "insufficient") or "insufficient"),
+            "weighted_signal_hit_rate": float(similar.get("weighted_signal_hit_rate", 0.0) or 0.0),
+            "recommended_tier_cap": str(similar.get("recommended_tier_cap", "") or ""),
+            "source": str(similar.get("source", "none") or "none"),
+            "tiers": similar.get("tiers", {}) if isinstance(similar.get("tiers", {}), dict) else {},
+        },
+        "recent_temperature": temperature,
+        "overview_24h": {
+            "settled_count": len(settlements),
+            "win_rate": win_rate24,
+            "pnl_total": pnl24,
+            "max_drawdown": max_drawdown24,
+            "observe_count": observe_count,
+            "blocked_count": blocked_count,
+        },
+        "regime_24h": {
+            "best_regime": best_regime,
+            "worst_regime": worst_regime,
+            "sample_rounds": len(rounds_by_key),
+        },
+        "tier_24h": tier_summary,
+    }
+
+
 def _format_pct(value: float) -> str:
     return f"{float(value) * 100:.1f}%"
 
@@ -1250,6 +1349,17 @@ def _json_text(payload: Any) -> str:
     return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
+def _ensure_table_columns(conn: sqlite3.Connection, table_name: str, columns: Dict[str, str]) -> None:
+    existing = {
+        str(row[1] or "")
+        for row in conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    }
+    for column_name, column_def in columns.items():
+        if column_name in existing:
+            continue
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_def}")
+
+
 def _safe_int_value(value: Any, default: int = 0) -> int:
     try:
         return int(value)
@@ -1304,6 +1414,32 @@ def _ensure_analytics_schema(conn: sqlite3.Connection) -> None:
             output_json TEXT,
             is_observe INTEGER NOT NULL,
             is_fallback INTEGER NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS policy_versions (
+            policy_row_id TEXT PRIMARY KEY,
+            policy_id TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            source TEXT NOT NULL,
+            activation_mode TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            activated_at TEXT,
+            based_on_version TEXT,
+            summary TEXT,
+            prompt_fragment TEXT,
+            writeback_json TEXT,
+            evidence_json TEXT,
+            evidence_hash TEXT
+        );
+        CREATE TABLE IF NOT EXISTS policy_events (
+            policy_event_id TEXT PRIMARY KEY,
+            policy_id TEXT NOT NULL,
+            policy_version TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            reason TEXT,
+            previous_version TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS risk_records (
             risk_record_id TEXT PRIMARY KEY,
@@ -1421,7 +1557,19 @@ def _ensure_analytics_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_task_runs_created_at ON task_runs(created_at);
         CREATE INDEX IF NOT EXISTS idx_package_runs_package_id ON package_runs(package_id);
         CREATE INDEX IF NOT EXISTS idx_package_runs_created_at ON package_runs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_policy_versions_policy_id ON policy_versions(policy_id);
+        CREATE INDEX IF NOT EXISTS idx_policy_events_policy_id ON policy_events(policy_id);
         """
+    )
+    _ensure_table_columns(
+        conn,
+        "decisions",
+        {
+            "policy_id": "TEXT",
+            "policy_version": "TEXT",
+            "policy_mode": "TEXT",
+            "policy_summary": "TEXT",
+        },
     )
 
 
@@ -1517,8 +1665,8 @@ def record_decision_audit(user_ctx, audit_log: Dict[str, Any]) -> None:
                 INSERT OR REPLACE INTO decisions (
                     decision_id, round_key, decision_time, mode, model_id, prediction, direction_code,
                     direction_text, confidence, source, pattern_tag, reason_text, input_payload_json,
-                    output_json, is_observe, is_fallback
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    output_json, is_observe, is_fallback, policy_id, policy_version, policy_mode, policy_summary
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     str(audit_log.get("decision_id", "") or ""),
@@ -1537,6 +1685,78 @@ def record_decision_audit(user_ctx, audit_log: Dict[str, Any]) -> None:
                     _json_text(output),
                     1 if prediction == -1 else 0,
                     0 if source in {"model", "model_skip"} else 1,
+                    str(audit_log.get("policy_id", "") or ""),
+                    str(audit_log.get("policy_version", "") or ""),
+                    str(audit_log.get("policy_mode", "") or ""),
+                    str(audit_log.get("policy_summary", "") or ""),
+                ),
+            ),
+        ],
+    )
+
+
+def record_policy_version(user_ctx, policy: Dict[str, Any]) -> None:
+    _write_analytics(
+        user_ctx,
+        [
+            (
+                """
+                INSERT OR REPLACE INTO policy_versions (
+                    policy_row_id, policy_id, policy_version, source, activation_mode, status,
+                    created_at, activated_at, based_on_version, summary, prompt_fragment,
+                    writeback_json, evidence_json, evidence_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"{str(policy.get('policy_id', '') or '')}:{str(policy.get('policy_version', '') or '')}",
+                    str(policy.get("policy_id", "") or ""),
+                    str(policy.get("policy_version", "") or ""),
+                    str(policy.get("source", "baseline") or "baseline"),
+                    str(policy.get("activation_mode", "baseline") or "baseline"),
+                    str(policy.get("status", "active") or "active"),
+                    str(policy.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")) or ""),
+                    str(policy.get("activated_at", "") or ""),
+                    str(policy.get("based_on_version", "") or ""),
+                    str(policy.get("summary", "") or ""),
+                    str(policy.get("prompt_fragment", "") or ""),
+                    _json_text(policy.get("writeback_lines", [])),
+                    _json_text(policy.get("evidence_package", {})),
+                    str(policy.get("evidence_hash", "") or ""),
+                ),
+            ),
+        ],
+    )
+
+
+def record_policy_event(
+    user_ctx,
+    *,
+    policy_id: str,
+    policy_version: str,
+    event_type: str,
+    reason: str = "",
+    previous_version: str = "",
+    payload: Any = None,
+) -> None:
+    _write_analytics(
+        user_ctx,
+        [
+            (
+                """
+                INSERT INTO policy_events (
+                    policy_event_id, policy_id, policy_version, event_type, reason,
+                    previous_version, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"pe_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{uuid.uuid4().hex[:8]}",
+                    str(policy_id or ""),
+                    str(policy_version or ""),
+                    str(event_type or ""),
+                    str(reason or ""),
+                    str(previous_version or ""),
+                    _json_text(payload),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
             ),
         ],
