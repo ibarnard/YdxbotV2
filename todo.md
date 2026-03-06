@@ -88,7 +88,7 @@
 ## 5. 当前执行阶段
 
 ### [x] E. 模板参数可覆盖 V1
-状态：已完成，已提交，待推送
+状态：已完成，已提交，已推送
 
 对应文档：
 - [docs/task-template-overrides-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/task-template-overrides-v1-tech-spec.md)
@@ -104,31 +104,29 @@
 
 ## 6. 当前执行阶段
 
-### [ ] F. 策略版本化与 prompt 回写 V1
-状态：下一阶段，准备开始
+### [x] F. 策略版本化与 prompt 回写 V1
+状态：已完成，已提交，待推送
 
-目标：
-- 把复盘事实回写到策略版本
-- 让提示词和策略上下文有版本、有灰度、有回滚
+对应文档：
+- [docs/policy-prompt-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/policy-prompt-v1-tech-spec.md)
 
-完成标准：
-- [ ] `policy_id / policy_version`
-- [ ] 结构化证据包
-- [ ] prompt 回写机制
-- [ ] 单账户灰度
-- [ ] 回滚能力
-- [ ] 对应说明书
-- [ ] 对应测试
-- [ ] 中文 commit
+已交付：
+- `policy_versions.json`
+- `policy_versions / policy_events`
+- 结构化证据包
+- prompt 回写片段
+- `policy / pol` 命令
+- 单账户灰度与回滚
+- 决策落库 `policy_*`
+- 对应测试与说明书
 
 ---
 
 ## 7. 当前之后的顺序
 当前默认顺序：
 
-1. `F. 策略版本化与 prompt 回写 V1`
-2. 多账号编排 V1
-3. 自学习 V1
+1. 多账号编排 V1
+2. 自学习 V1
 
 详细拆解、时间预估、风险、确认点，请看：
 - [docs/refactor-roadmap.md](D:/OneDrive/06Code/YdxbotV2/docs/refactor-roadmap.md)

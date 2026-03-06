@@ -6,6 +6,7 @@
 - [任务模板与快速创建 V1 技术说明书](./task-template-v1-tech-spec.md)
 - [任务包 V1 技术说明书](./task-package-v1-tech-spec.md)
 - [模板参数可覆盖 V1 技术说明书](./task-template-overrides-v1-tech-spec.md)
+- [策略版本化与 Prompt 回写 V1 技术说明书](./policy-prompt-v1-tech-spec.md)
 - [重构路线图](./refactor-roadmap.md)
 
 ## 使用建议
