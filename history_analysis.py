@@ -1441,6 +1441,55 @@ def _ensure_analytics_schema(conn: sqlite3.Connection) -> None:
             payload_json TEXT,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS learning_candidates (
+            candidate_row_id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            candidate_version TEXT NOT NULL,
+            based_on_policy_id TEXT,
+            based_on_policy_version TEXT,
+            source TEXT NOT NULL,
+            rule_id TEXT,
+            rule_name TEXT,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            summary TEXT,
+            tags_json TEXT,
+            overlay_json TEXT,
+            prompt_fragment TEXT,
+            evidence_json TEXT,
+            candidate_hash TEXT
+        );
+        CREATE TABLE IF NOT EXISTS learning_evaluations (
+            evaluation_id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            candidate_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            sample_size INTEGER NOT NULL,
+            score_total REAL NOT NULL,
+            metrics_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS learning_shadows (
+            shadow_id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            candidate_version TEXT NOT NULL,
+            round_key TEXT,
+            status TEXT NOT NULL,
+            diff_type TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS learning_promotions (
+            promotion_id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            candidate_version TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            target_policy_version TEXT,
+            reason TEXT,
+            payload_json TEXT,
+            created_at TEXT NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS risk_records (
             risk_record_id TEXT PRIMARY KEY,
             round_key TEXT NOT NULL,
@@ -1559,6 +1608,10 @@ def _ensure_analytics_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_package_runs_created_at ON package_runs(created_at);
         CREATE INDEX IF NOT EXISTS idx_policy_versions_policy_id ON policy_versions(policy_id);
         CREATE INDEX IF NOT EXISTS idx_policy_events_policy_id ON policy_events(policy_id);
+        CREATE INDEX IF NOT EXISTS idx_learning_candidates_candidate_id ON learning_candidates(candidate_id);
+        CREATE INDEX IF NOT EXISTS idx_learning_evaluations_candidate_id ON learning_evaluations(candidate_id);
+        CREATE INDEX IF NOT EXISTS idx_learning_shadows_candidate_id ON learning_shadows(candidate_id);
+        CREATE INDEX IF NOT EXISTS idx_learning_promotions_candidate_id ON learning_promotions(candidate_id);
         """
     )
     _ensure_table_columns(
@@ -1757,6 +1810,43 @@ def record_policy_event(
                     str(previous_version or ""),
                     _json_text(payload),
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            ),
+        ],
+    )
+
+
+def record_learning_candidate(user_ctx, candidate: Dict[str, Any]) -> None:
+    _write_analytics(
+        user_ctx,
+        [
+            (
+                """
+                INSERT OR REPLACE INTO learning_candidates (
+                    candidate_row_id, candidate_id, candidate_version, based_on_policy_id,
+                    based_on_policy_version, source, rule_id, rule_name, status,
+                    created_at, updated_at, summary, tags_json, overlay_json,
+                    prompt_fragment, evidence_json, candidate_hash
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(candidate.get("candidate_id", "") or ""),
+                    str(candidate.get("candidate_id", "") or ""),
+                    str(candidate.get("candidate_version", "") or ""),
+                    str(candidate.get("based_on_policy_id", "") or ""),
+                    str(candidate.get("based_on_policy_version", "") or ""),
+                    str(candidate.get("source", "rule_generator") or "rule_generator"),
+                    str(candidate.get("rule_id", "") or ""),
+                    str(candidate.get("rule_name", "") or ""),
+                    str(candidate.get("status", "generated") or "generated"),
+                    str(candidate.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")) or ""),
+                    str(candidate.get("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")) or ""),
+                    str(candidate.get("summary", "") or ""),
+                    _json_text(candidate.get("tags", [])),
+                    _json_text(candidate.get("overlay", {})),
+                    str(candidate.get("prompt_fragment", "") or ""),
+                    _json_text(candidate.get("evidence_package", {})),
+                    str(candidate.get("candidate_hash", "") or ""),
                 ),
             ),
         ],

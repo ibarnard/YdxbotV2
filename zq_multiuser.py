@@ -26,6 +26,7 @@ import history_analysis
 import multi_account_orchestrator
 import policy_engine
 import risk_control
+import self_learning_engine
 import task_engine
 import task_package_engine
 from update_manager import (
@@ -4902,6 +4903,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `policy list` / `policy show [vX]` : 查看策略版本列表或详情
 - `policy sync` : 根据当前复盘事实生成并激活新策略版本（单账户灰度）
 - `policy use <vX>` / `policy rollback` : 切换或回滚策略版本
+- `learn` : 查看受控自学习中心
+- `learn gen` / `learn list` / `learn show <id|cX>` : 生成、查看学习候选
+- `learn eval` / `learn shadow` / `learn gray` / `learn promote` / `learn rollback` : 受控自学习后续阶段入口
 - `fleet` / `users` : 查看多账号总览
 - `fleet task` : 查看多账号任务/任务包视图
 - `fleet policy` : 查看多账号策略灰度视图
@@ -5374,6 +5378,48 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "`policy sync`\n"
                     "`policy use <vX>`\n"
                     "`policy rollback`"
+                ),
+                user_ctx,
+                global_config,
+            )
+            return
+
+        if cmd in {"learn", "learning"}:
+            if len(my) == 1:
+                await send_to_admin(client, self_learning_engine.build_learning_overview_text(user_ctx), user_ctx, global_config)
+                return
+
+            subcmd = str(my[1]).strip().lower()
+            if subcmd == "gen":
+                result = self_learning_engine.generate_candidates_from_evidence(user_ctx, rt.get("current_analysis_snapshot", {}))
+                user_ctx.save_state()
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "list":
+                await send_to_admin(client, self_learning_engine.build_learning_list_text(user_ctx), user_ctx, global_config)
+                return
+            if subcmd == "show":
+                ident = my[2] if len(my) >= 3 else ""
+                await send_to_admin(client, self_learning_engine.build_learning_detail_text(user_ctx, ident), user_ctx, global_config)
+                return
+            if subcmd in {"eval", "shadow", "gray", "promote", "rollback"}:
+                await send_to_admin(client, self_learning_engine.build_learning_pending_text(subcmd), user_ctx, global_config)
+                return
+
+            await send_to_admin(
+                client,
+                (
+                    "❌ 参数格式错误\n"
+                    "用法：\n"
+                    "`learn`\n"
+                    "`learn gen`\n"
+                    "`learn list`\n"
+                    "`learn show <id|cX>`\n"
+                    "`learn eval`\n"
+                    "`learn shadow`\n"
+                    "`learn gray`\n"
+                    "`learn promote`\n"
+                    "`learn rollback`"
                 ),
                 user_ctx,
                 global_config,

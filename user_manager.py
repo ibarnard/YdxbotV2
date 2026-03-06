@@ -311,6 +311,12 @@ def get_default_runtime() -> Dict[str, Any]:
         "policy_last_summary": "",
         "policy_prompt_fragment": "",
         "policy_last_synced_at": "",
+        "learning_candidate_count": 0,
+        "learning_last_generated_at": "",
+        "learning_last_candidate_id": "",
+        "learning_shadow_candidate_id": "",
+        "learning_gray_candidate_id": "",
+        "learning_last_summary": "",
         
         # 统计和仪表盘变量
         "total": 0,
