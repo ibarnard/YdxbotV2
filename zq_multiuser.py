@@ -257,6 +257,15 @@ def log_event(level, module, event, message=None, **kwargs):
     )
 
 
+def _resolve_zhuque_csrf_token(zhuque_cfg: Dict[str, Any]) -> str:
+    """兼容历史字段，优先读取可用 csrf。"""
+    for key in ("csrf_token", "x_csrf", "x_csrf_token", "x-csrf-token", "csrf", "_csrf"):
+        value = str(zhuque_cfg.get(key, "") or "").strip()
+        if value:
+            return value
+    return ""
+
+
 # 格式化数字
 def format_number(num):
     """与 master 版一致：使用千分位格式。"""
@@ -4353,7 +4362,6 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         try:
             balance = await fetch_balance(user_ctx)
             rt["account_balance"] = balance
-            rt["balance_status"] = "success"
         except Exception as e:
             log_event(
                 logging.WARNING,
@@ -6976,12 +6984,22 @@ async def yc_command_handler_multiuser(
 
 async def fetch_balance(user_ctx: UserContext) -> int:
     zhuque = user_ctx.config.zhuque
-    cookie = zhuque.get("cookie", "")
-    csrf_token = zhuque.get("csrf_token", "") or zhuque.get("x_csrf", "")
+    cookie = str(zhuque.get("cookie", "") or "").strip()
+    csrf_token = _resolve_zhuque_csrf_token(zhuque)
     api_url = zhuque.get("api_url", "https://zhuque.in/api/user/getInfo?")
+    cached_balance = int(user_ctx.get_runtime("account_balance", 0) or 0)
     
     if not cookie or not csrf_token:
-        return 0
+        user_ctx.set_runtime("balance_status", "config_missing")
+        log_event(
+            logging.WARNING,
+            'balance',
+            '缺少 Cookie/CSRF，返回缓存余额',
+            user_id=user_ctx.user_id,
+            cookie_exists=bool(cookie),
+            csrf_exists=bool(csrf_token),
+        )
+        return cached_balance
     
     headers = {
         "Cookie": cookie,
@@ -7000,21 +7018,26 @@ async def fetch_balance(user_ctx: UserContext) -> int:
                     user_ctx.set_runtime("balance_status", "auth_failed")
                     log_event(logging.ERROR, 'balance', '认证失败(401)，请更新 Cookie',
                               user_id=user_ctx.user_id)
-                    return user_ctx.get_runtime("account_balance", 0)
+                    return cached_balance
                 
                 if response.status == 200:
                     data = await response.json()
                     if isinstance(data, dict) and data.get("status", 200) != 200:
+                        user_ctx.set_runtime("balance_status", "api_error")
                         log_event(logging.WARNING, 'balance', 'API返回错误',
                                   user_id=user_ctx.user_id, message=data.get("message"))
-                        return user_ctx.get_runtime("account_balance", 0)
+                        return cached_balance
                     
                     balance = int(data.get("data", {}).get("bonus", 0))
                     user_ctx.set_runtime("balance_status", "success")
                     return balance
+                user_ctx.set_runtime("balance_status", "network_error")
+                log_event(logging.ERROR, 'balance', '获取余额失败',
+                          user_id=user_ctx.user_id, status=response.status)
+                return cached_balance
     except Exception as e:
         user_ctx.set_runtime("balance_status", "network_error")
         log_event(logging.ERROR, 'balance', '获取余额失败',
                   user_id=user_ctx.user_id, data=str(e))
     
-    return 0
+    return cached_balance
