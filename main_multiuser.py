@@ -11,12 +11,32 @@ import os
 import time
 import sys
 import errno
-import fcntl
 from typing import Any, Dict, List
 from telethon import TelegramClient, events
 from logging.handlers import TimedRotatingFileHandler
 from user_manager import UserManager, UserContext
 from update_manager import periodic_release_check_loop
+
+try:
+    import fcntl  # type: ignore
+except ImportError:  # pragma: no cover - Windows fallback
+    import msvcrt
+
+    class _FcntlCompat:
+        LOCK_EX = 0x1
+        LOCK_NB = 0x4
+        LOCK_UN = 0x8
+
+        @staticmethod
+        def flock(fd: int, operation: int) -> None:
+            os.lseek(fd, 0, os.SEEK_SET)
+            if operation & _FcntlCompat.LOCK_UN:
+                msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                return
+            mode = msvcrt.LK_NBLCK if operation & _FcntlCompat.LOCK_NB else msvcrt.LK_LOCK
+            msvcrt.locking(fd, mode, 1)
+
+    fcntl = _FcntlCompat()
 
 # 日志配置
 logger = logging.getLogger('main_multiuser')

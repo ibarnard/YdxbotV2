@@ -21,6 +21,9 @@ from datetime import datetime
 from user_manager import UserContext
 from typing import Dict, Any, List, Optional, Tuple
 import constants
+import dynamic_betting
+import history_analysis
+import risk_control
 from update_manager import (
     get_current_repo_info,
     list_version_catalog,
@@ -352,6 +355,16 @@ def _persist_decision_audit(
             logging.WARNING,
             "predict_v10",
             "写入decisions.log失败",
+            user_id=user_ctx.user_id,
+            data=str(e),
+        )
+    try:
+        history_analysis.record_decision_audit(user_ctx, audit_log)
+    except Exception as e:
+        log_event(
+            logging.WARNING,
+            "analytics",
+            "写入 analytics decisions 失败",
             user_id=user_ctx.user_id,
             data=str(e),
         )
@@ -692,56 +705,30 @@ def _risk_switch_label(enabled: bool) -> str:
 
 
 def _normalize_risk_switches(rt: Dict[str, Any], apply_default: bool = False) -> Dict[str, bool]:
-    """
-    统一维护风控“当前开关 + 账号默认开关”。
-    apply_default=True 时，会把当前开关重置为账号默认值（用于启动恢复）。
-    """
-    current_base = _to_bool_switch(rt.get("risk_base_enabled", True), True)
-    current_deep = _to_bool_switch(rt.get("risk_deep_enabled", True), True)
-    default_base = _to_bool_switch(rt.get("risk_base_default_enabled", current_base), current_base)
-    default_deep = _to_bool_switch(rt.get("risk_deep_default_enabled", current_deep), current_deep)
-
-    if apply_default:
-        current_base = default_base
-        current_deep = default_deep
-
-    rt["risk_base_enabled"] = current_base
-    rt["risk_deep_enabled"] = current_deep
-    rt["risk_base_default_enabled"] = default_base
-    rt["risk_deep_default_enabled"] = default_deep
-
+    modes = risk_control.normalize_fk_switches(rt, apply_default=apply_default)
     return {
-        "base_enabled": current_base,
-        "deep_enabled": current_deep,
-        "base_default_enabled": default_base,
-        "deep_default_enabled": default_deep,
+        "base_enabled": modes["fk1_enabled"],
+        "deep_enabled": modes["fk2_enabled"],
+        "base_default_enabled": modes["fk1_default_enabled"],
+        "deep_default_enabled": modes["fk2_default_enabled"],
+        "fk1_enabled": modes["fk1_enabled"],
+        "fk2_enabled": modes["fk2_enabled"],
+        "fk3_enabled": modes["fk3_enabled"],
+        "fk1_default_enabled": modes["fk1_default_enabled"],
+        "fk2_default_enabled": modes["fk2_default_enabled"],
+        "fk3_default_enabled": modes["fk3_default_enabled"],
     }
-
-
 def apply_account_risk_default_mode(rt: Dict[str, Any]) -> Dict[str, bool]:
     """启动/重启时应用账号默认风控模式。"""
     return _normalize_risk_switches(rt, apply_default=True)
 
 
 def _build_risk_state_text(rt: Dict[str, Any], include_usage: bool = True) -> str:
-    risk_modes = _normalize_risk_switches(rt, apply_default=False)
-    mes = (
-        "🛡️ 当前风控开关（账号默认模式）\n"
-        f"- 基础风控：{_risk_switch_label(risk_modes['base_enabled'])}"
-        f"（默认：{_risk_switch_label(risk_modes['base_default_enabled'])}）\n"
-        f"- 深度风控（含高倍入场门控）：{_risk_switch_label(risk_modes['deep_enabled'])}"
-        f"（默认：{_risk_switch_label(risk_modes['deep_default_enabled'])}）\n\n"
-        "说明：`risk` 命令会同步写入当前账号默认，脚本重启后按默认模式生效。"
-    )
-    if include_usage:
-        mes += "\n用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`"
-    return mes
-
-
+    return risk_control.build_fk_state_text(rt, include_usage=include_usage)
 def build_startup_focus_reminder(user_ctx: UserContext) -> str:
     """启动重点设置提醒：风控开关 + 预设 + 入口命令。"""
     rt = user_ctx.state.runtime
-    risk_modes = _normalize_risk_switches(rt, apply_default=False)
+    risk_modes = risk_control.normalize_fk_switches(rt, apply_default=False)
     preset_name = str(rt.get("current_preset_name", "")).strip() or "未设置"
     try:
         mode_code = int(rt.get("mode", 1) or 1)
@@ -750,18 +737,15 @@ def build_startup_focus_reminder(user_ctx: UserContext) -> str:
     mode_text = {0: "反投", 1: "预测", 2: "追投"}.get(mode_code, "未知")
     status_text = get_bet_status_text(rt)
     return (
-        "📌 启动重点设置提醒\n"
-        f"🛡️ 风控提醒：基础 {_risk_switch_label(risk_modes['base_enabled'])} / "
-        f"深度 {_risk_switch_label(risk_modes['deep_enabled'])}\n"
-        f"🧭 默认模式：基础 {_risk_switch_label(risk_modes['base_default_enabled'])} / "
-        f"深度 {_risk_switch_label(risk_modes['deep_default_enabled'])}（可用 `risk ...` 开关）\n"
+        "🔔 启动重点设置提醒\n"
+        f"🛡️ 风控提醒：fk1 盘面 {_risk_switch_label(risk_modes['fk1_enabled'])} / fk2 入场 {_risk_switch_label(risk_modes['fk2_enabled'])} / fk3 连输 {_risk_switch_label(risk_modes['fk3_enabled'])}\n"
+        f"🧱 默认模式：fk1 {_risk_switch_label(risk_modes['fk1_default_enabled'])} / fk2 {_risk_switch_label(risk_modes['fk2_default_enabled'])} / fk3 {_risk_switch_label(risk_modes['fk3_default_enabled'])}（可用 `fk ...` 开关）\n"
         f"🎯 预设提醒：当前 `{preset_name}`（可用 `st <预设名>` 切换）\n"
-        f"📊 当前状态：{status_text}，模式：{mode_text}\n"
+        f"📳 当前状态：{status_text}，模式：{mode_text}\n"
         "ℹ️ 更多命令：`help`"
     )
 
 
-# 消息分发规则表（与 master 一致）
 MESSAGE_ROUTING_TABLE = {
     "win": {"channels": ["admin", "priority"], "priority": True},
     "explode": {"channels": ["admin", "priority"], "priority": True},
@@ -780,6 +764,34 @@ MESSAGE_ROUTING_TABLE = {
     "error": {"channels": ["admin", "priority"], "priority": True},
 }
 
+
+def _refresh_current_analysis_snapshot(user_ctx: UserContext) -> Dict[str, Any]:
+    snapshot = history_analysis.build_current_analysis_snapshot(user_ctx)
+    rt = user_ctx.state.runtime
+    log_event(
+        logging.DEBUG,
+        "analysis",
+        "刷新盘面分析快照",
+        user_id=user_ctx.user_id,
+        data=(
+            f"round_key={snapshot.get('round_key', '')}, "
+            f"regime={snapshot.get('regime_label', '')}, "
+            f"similar={snapshot.get('similar_cases', {}).get('similar_count', 0)}"
+        ),
+    )
+    rt["current_round_key"] = snapshot.get("round_key", "")
+    rt["current_analysis_snapshot"] = snapshot
+    try:
+        history_analysis.record_analysis_snapshot(user_ctx, snapshot)
+    except Exception as e:
+        log_event(
+            logging.WARNING,
+            "analytics",
+            "写入 analytics round snapshot 失败",
+            user_id=user_ctx.user_id,
+            data=str(e),
+        )
+    return snapshot
 
 def _strip_account_prefix(text: str) -> str:
     """管理员消息统一移除账号前缀，与 master 行为一致。"""
@@ -1467,31 +1479,8 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 )
                 return
 
-            if rt.get("shadow_probe_rearm", False) or _should_start_shadow_after_pause(rt):
-                _start_shadow_probe(rt, str(rt.get("pause_countdown_reason", "自动暂停")))
-                rt["shadow_probe_rearm"] = False
-                rt["bet"] = False
-                rt["bet_on"] = True
-                rt["mode_stop"] = True
-                rt["flag"] = True
-                rt["pause_resume_pending"] = False
-                rt["pause_resume_pending_reason"] = ""
-                user_ctx.save_state()
-                await _send_transient_admin_notice(
-                    client,
-                    user_ctx,
-                    global_config,
-                    (
-                        "🧪 风控恢复影子验证已启动\n"
-                        f"来源：{rt.get('shadow_probe_origin_reason', '自动暂停')}\n"
-                        f"规则：先观察 {rt.get('shadow_probe_target_rounds', SHADOW_PROBE_ROUNDS)} 局，"
-                        f"命中 >= {rt.get('shadow_probe_pass_required', SHADOW_PROBE_PASS_REQUIRED)} 才恢复真钱下注"
-                    ),
-                    ttl_seconds=180,
-                    attr_name="pause_transition_message",
-                )
-                return
-
+            _clear_shadow_probe(rt)
+            rt["shadow_probe_rearm"] = False
             rt["bet"] = False
             rt["bet_on"] = True
             rt["mode_stop"] = True
@@ -1529,312 +1518,23 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
 
     # 自动风控暂停：基础风控(40局窗口) + 深度风控(每3连输里程碑)。
     # 同一已结算快照不重复触发，避免重复暂停。
+    analysis_snapshot = _refresh_current_analysis_snapshot(user_ctx)
+    dynamic_betting.clear_dynamic_decision(rt)
     next_sequence = int(rt.get("bet_sequence_count", 0)) + 1
     settled_count = _count_settled_bets(state)
     history_len = len(state.history)
 
     # 影子验证阶段：只做预测，不真实下注。
     if rt.get("shadow_probe_active", False):
-        target_rounds = max(1, int(rt.get("shadow_probe_target_rounds", SHADOW_PROBE_ROUNDS)))
-        pass_required = max(1, int(rt.get("shadow_probe_pass_required", SHADOW_PROBE_PASS_REQUIRED)))
-        checked = int(rt.get("shadow_probe_checked", 0))
-        hits = int(rt.get("shadow_probe_hits", 0))
-        pending_pred = rt.get("shadow_probe_pending_prediction", None)
-        history_len = len(state.history)
-        last_history_len = int(rt.get("shadow_probe_last_history_len", -1))
-
-        if pending_pred in (0, 1):
-            return
-        if last_history_len == history_len:
-            return
-
-        rt["shadow_probe_last_history_len"] = history_len
-        rt["last_predict_info"] = "影子验证初始化预测"
-        rt["last_predict_source"] = "shadow"
-        rt["last_predict_confidence"] = 0
-        rt["last_predict_tag"] = "SHADOW"
-
-        shadow_prediction = None
-        shadow_reason = ""
-        try:
-            shadow_prediction = await asyncio.wait_for(
-                predict_next_bet_v10(user_ctx, global_config),
-                timeout=predict_timeout_sec,
-            )
-        except asyncio.TimeoutError:
-            shadow_prediction = None
-            shadow_reason = f"影子验证预测超时（>{predict_timeout_sec:.1f}s）"
-            rt["last_predict_info"] = "影子验证预测超时"
-            rt["last_predict_source"] = "shadow_timeout"
-            rt["last_predict_tag"] = "SHADOW_TIMEOUT"
-            rt["last_predict_confidence"] = 0
-
-        if shadow_prediction in (0, 1):
-            rt["shadow_probe_pending_prediction"] = int(shadow_prediction)
-            side = "大" if int(shadow_prediction) == 1 else "小"
-            await _send_transient_admin_notice(
-                client,
-                user_ctx,
-                global_config,
-                (
-                    "🧪 影子验证执行中（不下注）\n"
-                    f"进度：{checked}/{target_rounds}（命中 {hits}）\n"
-                    f"本局影子方向：{side}\n"
-                    "等待结算后自动评估"
-                ),
-                ttl_seconds=90,
-                attr_name="shadow_probe_message",
-            )
-        else:
-            checked += 1
-            rt["shadow_probe_checked"] = checked
-            await _send_transient_admin_notice(
-                client,
-                user_ctx,
-                global_config,
-                (
-                    "🧪 影子验证执行中（不下注）\n"
-                    f"进度：{checked}/{target_rounds}（命中 {hits}）\n"
-                    f"本局判定：无效（按未命中计）\n"
-                    f"原因：{shadow_reason or '模型返回SKIP/无效'}"
-                ),
-                ttl_seconds=90,
-                attr_name="shadow_probe_message",
-            )
-
-            if checked >= target_rounds:
-                if hits >= pass_required:
-                    _clear_shadow_probe(rt)
-                    rt["bet_on"] = True
-                    rt["mode_stop"] = True
-                    rt["pause_resume_pending"] = True
-                    rt["pause_resume_pending_reason"] = "影子验证通过"
-                    rt["pause_resume_probe_settled"] = -1
-                    await _send_transient_admin_notice(
-                        client,
-                        user_ctx,
-                        global_config,
-                        (
-                            "✅ 影子验证通过，恢复真钱下注\n"
-                            f"结果：{hits}/{target_rounds} 命中（阈值 {pass_required}）"
-                        ),
-                        ttl_seconds=150,
-                        attr_name="shadow_probe_message",
-                    )
-                else:
-                    _clear_shadow_probe(rt)
-                    rt["shadow_probe_rearm"] = True
-                    pause_rounds = int(SHADOW_PROBE_RETRY_PAUSE_ROUNDS)
-                    _enter_pause(rt, pause_rounds, "影子验证未达标")
-                    await send_to_admin(
-                        client,
-                        (
-                            "⛔ 影子验证未达标，继续暂停观察\n"
-                            f"结果：{hits}/{target_rounds} 命中（阈值 {pass_required}）\n"
-                            f"本次继续暂停：{pause_rounds} 局"
-                        ),
-                        user_ctx,
-                        global_config,
-                    )
-                    await _refresh_pause_countdown_notice(
-                        client,
-                        user_ctx,
-                        global_config,
-                        remaining_rounds=pause_rounds,
-                    )
-
+        _clear_shadow_probe(rt)
+        rt["shadow_probe_rearm"] = False
         user_ctx.save_state()
-        return
 
     snapshot_count = int(rt.get("risk_pause_snapshot_count", -1))
-    pause_acc_rounds = int(rt.get("risk_pause_acc_rounds", 0))
-
     skip_same_snapshot = (snapshot_count == settled_count)
     risk_pause = {} if skip_same_snapshot else _evaluate_auto_risk_pause(state, rt, next_sequence)
-
-    cycle_active = bool(rt.get("risk_pause_cycle_active", False))
-    recovery_passes = int(rt.get("risk_pause_recovery_passes", 0))
-    base_hit_streak = int(rt.get("risk_base_hit_streak", 0))
-    base_risk_enabled = bool(rt.get("risk_base_enabled", True))
-
-    # 风险周期恢复判定：最近40笔胜率>45% 连续2次才重置预算。
-    if not skip_same_snapshot and risk_pause:
-        if base_risk_enabled and risk_pause.get("base_trigger", False):
-            base_hit_streak += 1
-        else:
-            base_hit_streak = 0
-        rt["risk_base_hit_streak"] = base_hit_streak
-
-        if risk_pause.get("recovery_hit", False):
-            if cycle_active:
-                recovery_passes += 1
-            else:
-                recovery_passes = 0
-        else:
-            recovery_passes = 0
-        rt["risk_pause_recovery_passes"] = recovery_passes
-
-    if cycle_active and recovery_passes >= RISK_RECOVERY_PASS_NEEDED:
-        rt["risk_pause_cycle_active"] = False
-        rt["risk_pause_acc_rounds"] = 0
-        rt["risk_pause_snapshot_count"] = -1
-        rt["risk_pause_recovery_passes"] = 0
-        rt["risk_base_hit_streak"] = 0
-        rt["risk_pause_priority_notified"] = False
-        log_event(
-            logging.INFO,
-            "risk_pause",
-            "风控周期恢复，已重置暂停预算",
-            user_id=user_ctx.user_id,
-            data=f"wins>45% pass={RISK_RECOVERY_PASS_NEEDED}",
-        )
-        pause_acc_rounds = 0
-        cycle_active = False
-
-    # 深度风控已迁移到结算阶段触发（输单结果出来即触发），下注入口不再重复触发深度风控。
-
-    # 基础风控：40局<=37.5% 且连续2次命中后才触发，使用10局基础预算。
-    if (
-        base_risk_enabled
-        and risk_pause.get("base_trigger", False)
-        and base_hit_streak >= RISK_BASE_TRIGGER_STREAK_NEEDED
-    ):
-        remain_pause_budget = max(0, RISK_PAUSE_TOTAL_CAP_ROUNDS - pause_acc_rounds)
-        rt["risk_pause_cycle_active"] = True
-        rt["risk_pause_snapshot_count"] = settled_count
-
-        if remain_pause_budget <= 0:
-            warn_msg = (
-                "⚠️ 基础风控暂停已达上限\n"
-                f"基础风控累计暂停已达 {RISK_PAUSE_TOTAL_CAP_ROUNDS} 局，本局继续下注。\n"
-                "动作：保留当前倍投进度，后续按新结算数据继续评估风控。"
-            )
-            await send_to_admin(client, warn_msg, user_ctx, global_config)
-            user_ctx.save_state()
-            log_event(
-                logging.INFO,
-                'bet_on',
-                '基础风控暂停达上限，放行下注',
-                user_id=user_ctx.user_id,
-                data=f'settled_count={settled_count}, cap={RISK_PAUSE_TOTAL_CAP_ROUNDS}'
-            )
-        else:
-            layer_cap = int(RISK_BASE_MAX_PAUSE_ROUNDS)
-            max_allow_rounds = max(1, min(layer_cap, remain_pause_budget))
-            model_eval = {
-                **risk_pause,
-                "level": "BASE",
-                "level_label": "基础风控",
-            }
-            model_pause_rounds, model_reason, model_source = await _suggest_pause_rounds_by_model(
-                user_ctx,
-                model_eval,
-                max_pause=max_allow_rounds,
-            )
-            pause_rounds = max(1, min(max_allow_rounds, int(model_pause_rounds)))
-            _enter_pause(rt, pause_rounds, "基础风控暂停")
-            rt["risk_pause_acc_rounds"] = pause_acc_rounds + pause_rounds
-            rt["risk_pause_snapshot_count"] = settled_count
-            rt["risk_pause_block_hits"] = int(rt.get("risk_pause_block_hits", 0)) + 1
-            rt["risk_pause_block_rounds"] = int(rt.get("risk_pause_block_rounds", 0)) + pause_rounds
-            user_ctx.save_state()
-
-            wins = risk_pause.get("wins", 0)
-            total = risk_pause.get("total", RISK_WINDOW_BETS)
-            win_rate = risk_pause.get("win_rate", 0.0) * 100
-            reason_text = "最近40笔胜率<=37.5%"
-            resume_hint = _build_pause_resume_hint(rt)
-            pause_msg = (
-                "⛔ 自动风控暂停（已生效）\n"
-                "触发层级：基础风控\n"
-                f"触发原因：{reason_text}\n"
-                f"最近{total}笔胜率：{wins}/{total}（{win_rate:.1f}%）\n"
-                f"触发点：第 {next_sequence} 手下注前\n"
-                f"模型建议：{model_pause_rounds} 局（来源：{model_source}）\n"
-                f"本次暂停：{pause_rounds} 局（连续命中 {base_hit_streak}/{RISK_BASE_TRIGGER_STREAK_NEEDED}，基础预算累计 {rt.get('risk_pause_acc_rounds', 0)}/{RISK_PAUSE_TOTAL_CAP_ROUNDS}）\n"
-                f"模型依据：{model_reason}\n"
-                "暂停期间：保留当前倍投进度，不会重置首注\n"
-                f"{resume_hint}"
-            )
-
-            # 刷新式提示：管理员窗口仅保留最后一条风控暂停提示。
-            if hasattr(user_ctx, "risk_pause_message") and user_ctx.risk_pause_message:
-                await cleanup_message(client, user_ctx.risk_pause_message)
-
-            user_ctx.risk_pause_message = await send_to_admin(client, pause_msg, user_ctx, global_config)
-            await _refresh_pause_countdown_notice(
-                client,
-                user_ctx,
-                global_config,
-                remaining_rounds=pause_rounds,
-            )
-            rt["risk_pause_priority_notified"] = True
-
-            log_event(
-                logging.INFO,
-                'bet_on',
-                '触发自动风控暂停',
-                user_id=user_ctx.user_id,
-                data=(
-                    f"wins={wins}/{total}, wr={win_rate:.2f}%, "
-                    f"next_seq={next_sequence}, pause_rounds={pause_rounds}, "
-                    "level=BASE, "
-                    f"pause_acc={rt.get('risk_pause_acc_rounds', 0)}"
-                ),
-            )
-            return
-
-    bet_amount = calculate_bet_amount(rt)
-    if bet_amount <= 0:
-        if not rt.get("limit_stop_notified", False):
-            lose_stop = int(rt.get("lose_stop", 13))
-            mes = (
-                "⚠️ 已达到预设连投上限，已自动暂停\n"
-                f"当前预设最多连投：{lose_stop} 手\n"
-                "可等待新轮次或切换预设后继续"
-            )
-            await send_to_admin(client, mes, user_ctx, global_config)
-            rt["limit_stop_notified"] = True
-        rt["bet"] = False
-        rt["bet_on"] = False
-        rt["mode_stop"] = True
-        _clear_lose_recovery_tracking(rt)
-        user_ctx.save_state()
-        return
-    rt["limit_stop_notified"] = False
-
-    if not is_fund_available(user_ctx, bet_amount):
-        if _sync_fund_from_account_when_insufficient(rt, bet_amount):
-            log_event(
-                logging.INFO,
-                'bet_on',
-                '资金不足触发资金同步',
-                user_id=user_ctx.user_id,
-                data=f"need={bet_amount}, fund={rt.get('gambling_fund', 0)}, account={rt.get('account_balance', 0)}",
-            )
-            user_ctx.save_state()
-
-        if not is_fund_available(user_ctx, bet_amount):
-            if not rt.get("fund_pause_notified", False):
-                display_fund = max(0, rt.get("gambling_fund", 0))
-                mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
-                await send_message_v2(
-                    client,
-                    "fund_pause",
-                    mes,
-                    user_ctx,
-                    global_config,
-                    title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
-                    desp=mes,
-                )
-                rt["fund_pause_notified"] = True
-            rt["bet"] = False
-            rt["bet_on"] = False
-            rt["mode_stop"] = True
-            _clear_lose_recovery_tracking(rt)
-            user_ctx.save_state()
-            return
-    rt["fund_pause_notified"] = False
+    rt["risk_base_hit_streak"] = 0
+    rt["risk_pause_recovery_passes"] = 0
 
     if not (rt.get("bet_on", False) or rt.get("mode_stop", True)):
         log_event(logging.DEBUG, 'bet_on', '押注已暂停', user_id=user_ctx.user_id)
@@ -1848,7 +1548,8 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     log_event(logging.INFO, 'bet_on', '开始押注', user_id=user_ctx.user_id)
     try:
         force_unlock_active = False
-        deep_risk_enabled = bool(rt.get("risk_deep_enabled", True))
+        risk_control.normalize_fk_switches(rt, apply_default=False)
+        deep_risk_enabled = bool(rt.get("fk2_enabled", True))
         rt["last_predict_info"] = "初始化预测"
         rt["last_predict_source"] = "unknown"
         rt["last_predict_confidence"] = 0
@@ -1978,6 +1679,40 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 rt["bet"] = False
                 rt["bet_on"] = True
                 rt["mode_stop"] = True
+                current_need = calculate_bet_amount(rt)
+                if current_need > 0 and not is_fund_available(user_ctx, current_need):
+                    if _sync_fund_from_account_when_insufficient(rt, current_need):
+                        log_event(
+                            logging.INFO,
+                            'bet_on',
+                            '观望前触发资金同步',
+                            user_id=user_ctx.user_id,
+                            data=f"need={current_need}, fund={rt.get('gambling_fund', 0)}, account={rt.get('account_balance', 0)}",
+                        )
+                        user_ctx.save_state()
+
+                    if not is_fund_available(user_ctx, current_need):
+                        if not rt.get("fund_pause_notified", False):
+                            display_fund = max(0, rt.get("gambling_fund", 0))
+                            mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
+                            await send_message_v2(
+                                client,
+                                "fund_pause",
+                                mes,
+                                user_ctx,
+                                global_config,
+                                title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                                desp=mes,
+                            )
+                            rt["fund_pause_notified"] = True
+                        rt["bet"] = False
+                        rt["bet_on"] = False
+                        rt["mode_stop"] = True
+                        rt["last_execution_action"] = "blocked"
+                        rt["last_blocked_by"] = "fund"
+                        _clear_lose_recovery_tracking(rt)
+                        user_ctx.save_state()
+                        return
                 last_notice_settled = int(rt.get("last_skip_notice_settled", -1))
                 if last_notice_settled != settled_count:
                     rt["last_skip_notice_settled"] = settled_count
@@ -1986,14 +1721,59 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                         user_ctx,
                         global_config,
                         (
-                            "🧭 本局模型判定为观望（SKIP）\n"
+                            "🧭 本局模型判定为观望\n"
                             f"触发点：第 {next_sequence} 手\n"
                             f"依据：{rt.get('last_predict_info', '信号冲突')}\n"
                             "动作：不下注，等待下一局新信号"
                         ),
                         ttl_seconds=90,
-                        attr_name="shadow_probe_message",
+                        attr_name="risk_pause_message",
                     )
+                rt["last_execution_action"] = "strategy_observe"
+                rt["last_blocked_by"] = ""
+                dynamic_betting.clear_dynamic_decision(rt)
+                append_replay_event(
+                    user_ctx,
+                    "execution_action",
+                    {
+                        "round_key": str(rt.get("current_round_key", "") or ""),
+                        "decision_id": str(rt.get("last_decision_id", "") or ""),
+                        "action_type": "observe",
+                        "blocked_by": "strategy",
+                        "reason": str(rt.get("last_predict_info", "") or ""),
+                    },
+                )
+                append_replay_event(
+                    user_ctx,
+                    "risk_action",
+                    {
+                        "round_key": str(rt.get("current_round_key", "") or ""),
+                        "decision_id": str(rt.get("last_decision_id", "") or ""),
+                        "layer": "strategy",
+                        "action": "observe",
+                        "reason": str(rt.get("last_predict_info", "") or ""),
+                    },
+                )
+                try:
+                    history_analysis.record_risk_action(
+                        user_ctx,
+                        phase="pre_bet",
+                        layer_code="strategy",
+                        enabled=True,
+                        action="observe",
+                        reason_code="strategy_observe",
+                        reason_text=str(rt.get("last_predict_info", "") or "模型当前建议观望"),
+                        metrics=analysis_snapshot if isinstance(analysis_snapshot, dict) else {},
+                    )
+                    history_analysis.record_execution_action(
+                        user_ctx,
+                        action_type="observe",
+                        action_text="策略观望，本局不下注",
+                        blocked_by="strategy",
+                        note=str(rt.get("last_predict_info", "") or ""),
+                    )
+                except Exception as e:
+                    log_event(logging.WARNING, 'analytics', '写入 analytics execution 失败', user_id=user_ctx.user_id, data=str(e))
                 user_ctx.save_state()
                 return
 
@@ -2002,6 +1782,143 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             # 兼容测试桩/旧逻辑：返回了有效 prediction 但未写入来源时，按模型成功处理。
             predict_source = "model"
             rt["last_predict_source"] = "model"
+
+        analysis_snapshot = analysis_snapshot if isinstance(analysis_snapshot, dict) else _refresh_current_analysis_snapshot(user_ctx)
+        fk1_result = risk_control.evaluate_fk1(analysis_snapshot, rt)
+        rt["current_fk1_action"] = str(fk1_result.get("action", "allow") or "allow")
+        rt["current_fk1_action_text"] = str(fk1_result.get("action_text", "") or "")
+        rt["current_fk1_tier_cap"] = str(fk1_result.get("tier_cap", "") or "")
+        rt["current_fk1_reason"] = str(fk1_result.get("reason_text", "") or "")
+        if fk1_result.get("action") == "observe":
+            rt["last_execution_action"] = "blocked"
+            rt["last_blocked_by"] = "fk1"
+            dynamic_betting.clear_dynamic_decision(rt)
+            append_replay_event(
+                user_ctx,
+                "risk_action",
+                {
+                    "round_key": str(rt.get("current_round_key", "") or ""),
+                    "decision_id": str(rt.get("last_decision_id", "") or ""),
+                    "layer": "fk1",
+                    "action": "observe",
+                    "reason": str(fk1_result.get("reason_text", "") or ""),
+                },
+            )
+            try:
+                history_analysis.record_risk_action(
+                    user_ctx,
+                    phase="pre_bet",
+                    layer_code="fk1",
+                    enabled=bool(rt.get("fk1_enabled", True)),
+                    action="observe",
+                    reason_code=str(fk1_result.get("reason_code", "fk1_observe") or "fk1_observe"),
+                    reason_text=str(fk1_result.get("reason_text", "") or ""),
+                    metrics=analysis_snapshot,
+                )
+                history_analysis.record_execution_action(
+                    user_ctx,
+                    action_type="blocked",
+                    action_text=str(fk1_result.get("action_text", "盘面风控建议观望，本局不下注") or "盘面风控建议观望，本局不下注"),
+                    blocked_by="fk1",
+                    note=str(fk1_result.get("reason_text", "") or ""),
+                )
+            except Exception as e:
+                log_event(logging.WARNING, 'analytics', '写入 analytics fk1 observe 失败', user_id=user_ctx.user_id, data=str(e))
+            await _send_transient_admin_notice(
+                client,
+                user_ctx,
+                global_config,
+                risk_control.build_fk1_message(fk1_result, analysis_snapshot),
+                ttl_seconds=90,
+                attr_name="risk_pause_message",
+            )
+            user_ctx.save_state()
+            return
+        if fk1_result.get("action") == "cap":
+            append_replay_event(
+                user_ctx,
+                "risk_action",
+                {
+                    "round_key": str(rt.get("current_round_key", "") or ""),
+                    "decision_id": str(rt.get("last_decision_id", "") or ""),
+                    "layer": "fk1",
+                    "action": "cap",
+                    "tier_cap": str(fk1_result.get("tier_cap", "") or ""),
+                    "reason": str(fk1_result.get("reason_text", "") or ""),
+                },
+            )
+            try:
+                history_analysis.record_risk_action(
+                    user_ctx,
+                    phase="pre_bet",
+                    layer_code="fk1",
+                    enabled=bool(rt.get("fk1_enabled", True)),
+                    action="cap",
+                    tier_cap=str(fk1_result.get("tier_cap", "") or ""),
+                    reason_code=str(fk1_result.get("reason_code", "fk1_cap") or "fk1_cap"),
+                    reason_text=str(fk1_result.get("reason_text", "") or ""),
+                    metrics=analysis_snapshot,
+                )
+            except Exception as e:
+                log_event(logging.WARNING, 'analytics', '写入 analytics fk1 cap 失败', user_id=user_ctx.user_id, data=str(e))
+
+        dynamic_result = dynamic_betting.evaluate_dynamic_bet(analysis_snapshot, rt)
+        rt["current_dynamic_base_tier"] = str(dynamic_result.get("base_tier", "") or "")
+        rt["current_dynamic_tier"] = str(dynamic_result.get("applied_tier", "") or "")
+        rt["current_dynamic_reason"] = str(dynamic_result.get("reason_text", "") or "")
+        rt["current_dynamic_action_text"] = str(dynamic_result.get("action_text", "") or "")
+        rt["current_dynamic_floor_tier"] = str(dynamic_result.get("floor_tier", "") or "")
+        rt["current_dynamic_ceiling_tier"] = str(dynamic_result.get("ceiling_tier", "") or "")
+        append_replay_event(
+            user_ctx,
+            "dynamic_plan",
+            {
+                "round_key": str(rt.get("current_round_key", "") or ""),
+                "decision_id": str(rt.get("last_decision_id", "") or ""),
+                "base_tier": str(dynamic_result.get("base_tier", "") or ""),
+                "applied_tier": str(dynamic_result.get("applied_tier", "") or ""),
+                "floor_tier": str(dynamic_result.get("floor_tier", "") or ""),
+                "ceiling_tier": str(dynamic_result.get("ceiling_tier", "") or ""),
+                "reason": str(dynamic_result.get("reason_text", "") or ""),
+            },
+        )
+
+        preview_bet_amount = calculate_bet_amount(rt)
+        preview_dynamic_tier = str(rt.get("current_dynamic_tier", "") or "")
+        preview_bet_amount, _ = risk_control.clamp_bet_amount_by_tier_cap(preview_bet_amount, preview_dynamic_tier)
+        if preview_bet_amount > 0 and not is_fund_available(user_ctx, preview_bet_amount):
+            if _sync_fund_from_account_when_insufficient(rt, preview_bet_amount):
+                log_event(
+                    logging.INFO,
+                    'bet_on',
+                    '下注前触发资金同步',
+                    user_id=user_ctx.user_id,
+                    data=f"need={preview_bet_amount}, fund={rt.get('gambling_fund', 0)}, account={rt.get('account_balance', 0)}",
+                )
+                user_ctx.save_state()
+
+            if not is_fund_available(user_ctx, preview_bet_amount):
+                if not rt.get("fund_pause_notified", False):
+                    display_fund = max(0, rt.get("gambling_fund", 0))
+                    mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
+                    await send_message_v2(
+                        client,
+                        "fund_pause",
+                        mes,
+                        user_ctx,
+                        global_config,
+                        title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                        desp=mes,
+                    )
+                    rt["fund_pause_notified"] = True
+                rt["bet"] = False
+                rt["bet_on"] = False
+                rt["mode_stop"] = True
+                rt["last_execution_action"] = "blocked"
+                rt["last_blocked_by"] = "fund"
+                _clear_lose_recovery_tracking(rt)
+                user_ctx.save_state()
+                return
 
         if deep_risk_enabled and (not force_unlock_active) and predict_source in {"timeout", "fallback", "hard_fallback", "invalid"}:
             source_guard = _record_hand_stall_block(rt, next_sequence, history_len, "gate")
@@ -2054,6 +1971,89 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                     return
 
         # 自动暂停恢复后的第一手，先给出“模型复核说明”，避免只看到结果看不懂为何恢复。
+        bet_amount = calculate_bet_amount(rt)
+        dynamic_tier = str(rt.get("current_dynamic_tier", "") or "")
+        bet_amount, capped_tier = risk_control.clamp_bet_amount_by_tier_cap(bet_amount, dynamic_tier)
+        if capped_tier:
+            rt["current_dynamic_tier"] = capped_tier
+        if bet_amount <= 0:
+            if not rt.get("limit_stop_notified", False):
+                lose_stop = int(rt.get("lose_stop", 13))
+                mes = (
+                    "⚠️ 已达到预设连投上限，已自动暂停\n"
+                    f"当前预设最多连投：{lose_stop} 手\n"
+                    "可等待新轮次或切换预设后继续"
+                )
+                await send_to_admin(client, mes, user_ctx, global_config)
+                rt["limit_stop_notified"] = True
+            rt["bet"] = False
+            rt["bet_on"] = False
+            rt["mode_stop"] = True
+            _clear_lose_recovery_tracking(rt)
+            user_ctx.save_state()
+            return
+        rt["limit_stop_notified"] = False
+
+        if not is_fund_available(user_ctx, bet_amount):
+            if _sync_fund_from_account_when_insufficient(rt, bet_amount):
+                log_event(
+                    logging.INFO,
+                    'bet_on',
+                    '资金不足触发资金同步',
+                    user_id=user_ctx.user_id,
+                    data=f"need={bet_amount}, fund={rt.get('gambling_fund', 0)}, account={rt.get('account_balance', 0)}",
+                )
+                user_ctx.save_state()
+
+            if not is_fund_available(user_ctx, bet_amount):
+                if not rt.get("fund_pause_notified", False):
+                    display_fund = max(0, rt.get("gambling_fund", 0))
+                    mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
+                    await send_message_v2(
+                        client,
+                        "fund_pause",
+                        mes,
+                        user_ctx,
+                        global_config,
+                        title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
+                        desp=mes,
+                    )
+                    rt["fund_pause_notified"] = True
+                rt["bet"] = False
+                rt["bet_on"] = False
+                rt["mode_stop"] = True
+                rt["last_execution_action"] = "blocked"
+                rt["last_blocked_by"] = "fund"
+                try:
+                    history_analysis.record_risk_action(
+                        user_ctx,
+                        phase="pre_bet",
+                        layer_code="fund",
+                        enabled=True,
+                        action="block",
+                        reason_code="fund_insufficient",
+                        reason_text="菠菜资金不足，已暂停押注",
+                        tier_cap="",
+                        metrics={
+                            "bet_amount": int(bet_amount),
+                            "gambling_fund": int(rt.get("gambling_fund", 0) or 0),
+                            "account_balance": int(rt.get("account_balance", 0) or 0),
+                        },
+                    )
+                    history_analysis.record_execution_action(
+                        user_ctx,
+                        action_type="blocked",
+                        action_text="资金风控阻断，本局不下注",
+                        blocked_by="fund",
+                        note="菠菜资金不足",
+                    )
+                except Exception as e:
+                    log_event(logging.WARNING, 'analytics', '写入 analytics fund block 失败', user_id=user_ctx.user_id, data=str(e))
+                _clear_lose_recovery_tracking(rt)
+                user_ctx.save_state()
+                return
+        rt["fund_pause_notified"] = False
+
         if rt.get("pause_resume_pending", False):
             last_probe_settled = int(rt.get("pause_resume_probe_settled", -1))
             if last_probe_settled != settled_count:
@@ -2079,6 +2079,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         rt["bet_amount"] = int(bet_amount)
         direction = "大" if prediction == 1 else "小"
         direction_en = "big" if prediction == 1 else "small"
+        actual_preset_name = str(rt.get("current_dynamic_tier", "") or rt.get("current_preset_name", "") or "")
         buttons = constants.BIG_BUTTON if prediction == 1 else constants.SMALL_BUTTON
         combination = constants.find_combination(rt["bet_amount"], buttons)
 
@@ -2104,8 +2105,13 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         rt["bet_on"] = True
         rt["fund_pause_notified"] = False
         rt["limit_stop_notified"] = False
+        if int(rt.get("bet_sequence_count", 0) or 0) == 1 or int(rt.get("lose_count", 0) or 0) == 0:
+            rt["dynamic_sequence_start_tier"] = actual_preset_name
         _clear_hand_stall_guard(rt)
 
+        rt["current_fk2_action"] = "allow"
+        rt["last_execution_action"] = "bet"
+        rt["last_blocked_by"] = ""
         bet_id = generate_bet_id(user_ctx)
         decision_snapshot = _snapshot_last_decision(rt)
         bet_entry = {
@@ -2121,6 +2127,16 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             "settled_at": "",
             "status": "placed",
             "round": _safe_int(rt.get("current_round", 1), 1),
+            "round_key": str(rt.get("current_round_key", "") or ""),
+            "fk1_action": str(rt.get("current_fk1_action", "") or ""),
+            "fk1_tier_cap": str(rt.get("current_fk1_tier_cap", "") or ""),
+            "fk1_reason": str(rt.get("current_fk1_reason", "") or ""),
+            "dynamic_base_tier": str(rt.get("current_dynamic_base_tier", "") or ""),
+            "dynamic_tier": actual_preset_name,
+            "dynamic_reason": str(rt.get("current_dynamic_reason", "") or ""),
+            "fund_before": _safe_int(rt.get("gambling_fund", 0), 0),
+            "balance_before": _safe_int(rt.get("account_balance", 0), 0),
+            "lose_count_before": _safe_int(rt.get("lose_count", 0), 0),
             "decision_id": decision_snapshot.get("decision_id", ""),
             "decision_timestamp": decision_snapshot.get("decision_timestamp", ""),
             "decision_source": decision_snapshot.get("decision_source", ""),
@@ -2147,6 +2163,10 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 "bet_id": bet_id,
                 "sequence": _safe_int(bet_entry.get("sequence", 0), 0),
                 "round": _safe_int(bet_entry.get("round", 1), 1),
+                "round_key": str(bet_entry.get("round_key", "") or ""),
+                "fk1_action": str(bet_entry.get("fk1_action", "") or ""),
+                "fk1_tier_cap": str(bet_entry.get("fk1_tier_cap", "") or ""),
+                "dynamic_tier": str(bet_entry.get("dynamic_tier", "") or ""),
                 "direction": direction_en,
                 "amount": _safe_int(rt.get("bet_amount", 0), 0),
                 "decision_id": decision_snapshot.get("decision_id", ""),
@@ -2156,6 +2176,25 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 "decision_prediction": _safe_int(decision_snapshot.get("decision_prediction", -1), -1),
             },
         )
+        try:
+            history_analysis.record_execution_action(
+                user_ctx,
+                action_type="bet",
+                action_text="已执行真实下注",
+                bet_id=bet_id,
+                preset_name=actual_preset_name,
+                bet_amount=_safe_int(rt.get("bet_amount", 0), 0),
+                note=" | ".join(
+                    item
+                    for item in [
+                        str(rt.get("current_fk1_reason", "") or ""),
+                        str(rt.get("current_dynamic_reason", "") or ""),
+                    ]
+                    if item
+                ),
+            )
+        except Exception as e:
+            log_event(logging.WARNING, 'analytics', '写入 analytics bet execution 失败', user_id=user_ctx.user_id, data=str(e))
 
         bet_report = generate_mobile_bet_report(
             state.history,
@@ -2164,6 +2203,16 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             rt.get("bet_sequence_count", 1),
             bet_id
         )
+        dynamic_summary = dynamic_betting.build_dynamic_summary(
+            {
+                "base_tier": str(rt.get("current_dynamic_base_tier", "") or ""),
+                "applied_tier": actual_preset_name,
+                "reason_text": str(rt.get("current_dynamic_reason", "") or ""),
+                "action_text": str(rt.get("current_dynamic_action_text", "") or ""),
+            }
+        )
+        if dynamic_summary:
+            bet_report = f"{bet_report}\n\n{dynamic_summary}"
         message = await send_to_admin(client, bet_report, user_ctx, global_config)
         asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
         if message:
@@ -2747,7 +2796,7 @@ async def _evaluate_high_step_double_confirm(
 
             if secondary_prediction != primary_prediction:
                 if secondary_prediction == -1:
-                    reasons.append("副模型建议观望（SKIP）")
+                    reasons.append("副模型建议观望")
                 else:
                     side = "大" if secondary_prediction == 1 else "小"
                     reasons.append(f"副模型方向不一致（副模型={side}）")
@@ -2950,9 +2999,33 @@ async def _apply_entry_gate_pause(
 ) -> None:
     """统一发送高倍入场门控暂停提示。"""
     rt = user_ctx.state.runtime
+    rt["current_fk2_action"] = "block"
+    rt["last_execution_action"] = "blocked"
+    rt["last_blocked_by"] = "fk2"
     pause_rounds = max(1, int(gate.get("pause_rounds", 1)))
     _enter_pause(rt, pause_rounds, gate.get("gate_name", "高倍入场门控"))
     user_ctx.save_state()
+    try:
+        history_analysis.record_risk_action(
+            user_ctx,
+            phase="pre_bet",
+            layer_code="fk2",
+            enabled=bool(rt.get("fk2_enabled", True)),
+            action="block",
+            reason_code="fk2_block",
+            reason_text=str(gate.get("reason_text", "入场风控未通过") or "入场风控未通过"),
+            pause_rounds=pause_rounds,
+            metrics=gate,
+        )
+        history_analysis.record_execution_action(
+            user_ctx,
+            action_type="blocked",
+            action_text="入场风控阻断，本局不下注",
+            blocked_by="fk2",
+            note=str(gate.get("reason_text", "入场风控未通过") or "入场风控未通过"),
+        )
+    except Exception as e:
+        log_event(logging.WARNING, 'analytics', '写入 analytics fk2 block 失败', user_id=user_ctx.user_id, data=str(e))
 
     total = int(gate.get("total", 0) or 0)
     wins = int(gate.get("wins", 0) or 0)
@@ -3126,7 +3199,7 @@ async def _suggest_pause_rounds_by_model(
             "风控暂停模型建议失败，使用统计兜底",
             user_id=user_ctx.user_id,
             error=str(e),
-            level=level,
+            risk_level=level,
         )
         return fallback_rounds, fallback_reason, "fallback"
 
@@ -3312,7 +3385,8 @@ async def _trigger_deep_risk_pause_after_settle(
 ) -> bool:
     """在结算阶段触发深度风控暂停（连输里程碑），命中后立即通知。"""
     rt = user_ctx.state.runtime
-    if not bool(rt.get("risk_deep_enabled", True)):
+    risk_control.normalize_fk_switches(rt, apply_default=False)
+    if not bool(rt.get("fk3_enabled", True)):
         return False
     if not risk_pause.get("deep_trigger", False):
         return False
@@ -3350,11 +3424,27 @@ async def _trigger_deep_risk_pause_after_settle(
     rt["risk_pause_snapshot_count"] = settled_count
     rt["risk_pause_block_hits"] = int(rt.get("risk_pause_block_hits", 0)) + 1
     rt["risk_pause_block_rounds"] = int(rt.get("risk_pause_block_rounds", 0)) + pause_rounds
+    rt["last_execution_action"] = "pause"
+    rt["last_blocked_by"] = "fk3"
 
     deep_triggered = _get_deep_triggered_milestones(rt)
     if deep_milestone not in deep_triggered:
         deep_triggered.append(deep_milestone)
     rt["risk_deep_triggered_milestones"] = sorted(set(int(x) for x in deep_triggered))
+    try:
+        history_analysis.record_risk_action(
+            user_ctx,
+            phase="post_settle",
+            layer_code="fk3",
+            enabled=bool(rt.get("fk3_enabled", True)),
+            action="pause",
+            reason_code=f"fk3_loss_milestone_{deep_milestone}",
+            reason_text=f"连输达到 {deep_milestone} 档，触发连输风控暂停",
+            pause_rounds=pause_rounds,
+            metrics=risk_pause,
+        )
+    except Exception as e:
+        log_event(logging.WARNING, 'analytics', '写入 analytics fk3 pause 失败', user_id=user_ctx.user_id, data=str(e))
 
     wins = risk_pause.get("wins", 0)
     total = risk_pause.get("total", 0)
@@ -3459,6 +3549,7 @@ async def _handle_goal_pause_after_settle(
     rt["lose_count"] = 0
     rt["win_count"] = 0
     rt["bet_amount"] = int(rt.get("initial_amount", 500))
+    dynamic_betting.reset_dynamic_sequence(rt)
     _clear_lose_recovery_tracking(rt)
 
     resume_hint = _build_pause_resume_hint(rt)
@@ -3879,6 +3970,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     rt["mode_stop"] = True
                 else:
                     rt["fund_pause_notified"] = False
+                    rt["mode_stop"] = True
             else:
                 rt["fund_pause_notified"] = False
 
@@ -4069,6 +4161,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                         settled_entry["settled_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
                         settled_entry["settle_result_num"] = result_num
                         settled_entry["settle_result_type"] = result_type
+                        settled_entry["round_key"] = str(settled_entry.get("round_key", rt.get("current_round_key", "")) or "")
                         settled_entry["settle_history_index"] = len(state.history) - 1
                         if not str(settled_entry.get("decision_id", "")).strip():
                             decision_snapshot = _snapshot_last_decision(rt)
@@ -4083,6 +4176,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                                 "bet_id": str(settled_entry.get("bet_id", "")),
                                 "sequence": _safe_int(settled_entry.get("sequence", 0), 0),
                                 "round": _safe_int(settled_entry.get("round", settle_round), settle_round),
+                                "round_key": str(settled_entry.get("round_key", "") or ""),
                                 "direction": str(settled_entry.get("direction", direction.lower()) or direction.lower()),
                                 "amount": _safe_int(settled_entry.get("amount", bet_amount), bet_amount),
                                 "result": result_text,
@@ -4096,6 +4190,10 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                                 "history_index": len(state.history) - 1,
                             },
                         )
+                        try:
+                            history_analysis.record_settlement(user_ctx, settled_entry, result_num, result_type)
+                        except Exception as e:
+                            log_event(logging.WARNING, 'analytics', '写入 analytics settlement 失败', user_id=user_ctx.user_id, data=str(e))
 
                     user_ctx.save_state()
 
@@ -4161,6 +4259,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     if win or rt.get("lose_count", 0) >= rt.get("lose_stop", 13):
                         rt["bet_sequence_count"] = 0
                         rt["bet_amount"] = int(rt.get("initial_amount", 500))
+                        dynamic_betting.reset_dynamic_sequence(rt)
                         
                 except Exception as e:
                     log_event(logging.ERROR, 'settle', '结算失败', 
@@ -4623,11 +4722,18 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `open/off` : 兼容旧命令（分别等同 `resume/pause`）
 
 **风控说明（重点）**
-- `risk` : 查看当前风控状态与账号默认模式
-- `risk base on|off` : 切换基础风控（并写入当前账号默认）
-- `risk deep on|off` : 切换深度风控（并写入当前账号默认）
-- `risk all on|off` : 同步切换基础/深度风控（并写入当前账号默认）
-- 说明：风控会直接影响暂停与入场门槛，进而影响押注收益；脚本重启后按账号默认模式自动生效
+- `fk` : 查看当前风控状态与账号默认模式
+- `fk 1 on|off` : 切换盘面风控（并写入当前账号默认）
+- `fk 2 on|off` : 切换入场风控（并写入当前账号默认）
+- `fk 3 on|off` : 切换连输风控（并写入当前账号默认）
+- `fp` : 查看 24 小时复盘总览
+- `fp 1` : 查看按盘面复盘
+- `fp 2` : 查看按档位复盘
+- `fp 3` : 查看按手位复盘
+- `fp 4` : 查看观望/阻断复盘
+- `fp 5` : 查看当前盘面证据
+- `fp 6` : 查看链路覆盖与缺失
+- 说明：风控会直接影响观望、限档、入场阻断与连输暂停，进而影响押注收益；脚本重启后按账号默认模式自动生效
 
 **参数设置**
 - `gf [金额]` : 设置本金 (例: `gf 1000000`)
@@ -4774,9 +4880,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             log_event(logging.INFO, 'user_cmd', '恢复押注', user_id=user_ctx.user_id)
             return
 
-        # risk - 基础/深度风控开关
-        if cmd == "risk":
-            _normalize_risk_switches(rt, apply_default=False)
+        # fk / risk - 风控开关
+        if cmd in ("fk", "risk"):
+            risk_control.normalize_fk_switches(rt, apply_default=False)
 
             if len(my) == 1:
                 message = await send_to_admin(client, _build_risk_state_text(rt), user_ctx, global_config)
@@ -4785,47 +4891,61 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
                 return
 
-            if len(my) != 3:
-                await send_to_admin(
-                    client,
-                    "❌ 参数格式错误\n用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`",
-                    user_ctx,
-                    global_config,
-                )
-                return
+            target = ""
+            action = ""
+            if len(my) == 3 and str(my[1]).strip().lower() in {"1", "2", "3"} and str(my[2]).strip().lower() in {"on", "off"}:
+                target = str(my[1]).strip().lower()
+                action = str(my[2]).strip().lower()
+            elif cmd == "risk" and len(my) == 3:
+                legacy_target = str(my[1]).strip().lower()
+                legacy_action = str(my[2]).strip().lower()
+                if legacy_target in {"base", "deep", "all"} and legacy_action in {"on", "off"}:
+                    target = {"base": "1", "deep": "2", "all": "all"}[legacy_target]
+                    action = legacy_action
 
-            target = str(my[1]).strip().lower()
-            action = str(my[2]).strip().lower()
-            if target not in {"base", "deep", "all"} or action not in {"on", "off"}:
+            if not target or not action:
                 await send_to_admin(
                     client,
-                    "❌ 参数无效\n用法：`risk base on|off` / `risk deep on|off` / `risk all on|off`",
+                    "❌ 参数格式错误\n用法：`fk` / `fk 1 on|off` / `fk 2 on|off` / `fk 3 on|off`",
                     user_ctx,
                     global_config,
                 )
                 return
 
             enabled = action == "on"
-            if target in {"base", "all"}:
-                rt["risk_base_enabled"] = enabled
-                rt["risk_base_default_enabled"] = enabled
-                if not enabled:
-                    # 关闭基础风控时顺便清理其周期计数，避免再次开启时吃到旧状态。
-                    rt["risk_pause_cycle_active"] = False
-                    rt["risk_pause_acc_rounds"] = 0
-                    rt["risk_pause_recovery_passes"] = 0
-                    rt["risk_base_hit_streak"] = 0
-                    rt["risk_pause_snapshot_count"] = -1
-                    rt["risk_pause_priority_notified"] = False
-            if target in {"deep", "all"}:
-                rt["risk_deep_enabled"] = enabled
-                rt["risk_deep_default_enabled"] = enabled
-                if not enabled:
-                    rt["risk_deep_triggered_milestones"] = []
+            targets = [target] if target != "all" else ["1", "2", "3"]
+            for item in targets:
+                if item == "1":
+                    rt["fk1_enabled"] = enabled
+                    rt["fk1_default_enabled"] = enabled
+                    rt["risk_base_enabled"] = enabled
+                    rt["risk_base_default_enabled"] = enabled
+                    if not enabled:
+                        rt["current_fk1_action"] = ""
+                        rt["current_fk1_action_text"] = ""
+                        rt["current_fk1_tier_cap"] = ""
+                        rt["current_fk1_reason"] = ""
+                elif item == "2":
+                    rt["fk2_enabled"] = enabled
+                    rt["fk2_default_enabled"] = enabled
+                    rt["risk_deep_enabled"] = enabled
+                    rt["risk_deep_default_enabled"] = enabled
+                    if not enabled:
+                        rt["current_fk2_action"] = ""
+                elif item == "3":
+                    rt["fk3_enabled"] = enabled
+                    rt["fk3_default_enabled"] = enabled
+                    if not enabled:
+                        rt["risk_deep_triggered_milestones"] = []
 
-            _normalize_risk_switches(rt, apply_default=False)
+            risk_control.normalize_fk_switches(rt, apply_default=False)
             user_ctx.save_state()
-            scope_text = {"base": "基础风控", "deep": "深度风控", "all": "基础+深度风控"}[target]
+            scope_text = {
+                "1": "fk1 盘面风控",
+                "2": "fk2 入场风控",
+                "3": "fk3 连输风控",
+                "all": "fk1/fk2/fk3",
+            }[target]
             status_text = "开启" if enabled else "关闭"
             mes = f"✅ 已{status_text}{scope_text}（已写入账号默认模式）\n\n{_build_risk_state_text(rt)}"
             message = await send_to_admin(client, mes, user_ctx, global_config)
@@ -4841,7 +4961,37 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 enabled=enabled,
             )
             return
-        
+
+        if cmd == "fp":
+            if len(my) == 1:
+                await send_to_admin(client, history_analysis.build_fp_overview(user_ctx), user_ctx, global_config)
+                return
+            if len(my) == 2 and str(my[1]).strip() == "1":
+                await send_to_admin(client, history_analysis.build_fp_regime_report(user_ctx), user_ctx, global_config)
+                return
+            if len(my) == 2 and str(my[1]).strip() == "2":
+                await send_to_admin(client, history_analysis.build_fp_tier_report(user_ctx), user_ctx, global_config)
+                return
+            if len(my) == 2 and str(my[1]).strip() == "3":
+                await send_to_admin(client, history_analysis.build_fp_hand_report(user_ctx), user_ctx, global_config)
+                return
+            if len(my) == 2 and str(my[1]).strip() == "4":
+                await send_to_admin(client, history_analysis.build_fp_block_report(user_ctx), user_ctx, global_config)
+                return
+            if len(my) == 2 and str(my[1]).strip() == "5":
+                await send_to_admin(client, history_analysis.build_fp_current_evidence(user_ctx), user_ctx, global_config)
+                return
+            if len(my) == 2 and str(my[1]).strip() == "6":
+                await send_to_admin(client, history_analysis.build_fp_linkage_report(user_ctx), user_ctx, global_config)
+                return
+            await send_to_admin(
+                client,
+                "❌ 参数格式错误\n用法：`fp` / `fp 1` / `fp 2` / `fp 3` / `fp 4` / `fp 5` / `fp 6`",
+                user_ctx,
+                global_config,
+            )
+            return
+
         # st - 启动预设 - 与master一致
         if cmd == "st" and len(my) > 1:
             preset_name = my[1]
@@ -4865,6 +5015,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 rt["bet"] = False  # st 命令不直接设置 bet=True，等待真实盘口触发下注
                 rt["risk_deep_triggered_milestones"] = []
                 rt["fund_pause_notified"] = False
+                dynamic_betting.reset_dynamic_sequence(rt)
                 rt["limit_stop_notified"] = False
                 _clear_lose_recovery_tracking(rt)
                 user_ctx.save_state()
@@ -5209,6 +5360,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["bet_sequence_count"] = 0
                     rt["explode_count"] = 0
                     rt["bet_amount"] = int(rt.get("initial_amount", 500))
+                    dynamic_betting.reset_dynamic_sequence(rt)
                     rt["risk_pause_acc_rounds"] = 0
                     rt["risk_pause_snapshot_count"] = -1
                     rt["risk_pause_cycle_active"] = False
@@ -5234,6 +5386,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["bet_sequence_count"] = 0
                     rt["explode_count"] = 0
                     rt["bet_amount"] = int(rt.get("initial_amount", 500))
+                    dynamic_betting.reset_dynamic_sequence(rt)
                     rt["risk_pause_acc_rounds"] = 0
                     rt["risk_pause_snapshot_count"] = -1
                     rt["risk_pause_cycle_active"] = False
@@ -5252,6 +5405,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     rt["bet_sequence_count"] = 0
                     rt["explode_count"] = 0
                     rt["bet_amount"] = int(rt.get("initial_amount", 500))
+                    dynamic_betting.reset_dynamic_sequence(rt)
                     rt["bet"] = False
                     rt["bet_on"] = False
                     rt["stop_count"] = 0

@@ -197,6 +197,12 @@ def get_default_runtime() -> Dict[str, Any]:
         "risk_deep_default_enabled": True,
         "risk_base_enabled": True,
         "risk_deep_enabled": True,
+        "fk1_default_enabled": True,
+        "fk2_default_enabled": True,
+        "fk3_default_enabled": True,
+        "fk1_enabled": True,
+        "fk2_enabled": True,
+        "fk3_enabled": True,
         "risk_pause_level1_hit": False,
         "risk_deep_triggered_milestones": [],
         "risk_pause_priority_notified": False,
@@ -246,6 +252,22 @@ def get_default_runtime() -> Dict[str, Any]:
         "fund_pause_notified": False,
         "limit_stop_notified": False,
         "pending_bet_id": "",
+        "current_round_key": "",
+        "current_analysis_snapshot": {},
+        "current_fk1_action": "",
+        "current_fk1_action_text": "",
+        "current_fk1_tier_cap": "",
+        "current_fk1_reason": "",
+        "current_fk2_action": "",
+        "dynamic_sequence_start_tier": "",
+        "current_dynamic_base_tier": "",
+        "current_dynamic_tier": "",
+        "current_dynamic_reason": "",
+        "current_dynamic_action_text": "",
+        "current_dynamic_floor_tier": "",
+        "current_dynamic_ceiling_tier": "",
+        "last_blocked_by": "",
+        "last_execution_action": "",
         
         # 统计和仪表盘变量
         "total": 0,
@@ -439,6 +461,30 @@ class UserContext:
                 if "risk_deep_default_enabled" not in saved_runtime:
                     merged_runtime["risk_deep_default_enabled"] = bool(
                         merged_runtime.get("risk_deep_enabled", True)
+                    )
+                if "fk1_enabled" not in saved_runtime:
+                    merged_runtime["fk1_enabled"] = bool(
+                        merged_runtime.get("risk_base_enabled", True)
+                    )
+                if "fk2_enabled" not in saved_runtime:
+                    merged_runtime["fk2_enabled"] = bool(
+                        merged_runtime.get("risk_deep_enabled", True)
+                    )
+                if "fk3_enabled" not in saved_runtime:
+                    merged_runtime["fk3_enabled"] = bool(
+                        merged_runtime.get("risk_deep_enabled", True)
+                    )
+                if "fk1_default_enabled" not in saved_runtime:
+                    merged_runtime["fk1_default_enabled"] = bool(
+                        merged_runtime.get("risk_base_default_enabled", merged_runtime.get("fk1_enabled", True))
+                    )
+                if "fk2_default_enabled" not in saved_runtime:
+                    merged_runtime["fk2_default_enabled"] = bool(
+                        merged_runtime.get("risk_deep_default_enabled", merged_runtime.get("fk2_enabled", True))
+                    )
+                if "fk3_default_enabled" not in saved_runtime:
+                    merged_runtime["fk3_default_enabled"] = bool(
+                        merged_runtime.get("risk_deep_default_enabled", merged_runtime.get("fk3_enabled", True))
                     )
                 
                 self.state = UserState(

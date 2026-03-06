@@ -1,24 +1,24 @@
-"""验证项目依赖安装状态。"""
+"""Simple dependency verification for local Windows development."""
+
+from __future__ import annotations
 
 import sys
 
 
-def check_import(module_name, package_name=None):
-    """检查模块是否可以导入。"""
+def check_import(module_name: str, package_name: str | None = None) -> bool:
     if package_name is None:
         package_name = module_name
     try:
         __import__(module_name)
-        print(f"✅ {package_name}")
+        print(f"OK  {package_name}")
         return True
-    except ImportError as e:
-        print(f"❌ {package_name}: {e}")
+    except ImportError as exc:
+        print(f"ERR {package_name}: {exc}")
         return False
 
 
-def main():
-    """执行依赖检查并返回进程退出码。"""
-    print("正在验证依赖安装...\n")
+def main() -> int:
+    print("Checking installed dependencies...\n")
     all_ok = True
     all_ok &= check_import("telethon")
     all_ok &= check_import("aiohttp")
@@ -28,12 +28,11 @@ def main():
 
     print("\n" + "=" * 40)
     if all_ok:
-        print("✅ 所有核心依赖验证通过！")
+        print("All core dependencies are available.")
         return 0
-    print("❌ 部分依赖未正确安装")
+    print("Some dependencies are missing.")
     return 1
 
 
 if __name__ == "__main__":
-    # 修复：模块导入即退出的问题，原因：旧实现在 import 时直接执行 sys.exit。
     sys.exit(main())
