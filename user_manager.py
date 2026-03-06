@@ -278,6 +278,14 @@ def get_default_runtime() -> Dict[str, Any]:
         "task_last_action": "",
         "task_last_reason": "",
         "task_last_event_at": "",
+        "package_current_id": "",
+        "package_current_name": "",
+        "package_current_status": "",
+        "package_current_task_id": "",
+        "package_current_task_name": "",
+        "package_last_action": "",
+        "package_last_reason": "",
+        "package_last_event_at": "",
         
         # 统计和仪表盘变量
         "total": 0,
@@ -312,6 +320,7 @@ class UserContext:
         self.state: Optional[UserState] = None
         self.presets: Dict[str, List] = {}
         self.tasks: List[Dict[str, Any]] = []
+        self.task_packages: List[Dict[str, Any]] = []
         self.client = None
         self._model_manager = None
         self._model_manager_ai_sig = ""
@@ -325,6 +334,7 @@ class UserContext:
         self._load_state()
         self._load_presets()
         self._load_tasks()
+        self._load_task_packages()
 
     def _resolve_user_config_path(self) -> str:
         """
@@ -671,6 +681,43 @@ class UserContext:
             except Exception as e:
                 log_event(logging.ERROR, 'save_tasks', '保存用户任务失败', f'user_id={self.user_id}, error={str(e)}')
     
+    def _load_task_packages(self):
+        packages_path = os.path.join(self.user_dir, "task_packages.json")
+        self.task_packages = []
+        if not os.path.exists(packages_path):
+            self.save_task_packages()
+            return
+        try:
+            with open(packages_path, 'r', encoding='utf-8') as f:
+                payload = json.load(f)
+            if isinstance(payload, dict):
+                package_items = payload.get("packages", [])
+            elif isinstance(payload, list):
+                package_items = payload
+            else:
+                raise ValueError("task_packages.json 必须是对象(dict)或数组(list)")
+            if not isinstance(package_items, list):
+                raise ValueError("packages 字段必须是数组(list)")
+            self.task_packages = [item for item in package_items if isinstance(item, dict)]
+            log_event(logging.DEBUG, 'load_task_packages', '加载用户任务包成功', f'user_id={self.user_id}, count={len(self.task_packages)}')
+        except Exception as e:
+            self.task_packages = []
+            log_event(logging.ERROR, 'load_task_packages', '加载用户任务包失败', f'user_id={self.user_id}, error={str(e)}')
+
+    def save_task_packages(self):
+        with self._lock:
+            packages_path = os.path.join(self.user_dir, "task_packages.json")
+            payload = {
+                "version": 1,
+                "packages": self.task_packages,
+            }
+            try:
+                with open(packages_path, 'w', encoding='utf-8') as f:
+                    json.dump(payload, f, indent=4, ensure_ascii=False)
+                log_event(logging.DEBUG, 'save_task_packages', '保存用户任务包成功', f'user_id={self.user_id}, count={len(self.task_packages)}')
+            except Exception as e:
+                log_event(logging.ERROR, 'save_task_packages', '保存用户任务包失败', f'user_id={self.user_id}, error={str(e)}')
+
     def get_runtime(self, key: str, default=None):
         return self.state.runtime.get(key, default)
     

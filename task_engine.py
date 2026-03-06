@@ -663,6 +663,26 @@ def pause_task(user_ctx, ident: str, reason: str = "手动暂停") -> Dict[str, 
     return {"ok": True, "task": task, "message": f"任务已暂停：{task.get('name', '')}"}
 
 
+def stop_task_run(user_ctx, ident: str, reason: str = "任务停止") -> Dict[str, Any]:
+    task = find_task(user_ctx, ident)
+    if not task:
+        return {"ok": False, "message": f"任务不存在：{ident}"}
+    task["status"] = TASK_STATUS_IDLE
+    task["current_run_id"] = ""
+    _touch(task, "stopped", reason)
+    _record_task_event(user_ctx, task, "stopped", note=reason, status_text="已停止")
+    rt = user_ctx.state.runtime
+    if str(rt.get("task_current_id", "") or "") == str(task.get("task_id", "") or ""):
+        _clear_task_runtime(rt)
+        rt["bet_on"] = False
+        rt["bet"] = False
+        rt["mode_stop"] = True
+        _set_task_event(rt, "stopped", reason)
+        user_ctx.save_state()
+    save_tasks(user_ctx)
+    return {"ok": True, "task": task, "message": f"任务已停止：{task.get('name', '')}"}
+
+
 def resume_task(user_ctx, ident: str) -> Dict[str, Any]:
     task = find_task(user_ctx, ident)
     if not task:
@@ -691,6 +711,14 @@ def run_task_now(user_ctx, ident: str) -> Dict[str, Any]:
         return {"ok": False, "message": f"任务不存在：{ident}"}
     task["enabled"] = True
     return _start_task(user_ctx, task, "手动触发", force=True)
+
+
+def start_task_if_possible(user_ctx, ident: str, reason: str, force: bool = False) -> Dict[str, Any]:
+    task = find_task(user_ctx, ident)
+    if not task:
+        return {"ok": False, "message": f"任务不存在：{ident}"}
+    task["enabled"] = True
+    return _start_task(user_ctx, task, reason, force=force)
 
 
 def delete_task(user_ctx, ident: str) -> Dict[str, Any]:

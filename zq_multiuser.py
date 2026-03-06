@@ -25,6 +25,7 @@ import dynamic_betting
 import history_analysis
 import risk_control
 import task_engine
+import task_package_engine
 from update_manager import (
     get_current_repo_info,
     list_version_catalog,
@@ -644,6 +645,9 @@ def format_dashboard(user_ctx: UserContext) -> str:
         f"{rt.get('lose_three', 2.05)} {rt.get('lose_four', 2.0)} {rt.get('initial_amount', 500)}"
     )
     mes += f"📋 **预设名称：{preset_name}**\n"
+    current_package_name = str(rt.get("package_current_name", "") or "")
+    if current_package_name:
+        mes += f"🧰 **当前任务包：{current_package_name}**\n"
     current_task_name = str(rt.get("task_current_name", "") or "")
     if current_task_name:
         mes += (
@@ -745,12 +749,14 @@ def build_startup_focus_reminder(user_ctx: UserContext) -> str:
         mode_code = 1
     mode_text = {0: "反投", 1: "预测", 2: "追投"}.get(mode_code, "未知")
     status_text = get_bet_status_text(rt)
+    package_text = task_package_engine.build_package_focus_text(user_ctx)
     task_text = task_engine.build_task_focus_text(user_ctx)
     return (
         "🔔 启动重点设置提醒\n"
         f"🛡️ 风控提醒：fk1 盘面 {_risk_switch_label(risk_modes['fk1_enabled'])} / fk2 入场 {_risk_switch_label(risk_modes['fk2_enabled'])} / fk3 连输 {_risk_switch_label(risk_modes['fk3_enabled'])}\n"
         f"🧱 默认模式：fk1 {_risk_switch_label(risk_modes['fk1_default_enabled'])} / fk2 {_risk_switch_label(risk_modes['fk2_default_enabled'])} / fk3 {_risk_switch_label(risk_modes['fk3_default_enabled'])}（可用 `fk ...` 开关）\n"
         f"🎯 预设提醒：当前 `{preset_name}`（可用 `st <预设名>` 切换）\n"
+        f"{package_text}\n"
         f"{task_text}\n"
         f"📳 当前状态：{status_text}，模式：{mode_text}\n"
         "ℹ️ 更多命令：`help`"
@@ -1530,6 +1536,27 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     # 自动风控暂停：基础风控(40局窗口) + 深度风控(每3连输里程碑)。
     # 同一已结算快照不重复触发，避免重复暂停。
     analysis_snapshot = _refresh_current_analysis_snapshot(user_ctx)
+    package_plan = task_package_engine.prepare_package_for_round(user_ctx, analysis_snapshot)
+    if package_plan.get("started", False):
+        package_info = package_plan.get("package", {}) if isinstance(package_plan.get("package", {}), dict) else {}
+        package_task = package_plan.get("task", {}) if isinstance(package_plan.get("task", {}), dict) else {}
+        try:
+            await _send_transient_admin_notice(
+                client,
+                user_ctx,
+                global_config,
+                (
+                    "🧰 任务包已切换\n"
+                    f"任务包：{package_info.get('name', '')}\n"
+                    f"当前任务：{package_task.get('name', '')}\n"
+                    f"原因：{package_plan.get('message', '') or package_info.get('last_reason', '')}"
+                ),
+                ttl_seconds=90,
+                attr_name="package_transition_message",
+            )
+        except Exception:
+            pass
+
     task_plan = task_engine.prepare_task_for_round(user_ctx, analysis_snapshot)
     if task_plan.get("started", False):
         task_info = task_plan.get("task", {}) if isinstance(task_plan.get("task", {}), dict) else {}
@@ -4266,6 +4293,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                         except Exception as e:
                             log_event(logging.WARNING, 'analytics', '写入 analytics settlement 失败', user_id=user_ctx.user_id, data=str(e))
                         task_finish_result = task_engine.record_settlement(user_ctx, settled_entry, profit)
+                        task_package_engine.record_settlement(user_ctx, profit)
 
                     user_ctx.save_state()
 
@@ -4816,6 +4844,12 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `task pause|resume <id>` : 暂停/恢复任务
 - `task logs [id]` : 查看任务运行记录
 - `task stats [id]` : 查看任务统计
+- `pkg` : 查看任务包总览
+- `pkg tpl` : 查看任务包模板
+- `pkg new <模板> [名称]` : 按模板快速创建任务包
+- `pkg list` / `pkg show <id>` : 查看任务包列表或详情
+- `pkg run <id>` / `pkg pause <id>` / `pkg resume <id>` : 启动、暂停、恢复任务包
+- `pkg logs [id]` / `pkg stats [id]` : 查看任务包日志与统计
 - 说明：风控会直接影响观望、限档、入场阻断与连输暂停，进而影响押注收益；脚本重启后按账号默认模式自动生效
 
 **参数设置**
@@ -5155,6 +5189,64 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "`task show <id>` / `task on <id>` / `task off <id>` / `task run <id>`\n"
                     "`task pause <id>` / `task resume <id>` / `task del <id>`\n"
                     "`task logs [id]` / `task stats [id]`"
+                ),
+                user_ctx,
+                global_config,
+            )
+            return
+
+        if cmd == "pkg":
+            if len(my) == 1:
+                await send_to_admin(client, task_package_engine.build_package_overview_text(user_ctx), user_ctx, global_config)
+                return
+
+            subcmd = str(my[1]).strip().lower()
+            if subcmd in {"tpl", "template", "templates"}:
+                await send_to_admin(client, task_package_engine.build_package_template_text(), user_ctx, global_config)
+                return
+            if subcmd == "new" and len(my) >= 3:
+                package_name = my[3] if len(my) >= 4 else ""
+                result = task_package_engine.create_package_from_template(user_ctx, my[2], package_name, enabled=False)
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "list":
+                await send_to_admin(client, task_package_engine.build_package_list_text(user_ctx), user_ctx, global_config)
+                return
+            if subcmd == "show" and len(my) >= 3:
+                await send_to_admin(client, task_package_engine.build_package_detail_text(user_ctx, my[2]), user_ctx, global_config)
+                return
+            if subcmd == "logs":
+                ident = my[2] if len(my) >= 3 else ""
+                await send_to_admin(client, task_package_engine.build_package_logs_text(user_ctx, ident), user_ctx, global_config)
+                return
+            if subcmd == "stats":
+                ident = my[2] if len(my) >= 3 else ""
+                await send_to_admin(client, task_package_engine.build_package_stats_text(user_ctx, ident), user_ctx, global_config)
+                return
+            if subcmd == "run" and len(my) >= 3:
+                result = task_package_engine.run_package_now(user_ctx, my[2])
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "pause" and len(my) >= 3:
+                result = task_package_engine.pause_package(user_ctx, my[2])
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "resume" and len(my) >= 3:
+                result = task_package_engine.resume_package(user_ctx, my[2])
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+
+            await send_to_admin(
+                client,
+                (
+                    "❌ 参数格式错误\n"
+                    "用法：\n"
+                    "`pkg`\n"
+                    "`pkg tpl`\n"
+                    "`pkg new <模板> [名称]`\n"
+                    "`pkg list`\n"
+                    "`pkg show <id>` / `pkg run <id>` / `pkg pause <id>` / `pkg resume <id>`\n"
+                    "`pkg logs [id]` / `pkg stats [id]`"
                 ),
                 user_ctx,
                 global_config,

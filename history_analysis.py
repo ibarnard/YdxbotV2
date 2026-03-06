@@ -1395,6 +1395,23 @@ def _ensure_analytics_schema(conn: sqlite3.Connection) -> None:
             note TEXT,
             created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS package_runs (
+            package_event_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_name TEXT NOT NULL,
+            run_id TEXT,
+            task_id TEXT,
+            task_name TEXT,
+            round_key TEXT,
+            event_type TEXT NOT NULL,
+            status_text TEXT,
+            progress_switches INTEGER NOT NULL,
+            active_task_count INTEGER NOT NULL,
+            profit_delta INTEGER NOT NULL,
+            cum_profit INTEGER NOT NULL,
+            note TEXT,
+            created_at TEXT NOT NULL
+        );
         CREATE INDEX IF NOT EXISTS idx_rounds_history_index ON rounds(history_index);
         CREATE INDEX IF NOT EXISTS idx_decisions_round_key ON decisions(round_key);
         CREATE INDEX IF NOT EXISTS idx_risk_round_key ON risk_records(round_key);
@@ -1402,6 +1419,8 @@ def _ensure_analytics_schema(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_settlements_round_key ON settlements(round_key);
         CREATE INDEX IF NOT EXISTS idx_task_runs_task_id ON task_runs(task_id);
         CREATE INDEX IF NOT EXISTS idx_task_runs_created_at ON task_runs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_package_runs_package_id ON package_runs(package_id);
+        CREATE INDEX IF NOT EXISTS idx_package_runs_created_at ON package_runs(created_at);
         """
     )
 
@@ -1710,6 +1729,55 @@ def record_task_event(
                     _safe_int_value(profit_delta, 0),
                     _safe_int_value(cum_profit, 0),
                     _safe_int_value(cum_loss, 0),
+                    str(note or ""),
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                ),
+            ),
+        ],
+    )
+
+
+def record_package_event(
+    user_ctx,
+    *,
+    package_id: str,
+    package_name: str,
+    run_id: str = "",
+    task_id: str = "",
+    task_name: str = "",
+    round_key: str = "",
+    event_type: str,
+    status_text: str = "",
+    progress_switches: int = 0,
+    active_task_count: int = 0,
+    profit_delta: int = 0,
+    cum_profit: int = 0,
+    note: str = "",
+) -> None:
+    _write_analytics(
+        user_ctx,
+        [
+            (
+                """
+                INSERT INTO package_runs (
+                    package_event_id, package_id, package_name, run_id, task_id, task_name, round_key,
+                    event_type, status_text, progress_switches, active_task_count, profit_delta, cum_profit, note, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    f"pkg_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{uuid.uuid4().hex[:8]}",
+                    str(package_id or ""),
+                    str(package_name or ""),
+                    str(run_id or ""),
+                    str(task_id or ""),
+                    str(task_name or ""),
+                    str(round_key or ""),
+                    str(event_type or ""),
+                    str(status_text or ""),
+                    _safe_int_value(progress_switches, 0),
+                    _safe_int_value(active_task_count, 0),
+                    _safe_int_value(profit_delta, 0),
+                    _safe_int_value(cum_profit, 0),
                     str(note or ""),
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 ),
