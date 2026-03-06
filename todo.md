@@ -145,17 +145,17 @@
 当前默认顺序：
 
 ### [ ] H. 受控自学习 V1
-状态：设计完成，待实现
+状态：进行中（H1/H2 已完成，H3/H4/H5 待实现）
 
 对应文档：
 - [docs/controlled-self-learning-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/controlled-self-learning-v1-tech-spec.md)
 
 执行子阶段：
-- [ ] H1 候选中心
+- [x] H1 候选中心
   - `learning_center.json`
   - `learning_candidates / learning_evaluations / learning_shadows / learning_promotions`
   - `learn` / `learn list` / `learn show`
-- [ ] H2 候选生成器
+- [x] H2 候选生成器
   - 基于复盘事实生成候选策略
   - `learn gen`
 - [ ] H3 离线评估器
@@ -179,11 +179,9 @@
 ## 9. 当前之后的顺序
 当前默认顺序：
 
-1. H1 候选中心
-2. H2 候选生成器
-3. H3 离线评估器
-4. H4 影子验证器
-5. H5 灰度与转正
+1. H3 离线评估器
+2. H4 影子验证器
+3. H5 灰度与转正
 
 详细拆解、时间预估、风险、确认点，请看：
 - [docs/refactor-roadmap.md](D:/OneDrive/06Code/YdxbotV2/docs/refactor-roadmap.md)
@@ -194,7 +192,7 @@
 每个阶段结束前至少执行：
 
 ```powershell
-.\venv_win\Scripts\python.exe -m pytest tests_multiuser\test_multiuser_branch.py tests_multiuser\test_risk_history_v1.py tests_multiuser\test_dynamic_betting.py tests_multiuser\test_task_engine_v1.py tests_multiuser\test_task_package_engine_v1.py tests_multiuser\test_policy_prompt_v1.py tests_multiuser\test_multi_account_orchestrator_v1.py -q
+.\venv_win\Scripts\python.exe -m pytest tests_multiuser\test_multiuser_branch.py tests_multiuser\test_risk_history_v1.py tests_multiuser\test_dynamic_betting.py tests_multiuser\test_task_engine_v1.py tests_multiuser\test_task_package_engine_v1.py tests_multiuser\test_policy_prompt_v1.py tests_multiuser\test_multi_account_orchestrator_v1.py tests_multiuser\test_self_learning_v1.py -q
 ```
 
 如果阶段新增新的测试文件，要一并纳入回归。
