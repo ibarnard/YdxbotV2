@@ -23,6 +23,7 @@ from typing import Dict, Any, List, Optional, Tuple
 import constants
 import dynamic_betting
 import history_analysis
+import multi_account_orchestrator
 import policy_engine
 import risk_control
 import task_engine
@@ -4901,6 +4902,11 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `policy list` / `policy show [vX]` : 查看策略版本列表或详情
 - `policy sync` : 根据当前复盘事实生成并激活新策略版本（单账户灰度）
 - `policy use <vX>` / `policy rollback` : 切换或回滚策略版本
+- `fleet` / `users` : 查看多账号总览
+- `fleet task` : 查看多账号任务/任务包视图
+- `fleet policy` : 查看多账号策略灰度视图
+- `fleet show <账号名|ID>` : 查看单账号详情
+- `fleet gray <账号名|ID> baseline|latest` : 切换指定账号到基线或最新策略版本
 - 说明：风控会直接影响观望、限档、入场阻断与连输暂停，进而影响押注收益；脚本重启后按账号默认模式自动生效
 
 **参数设置**
@@ -5956,22 +5962,61 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 asyncio.create_task(delete_later(client, message.chat_id, message.id, 10))
             return
         
-        # ========== 多用户管理命令 ==========
-        # users - 查看所有用户
-        if cmd == "users":
-            # 获取当前用户信息
-            user_info = f"👤 当前用户: {user_ctx.config.name} (ID: {user_ctx.user_id})\n"
-            user_info += f"💰 菠菜资金: {format_number(rt.get('gambling_fund', 0))}\n"
-            user_info += f"📊 状态: {get_bet_status_text(rt)}\n"
-            user_info += f"🎯 预设: {rt.get('current_preset_name', '无')}\n"
-            user_info += f"🤖 模型: {rt.get('current_model_id', 'default')}\n"
-            user_info += f"📈 胜率: {rt.get('win_total', 0)}/{rt.get('total', 0)}"
-            message = await send_to_admin(client, user_info, user_ctx, global_config)
+        # ========== 多账号编排命令 ==========
+        if cmd in {"fleet", "users"}:
+            if len(my) == 1:
+                message = await send_to_admin(client, multi_account_orchestrator.build_fleet_overview_text(user_ctx), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
+                return
+
+            subcmd = str(my[1]).strip().lower()
+            if subcmd == "task":
+                message = await send_to_admin(client, multi_account_orchestrator.build_fleet_task_text(user_ctx), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
+                return
+            if subcmd == "policy":
+                message = await send_to_admin(client, multi_account_orchestrator.build_fleet_policy_text(user_ctx), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
+                return
+            if subcmd == "show" and len(my) >= 3:
+                message = await send_to_admin(client, multi_account_orchestrator.build_fleet_account_text(user_ctx, my[2]), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
+                return
+            if subcmd == "gray" and len(my) >= 4:
+                result = multi_account_orchestrator.switch_account_policy_mode(user_ctx, my[2], my[3])
+                message = await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
+                return
+
+            message = await send_to_admin(
+                client,
+                (
+                    "❌ 参数格式错误\n"
+                    "用法：\n"
+                    "`fleet`\n"
+                    "`fleet task`\n"
+                    "`fleet policy`\n"
+                    "`fleet show <账号名|ID>`\n"
+                    "`fleet gray <账号名|ID> baseline|latest`"
+                ),
+                user_ctx,
+                global_config,
+            )
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             if message:
-                asyncio.create_task(delete_later(client, message.chat_id, message.id, 30))
+                asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
             return
-        
+
         # 未知命令
         log_event(logging.DEBUG, 'user_cmd', '未知命令', user_id=user_ctx.user_id, data=text[:50])
         message = await send_to_admin(client, f"未知命令: {cmd}\n输入 help 查看帮助", user_ctx, global_config)

@@ -22,6 +22,8 @@ file_handler = TimedRotatingFileHandler('user_manager.log', when='midnight', int
 file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
 logger.addHandler(file_handler)
 
+_REGISTERED_USER_CONTEXTS: Dict[int, "UserContext"] = {}
+
 
 def log_event(level, module, event, message=None, **kwargs):
     # 兼容旧调用: log_event(level, event, message, data)
@@ -31,6 +33,23 @@ def log_event(level, module, event, message=None, **kwargs):
         module = 'user_manager'
     data = ', '.join(f'{k}={v}' for k, v in kwargs.items())
     logger.log(level, f"[{module}:{event}] {message} | {data}")
+
+
+def register_user_context(user_ctx: "UserContext") -> None:
+    try:
+        user_id = int(getattr(user_ctx, "user_id", 0) or 0)
+    except (TypeError, ValueError):
+        user_id = 0
+    if user_id > 0:
+        _REGISTERED_USER_CONTEXTS[user_id] = user_ctx
+
+
+def get_registered_user_contexts() -> Dict[int, "UserContext"]:
+    return dict(_REGISTERED_USER_CONTEXTS)
+
+
+def clear_registered_user_contexts() -> None:
+    _REGISTERED_USER_CONTEXTS.clear()
 
 
 def load_json_with_comments(filepath: str) -> Dict[str, Any]:
@@ -334,6 +353,7 @@ class UserContext:
         self._config_data = {}
         self._lock = threading.Lock()
         self._load_all()
+        register_user_context(self)
     
     def _load_all(self):
         self._load_config()
