@@ -247,6 +247,88 @@ def test_update_to_ref_rejects_ref_outside_limited_branch(monkeypatch, tmp_path)
     assert checkout_calls["count"] == 0
 
 
+def test_update_to_ref_auto_preserves_local_global_config(monkeypatch, tmp_path):
+    monkeypatch.setattr(um, "_acquire_update_lock", lambda repo_root: {"success": True})
+    monkeypatch.setattr(um, "_release_update_lock", lambda repo_root: None)
+    monkeypatch.setattr(um, "get_blocking_dirty_paths", lambda repo_root=None: [])
+    monkeypatch.setattr(
+        um,
+        "detect_repo_remote",
+        lambda repo_root=None: {"name": "origin", "url": "https://github.com/ibarnard/YdxbotV2.git", "slug": "ibarnard/YdxbotV2"},
+    )
+    monkeypatch.setattr(um, "resolve_github_token", lambda repo_root=None, remote_url="": "")
+    monkeypatch.setattr(um, "resolve_update_target_branch", lambda repo_root=None: "codex/v2-adaptive")
+    monkeypatch.setattr(um, "_save_rollback_point", lambda *args, **kwargs: None)
+    monkeypatch.setattr(um, "run_health_check", lambda repo_root=None: {"success": True})
+    monkeypatch.setattr(um, "mark_release_applied", lambda *args, **kwargs: None)
+    monkeypatch.setattr(um, "mark_release_notified", lambda *args, **kwargs: None)
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    config_path = config_dir / "global_config.json"
+    local_config_text = '{"admin_chat": 5721909476}\n'
+    config_path.write_text(local_config_text, encoding="utf-8")
+
+    info_calls = {"count": 0}
+
+    def fake_get_current_repo_info(repo_root=None):
+        info_calls["count"] += 1
+        if info_calls["count"] == 1:
+            return {
+                "commit": "aaaaaaaa11111111",
+                "short_commit": "aaaaaaaa",
+                "branch": "codex/v2-adaptive",
+                "current_tag": "",
+                "nearest_tag": "",
+                "display_version": "codex/v2-adaptive@aaaaaaaa",
+            }
+        return {
+            "commit": "bbbbbbbb22222222",
+            "short_commit": "bbbbbbbb",
+            "branch": "",
+            "current_tag": "",
+            "nearest_tag": "",
+            "display_version": "bbbbbbbb",
+        }
+
+    monkeypatch.setattr(um, "get_current_repo_info", fake_get_current_repo_info)
+
+    calls = {"stash_push": 0, "stash_drop": 0}
+
+    def fake_run_cmd(args, cwd, timeout=30):
+        if args[:3] == ["git", "status", "--porcelain"] and "--" in args:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout=" M config/global_config.json\n", stderr="")
+        if args == ["git", "fetch", "origin", "+refs/heads/codex/v2-adaptive:refs/remotes/origin/codex/v2-adaptive"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args == ["git", "fetch", "--force", "--tags", "origin"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args == ["git", "rev-parse", "--verify", "refs/remotes/origin/codex/v2-adaptive"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="cccccccc33333333\n", stderr="")
+        if args == ["git", "rev-parse", "--verify", "52e093c^{commit}"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="bbbbbbbb22222222\n", stderr="")
+        if args == ["git", "merge-base", "--is-ancestor", "bbbbbbbb22222222", "refs/remotes/origin/codex/v2-adaptive"]:
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        if args[:4] == ["git", "stash", "push", "--include-untracked"]:
+            calls["stash_push"] += 1
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="Saved working directory and index state", stderr="")
+        if args[:3] == ["git", "stash", "drop"]:
+            calls["stash_drop"] += 1
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="Dropped stash@{0}", stderr="")
+        if args == ["git", "checkout", "bbbbbbbb22222222"]:
+            config_path.write_text('{"admin_chat": 0}\n', encoding="utf-8")
+            return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+        return subprocess.CompletedProcess(args=args, returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(um, "_run_cmd", fake_run_cmd)
+
+    result = um.update_to_ref(str(tmp_path), "52e093c")
+    assert result["success"] is True
+    assert calls["stash_push"] == 1
+    assert calls["stash_drop"] == 1
+    assert config_path.read_text(encoding="utf-8") == local_config_text
+    assert "config/global_config.json" in result.get("preserved_local_paths", [])
+
+
 def test_reback_to_version_requires_target():
     result = um.reback_to_version("/tmp/repo", "")
     assert result["success"] is False

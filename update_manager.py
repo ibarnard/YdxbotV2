@@ -35,6 +35,14 @@ GITHUB_TOKEN_ENV_KEYS = ("YDXBOT_GITHUB_TOKEN", "GITHUB_TOKEN", "GH_TOKEN")
 SYSTEMD_SERVICE_ENV_KEYS = ("YDXBOT_SYSTEMD_SERVICE", "SYSTEMD_SERVICE")
 UPDATE_TARGET_BRANCH_ENV_KEYS = ("YDXBOT_UPDATE_TARGET_BRANCH", "UPDATE_TARGET_BRANCH")
 DEFAULT_UPDATE_TARGET_BRANCH = "codex/v2-adaptive"
+LOCAL_UPDATE_PRESERVE_FILES = (
+    "config/global_config.json",
+    "config/global.json",
+    "config/global.local.json",
+    "shared/global.json",
+    "shared/global.local.json",
+    "global.json",
+)
 GLOBAL_CONFIG_CANDIDATES = (
     "global_config.json",
     "global_config.example.json",
@@ -838,6 +846,142 @@ def get_blocking_dirty_paths(repo_root: Optional[str] = None) -> List[str]:
     return blocking
 
 
+def _collect_dirty_paths(root: Path, pathspecs: Optional[List[str]] = None) -> List[str]:
+    cmd = ["git", "status", "--porcelain"]
+    if pathspecs:
+        cmd += ["--", *pathspecs]
+    result = _run_cmd(cmd, root)
+    if result.returncode != 0:
+        return []
+
+    dirty_paths: List[str] = []
+    for line in result.stdout.splitlines():
+        path = _parse_status_path(line)
+        if not path:
+            continue
+        normalized = path.replace("\\", "/")
+        while normalized.startswith("./"):
+            normalized = normalized[2:]
+        dirty_paths.append(normalized)
+    return dirty_paths
+
+
+def _capture_local_file_states(root: Path, paths: List[str]) -> Dict[str, Dict[str, Any]]:
+    states: Dict[str, Dict[str, Any]] = {}
+    for rel_path in paths:
+        file_path = root / rel_path
+        if file_path.exists():
+            states[rel_path] = {"exists": True, "content": file_path.read_bytes()}
+        else:
+            states[rel_path] = {"exists": False, "content": b""}
+    return states
+
+
+def _stash_local_paths(root: Path, paths: List[str]) -> Dict[str, Any]:
+    if not paths:
+        return {"success": True, "created": False, "detail": ""}
+    stash_message = f"ydx-update-preserve-{int(time.time())}-{os.getpid()}"
+    stash_res = _run_cmd(
+        ["git", "stash", "push", "--include-untracked", "-m", stash_message, "--", *paths],
+        root,
+        timeout=60,
+    )
+    if stash_res.returncode != 0:
+        return {
+            "success": False,
+            "error": "自动暂存本地配置失败",
+            "detail": (stash_res.stderr or stash_res.stdout).strip()[:600],
+        }
+    output = (stash_res.stdout or stash_res.stderr or "").strip()
+    created = "No local changes to save" not in output
+    return {"success": True, "created": created, "detail": output}
+
+
+def _restore_local_file_states(root: Path, states: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    if not states:
+        return {"success": True, "restored_paths": [], "errors": []}
+
+    restored_paths: List[str] = []
+    errors: List[str] = []
+    for rel_path, payload in states.items():
+        file_path = root / rel_path
+        try:
+            if payload.get("exists", False):
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_bytes(payload.get("content", b""))
+            else:
+                if file_path.exists():
+                    if file_path.is_file() or file_path.is_symlink():
+                        file_path.unlink()
+                    else:
+                        shutil.rmtree(file_path)
+            restored_paths.append(rel_path)
+        except Exception as exc:
+            errors.append(f"{rel_path}: {exc}")
+
+    return {"success": not errors, "restored_paths": restored_paths, "errors": errors}
+
+
+def _drop_latest_stash(root: Path) -> Dict[str, Any]:
+    drop_res = _run_cmd(["git", "stash", "drop", "stash@{0}"], root, timeout=30)
+    if drop_res.returncode != 0:
+        return {
+            "success": False,
+            "detail": (drop_res.stderr or drop_res.stdout).strip()[:600],
+        }
+    return {"success": True, "detail": ""}
+
+
+def _prepare_local_update_preserve(root: Path) -> Dict[str, Any]:
+    dirty_set = set(_collect_dirty_paths(root, list(LOCAL_UPDATE_PRESERVE_FILES)))
+    target_paths = [path for path in LOCAL_UPDATE_PRESERVE_FILES if path in dirty_set]
+    if not target_paths:
+        return {
+            "success": True,
+            "paths": [],
+            "states": {},
+            "stash_created": False,
+        }
+    try:
+        states = _capture_local_file_states(root, target_paths)
+    except Exception as exc:
+        return {
+            "success": False,
+            "error": "读取本地配置快照失败",
+            "detail": str(exc)[:600],
+        }
+    stash_result = _stash_local_paths(root, target_paths)
+    if not stash_result.get("success"):
+        return stash_result
+    return {
+        "success": True,
+        "paths": target_paths,
+        "states": states,
+        "stash_created": bool(stash_result.get("created", False)),
+    }
+
+
+def _finalize_local_update_preserve(root: Path, preserve_ctx: Dict[str, Any]) -> Dict[str, Any]:
+    if not preserve_ctx.get("paths"):
+        return {"success": True, "restored_paths": [], "detail": ""}
+
+    restore_result = _restore_local_file_states(root, preserve_ctx.get("states", {}))
+    detail_parts: List[str] = []
+    if not restore_result.get("success"):
+        detail_parts.extend(restore_result.get("errors", []))
+
+    if preserve_ctx.get("stash_created"):
+        drop_result = _drop_latest_stash(root)
+        if not drop_result.get("success"):
+            detail_parts.append(drop_result.get("detail", "stash drop 失败"))
+
+    return {
+        "success": not detail_parts,
+        "restored_paths": restore_result.get("restored_paths", []),
+        "detail": "；".join([item for item in detail_parts if item])[:600],
+    }
+
+
 def _acquire_update_lock(repo_root: Path) -> Dict[str, Any]:
     lock_path = repo_root / UPDATE_LOCK_FILE
     try:
@@ -1109,39 +1253,58 @@ def update_to_ref(repo_root: Optional[str] = None, target_ref: Optional[str] = N
                 "message": "当前已是目标版本",
             }
 
+        preserve_ctx = _prepare_local_update_preserve(root)
+        if not preserve_ctx.get("success"):
+            return {
+                "success": False,
+                "error": preserve_ctx.get("error", "自动暂存本地配置失败"),
+                "detail": preserve_ctx.get("detail", ""),
+            }
+
+        def _attach_preserve_result(base_result: Dict[str, Any]) -> Dict[str, Any]:
+            finalize_result = _finalize_local_update_preserve(root, preserve_ctx)
+            if not finalize_result.get("success"):
+                current_detail = str(base_result.get("detail", "") or "").strip()
+                extra_detail = str(finalize_result.get("detail", "") or "").strip()
+                merged_detail = extra_detail if not current_detail else f"{current_detail} | {extra_detail}"
+                base_result["detail"] = merged_detail[:600]
+            elif finalize_result.get("restored_paths"):
+                base_result["preserved_local_paths"] = finalize_result.get("restored_paths", [])
+            return base_result
+
         _save_rollback_point(root, current, final_ref)
 
         checkout_res = _run_cmd(["git", "checkout", target_commit], root, timeout=60)
         if checkout_res.returncode != 0:
-            return {
+            return _attach_preserve_result({
                 "success": False,
                 "error": f"切换到目标 ref 失败: {final_ref}",
                 "detail": (checkout_res.stderr or checkout_res.stdout).strip()[:600],
-            }
+            })
 
         health = run_health_check(root)
         if not health.get("success"):
             rollback_result = _rollback_to_last_release_unlocked(root)
-            return {
+            return _attach_preserve_result({
                 "success": False,
                 "error": health.get("error", "更新后健康检查失败"),
                 "detail": health.get("detail", ""),
                 "rollback": rollback_result,
-            }
+            })
 
         after = get_current_repo_info(root)
         if after.get("current_tag"):
             mark_release_applied(after.get("current_tag"), root)
             mark_release_notified(after.get("current_tag"), root)
 
-        return {
+        return _attach_preserve_result({
             "success": True,
             "current": current,
             "after": after,
             "target_ref": final_ref,
             "target_commit": target_commit,
             "target_branch": target_branch,
-        }
+        })
     finally:
         _release_update_lock(root)
 
