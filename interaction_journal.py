@@ -99,6 +99,8 @@ def record_message(
     ok: bool,
     error: str = "",
     parse_mode: str = "",
+    msg_type: str = "",
+    message_kind: str = "",
 ) -> None:
     record = _base_record(user_ctx, "message")
     text = str(message or "")
@@ -110,6 +112,8 @@ def record_message(
             "ok": bool(ok),
             "error": str(error or "").strip(),
             "parse_mode": str(parse_mode or "").strip(),
+            "msg_type": str(msg_type or "").strip(),
+            "message_kind": str(message_kind or "").strip(),
             "message_preview": text[:240],
             "message": text,
         }

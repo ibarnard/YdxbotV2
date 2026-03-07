@@ -111,7 +111,16 @@ def test_single_account_startup_and_one_bet_settle_loop(tmp_path, monkeypatch):
         admin_messages.append(message)
         return _DummySentMessage(user_ctx.user_id, len(admin_messages) + 100, message)
 
-    async def fake_send_message_v2(client_obj, msg_type, message, user_ctx, global_config, parse_mode="markdown", title=None, desp=None):
+    async def fake_send_message_v2(
+        client_obj,
+        msg_type,
+        message,
+        user_ctx,
+        global_config,
+        parse_mode="markdown",
+        title=None,
+        desp=None,
+    ):
         routed_messages.append((msg_type, message))
         return _DummySentMessage(user_ctx.user_id, len(routed_messages) + 200, message)
 
@@ -154,12 +163,16 @@ def test_single_account_startup_and_one_bet_settle_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(zm, "_click_bet_button_with_recover", fake_click_bet_button_with_recover)
     monkeypatch.setattr(zm, "_emit_watch_event", fake_emit_watch_event)
     monkeypatch.setattr(zm, "_send_transient_admin_notice", fake_transient_notice)
-    monkeypatch.setattr(zm, "_read_timing_config", lambda cfg: {
-        "prompt_wait_sec": 0.0,
-        "predict_timeout_sec": 3.0,
-        "click_interval_sec": 0.0,
-        "click_timeout_sec": 1.0,
-    })
+    monkeypatch.setattr(
+        zm,
+        "_read_timing_config",
+        lambda cfg: {
+            "prompt_wait_sec": 0.0,
+            "predict_timeout_sec": 3.0,
+            "click_interval_sec": 0.0,
+            "click_timeout_sec": 1.0,
+        },
+    )
     monkeypatch.setattr(zm, "_refresh_current_analysis_snapshot", fake_refresh_snapshot)
     monkeypatch.setattr(zm, "predict_next_bet_v10", fake_predict_next_bet_v10)
     monkeypatch.setattr(zm, "fetch_balance", fake_fetch_balance)
@@ -218,7 +231,11 @@ def test_single_account_startup_and_one_bet_settle_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(zm.dynamic_betting, "clear_dynamic_decision", lambda rt: None)
     monkeypatch.setattr(zm.task_engine, "prepare_task_for_round", lambda user_ctx, snapshot: {"started": False})
     monkeypatch.setattr(zm.task_engine, "record_round_action", lambda *args, **kwargs: None)
-    monkeypatch.setattr(zm.task_engine, "record_settlement", lambda *args, **kwargs: {"task_finished": False, "summary": ""})
+    monkeypatch.setattr(
+        zm.task_engine,
+        "record_settlement",
+        lambda *args, **kwargs: {"task_finished": False, "summary": ""},
+    )
     monkeypatch.setattr(zm.task_package_engine, "prepare_package_for_round", lambda user_ctx, snapshot: {"started": False})
     monkeypatch.setattr(zm.task_package_engine, "record_settlement", lambda *args, **kwargs: None)
     monkeypatch.setattr(zm.constants, "BIG_BUTTON", {500: "big_500"})
@@ -247,7 +264,7 @@ def test_single_account_startup_and_one_bet_settle_loop(tmp_path, monkeypatch):
     assert ctx.state.runtime["total"] == 1
     assert ctx.state.runtime["bet_sequence_count"] == 1
     assert ctx.state.bet_sequence_log[-1]["status"] == "placed"
-    assert any("Admin 驾驶舱" in text for text in admin_messages)
+    assert any(msg_type == "dashboard" and "Admin 驾驶舱" in text for msg_type, text in routed_messages)
 
     settle_event = SimpleNamespace(
         id=2,
@@ -264,4 +281,6 @@ def test_single_account_startup_and_one_bet_settle_loop(tmp_path, monkeypatch):
     assert ctx.state.bet_sequence_log[-1]["status"] == "settled"
     assert ctx.dashboard_message is not None
     assert isinstance(routed_messages, list)
-    assert sum(1 for text in admin_messages if "Admin 驾驶舱" in text) >= 2
+    assert sum(
+        1 for msg_type, text in routed_messages if msg_type == "dashboard" and "Admin 驾驶舱" in text
+    ) >= 2

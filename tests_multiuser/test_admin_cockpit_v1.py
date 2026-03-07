@@ -276,6 +276,40 @@ def test_build_settle_event_card_includes_pnl_context(tmp_path):
     assert "信号：主模型建议追大，样本稳定" in message
 
 
+def test_build_auto_pause_card_includes_countdown_and_hint(tmp_path):
+    clear_registered_user_contexts()
+    ctx = _make_user_context(tmp_path, user_id=99541)
+    ctx.state.runtime.update(
+        {
+            "bet_on": False,
+            "mode_stop": False,
+            "current_preset_name": "yc10",
+            "current_dynamic_tier": "yc20",
+            "policy_active_version": "v4",
+            "policy_active_mode": "gray",
+            "bet_sequence_count": 3,
+            "initial_amount": 50000,
+        }
+    )
+
+    message = zm._build_auto_pause_card(
+        ctx,
+        action="高倍入场门控，已暂停 2 局",
+        reason="当前预测来自回退通道，信号不稳定",
+        remaining_rounds=2,
+        total_rounds=2,
+        current_text="第 4 手下注前阻断 | 最近胜率 1/4（25.0%）",
+        signal_text="标签 UNKNOWN | 置信度 0% | 来源 timeout",
+        extra_lines=["恢复后动作：继续第 4 手，预计下注 50,000"],
+    )
+
+    assert "⏸️ 自动暂停卡" in message
+    assert "动作：高倍入场门控，已暂停 2 局" in message
+    assert "倒计时：剩 2 局" in message
+    assert "恢复后动作：继续第 4 手" in message
+    assert "信号：标签 UNKNOWN | 置信度 0% | 来源 timeout" in message
+
+
 def test_process_user_command_pause_resume_uses_status_cards(tmp_path, monkeypatch):
     clear_registered_user_contexts()
     ctx = _make_user_context(tmp_path, user_id=9955)

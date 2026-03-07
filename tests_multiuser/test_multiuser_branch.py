@@ -1506,7 +1506,9 @@ def test_check_bet_status_can_resume_when_fund_sufficient(tmp_path, monkeypatch)
     # 恢复可下注状态时不应提前标记为“已下注”，避免结算时序误判。
     assert rt["bet"] is False
     assert rt["pause_count"] == 0
-    assert "恢复可下注状态" in sent["message"]
+    assert "💰 资金状态卡" in sent["message"]
+    assert "动作：资金条件已满足，恢复可下注状态" in sent["message"]
+    assert "接续金额 500" in sent["message"]
 
 
 def test_pause_command_sets_manual_pause_and_blocks_bet_on(tmp_path, monkeypatch):
@@ -3041,3 +3043,235 @@ def test_process_settle_updates_target_pending_entry_by_pending_bet_id(tmp_path,
     assert ctx.state.bet_sequence_log[1]["bet_id"] == "bet_old_done"
     assert ctx.state.bet_sequence_log[1]["profit"] == 990
     assert rt["pending_bet_id"] == ""
+
+
+def test_process_bet_on_prediction_timeout_gate_dedup_same_snapshot(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "4005"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "超时去重用户"},
+            "telegram": {"user_id": 4005},
+            "groups": {"admin_chat": 4005},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["bet_on"] = True
+    rt["mode_stop"] = True
+    rt["stop_count"] = 0
+    rt["initial_amount"] = 500
+    rt["bet_amount"] = 500
+    rt["lose_count"] = 0
+    rt["win_count"] = 0
+    ctx.state.history = [0, 1] * 20
+
+    async def fake_predict(user_ctx, global_cfg):
+        raise asyncio.TimeoutError("predict timeout")
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=1, id=len(sent_messages))
+
+    async def fake_sleep(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(zm, "predict_next_bet_v10", fake_predict)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm.asyncio, "sleep", fake_sleep)
+
+    class DummyEvent:
+        def __init__(self):
+            history = " ".join((["0", "1"] * 20))
+            self.message = SimpleNamespace(message=f"[近 40 次结果][由近及远][0 小 1 大] {history}")
+            self.reply_markup = object()
+            self.chat_id = 1
+            self.id = 205
+            self.clicks = []
+
+        async def click(self, data):
+            self.clicks.append(data)
+
+    event = DummyEvent()
+    asyncio.run(zm.process_bet_on(SimpleNamespace(), event, ctx, {"betting": {"predict_timeout_sec": 2}}))
+    rt["stop_count"] = 0
+    rt["bet_on"] = True
+    rt["mode_stop"] = True
+    asyncio.run(zm.process_bet_on(SimpleNamespace(), event, ctx, {"betting": {"predict_timeout_sec": 2}}))
+
+    timeout_msgs = [
+        m
+        for m in sent_messages
+        if "⏸️ 自动暂停卡" in m
+        and "模型可用性门控（超时）" in m
+        and "暂停期间保留当前倍投进度" in m
+    ]
+    assert len(timeout_msgs) == 1
+
+
+def test_process_settle_lose_warning_matches_master_style(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5004"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "告警用户"},
+            "telegram": {"user_id": 5004},
+            "groups": {"admin_chat": 5004},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["bet"] = True
+    rt["bet_type"] = 0
+    rt["bet_amount"] = 500
+    rt["warning_lose_count"] = 1
+    rt["bet_sequence_count"] = 1
+    rt["account_balance"] = 10_000_000
+    rt["gambling_fund"] = 9_000_000
+    rt["current_round"] = 1
+    rt["current_bet_seq"] = 2
+    rt["current_preset_name"] = "yc10"
+    ctx.state.bet_sequence_log = [{"bet_id": "20260223_1_1", "profit": None}]
+
+    captured = []
+
+    async def fake_send_message_v2(client, msg_type, message, user_ctx, global_cfg, parse_mode="markdown", title=None, desp=None):
+        captured.append({"type": msg_type, "message": message})
+        return None
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        return SimpleNamespace(chat_id=5004, id=12)
+
+    async def fake_fetch_balance(user_ctx):
+        return rt["account_balance"]
+
+    monkeypatch.setattr(zm, "send_message_v2", fake_send_message_v2)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "fetch_balance", fake_fetch_balance)
+
+    class DummyClient:
+        async def send_message(self, target, message, parse_mode=None):
+            return SimpleNamespace(chat_id=target, id=1)
+
+        async def delete_messages(self, chat_id, message_id):
+            return None
+
+    event = SimpleNamespace(message=SimpleNamespace(message="已结算: 结果为 9 大"))
+    asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
+
+    lose_warning = next(item for item in captured if item["type"] == "lose_streak")
+    assert "⚠️⚠️  1 连输告警 ⚠️⚠️" in lose_warning["message"]
+    assert "第 1 轮第 1 次" in lose_warning["message"]
+    assert "📋 预设名称：yc10" in lose_warning["message"]
+    assert "💰 账户余额：" in lose_warning["message"]
+    assert "🦻 当前局 AI 预测提示" not in lose_warning["message"]
+
+
+def test_process_settle_profit_pause_does_not_immediately_resume(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5014"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "盈利暂停用户"},
+            "telegram": {"user_id": 5014},
+            "groups": {"admin_chat": 5014},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["bet"] = True
+    rt["bet_type"] = 1
+    rt["bet_amount"] = 10_000
+    rt["period_profit"] = 95_000
+    rt["profit"] = 100_000
+    rt["profit_stop"] = 2
+    rt["flag"] = True
+    rt["current_round"] = 1
+    rt["current_bet_seq"] = 3
+    rt["account_balance"] = 10_000_000
+    rt["gambling_fund"] = 9_000_000
+    ctx.state.bet_sequence_log = [{"bet_id": "20260227_1_3", "profit": None}]
+
+    sent_messages = []
+    routed_messages = []
+
+    async def fake_send_message_v2(client, msg_type, message, user_ctx, global_cfg, parse_mode="markdown", title=None, desp=None):
+        routed_messages.append((msg_type, message))
+        return None
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5014, id=len(sent_messages))
+
+    async def fake_fetch_balance(user_ctx):
+        return rt["account_balance"]
+
+    monkeypatch.setattr(zm, "send_message_v2", fake_send_message_v2)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "fetch_balance", fake_fetch_balance)
+
+    class DummyClient:
+        async def send_message(self, target, message, parse_mode=None):
+            return SimpleNamespace(chat_id=target, id=1)
+
+        async def delete_messages(self, chat_id, message_id):
+            return None
+
+    event = SimpleNamespace(id=41001, message=SimpleNamespace(message="已结算: 结果为 9 大"))
+    asyncio.run(zm.process_settle(DummyClient(), event, ctx, {}))
+
+    assert any(msg_type == "goal_pause" and "原因：盈利达成" in m for msg_type, m in routed_messages)
+    assert any("⏸️ 自动暂停卡" in m for m in sent_messages)
+    assert any("倒计时：剩 2 局" in m for m in sent_messages)
+    assert not any(m.startswith("**恢复押注**") for m in sent_messages)
+    assert rt["stop_count"] == 3
+    assert rt["pause_countdown_active"] is True
+    assert rt["pause_countdown_total_rounds"] == 2
+    assert rt["period_profit"] == 0
+    assert rt["current_round"] == 2
+    assert rt["bet"] is False
+    assert rt["bet_on"] is False
+
+
+def test_process_bet_on_pause_countdown_refreshes_while_paused(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "5017"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "倒计时用户"},
+            "telegram": {"user_id": 5017},
+            "groups": {"admin_chat": 5017},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["manual_pause"] = False
+    rt["stop_count"] = 3
+    rt["pause_countdown_active"] = True
+    rt["pause_countdown_reason"] = "基础风控暂停"
+    rt["pause_countdown_total_rounds"] = 2
+    rt["pause_countdown_last_remaining"] = -1
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_cfg):
+        sent_messages.append(message)
+        return SimpleNamespace(chat_id=5017, id=len(sent_messages))
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    event = SimpleNamespace(reply_markup=object(), message=SimpleNamespace(message="unused"))
+    asyncio.run(zm.process_bet_on(SimpleNamespace(), event, ctx, {}))
+
+    assert rt["stop_count"] == 2
+    assert any("⏸️ 自动暂停卡" in m for m in sent_messages)
+    assert any("倒计时：剩 1 局" in m for m in sent_messages)
+    assert not any(m.startswith("**恢复押注**") for m in sent_messages)

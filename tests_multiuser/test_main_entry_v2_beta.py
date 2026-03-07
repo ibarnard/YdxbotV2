@@ -164,6 +164,8 @@ def test_interaction_journal_records_and_reads_recent_events(tmp_path):
         target=5721909476,
         message="test dashboard",
         ok=True,
+        msg_type="dashboard",
+        message_kind="dashboard",
     )
 
     records = interaction_journal.read_recent_events(ctx, 5)
@@ -175,6 +177,8 @@ def test_interaction_journal_records_and_reads_recent_events(tmp_path):
     assert records[0]["kind"] == "command"
     assert records[1]["kind"] == "inbound"
     assert records[2]["kind"] == "message"
+    assert records[2]["msg_type"] == "dashboard"
+    assert records[2]["message_kind"] == "dashboard"
     assert command_records[0]["kind"] == "command"
     assert inbound_records[0]["kind"] == "inbound"
     assert outbound_records[0]["kind"] == "message"

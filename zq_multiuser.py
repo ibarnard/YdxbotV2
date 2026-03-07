@@ -1141,6 +1141,7 @@ async def _send_tg_bot_notification(
                 target=chat_id,
                 message=text,
                 ok=True,
+                message_kind=channel_name,
             )
         except Exception as e:
             interaction_journal.record_message(
@@ -1150,6 +1151,7 @@ async def _send_tg_bot_notification(
                 message=text,
                 ok=False,
                 error=str(e),
+                message_kind=channel_name,
             )
             runtime_stability.record_runtime_fault(
                 user_ctx,
@@ -1169,7 +1171,8 @@ async def send_message_v2(
     global_config: dict,
     parse_mode: str = "markdown",
     title=None,
-    desp=None
+    desp=None,
+    journal_kind: str = "",
 ):
     """新版统一消息发送函数（多用户版）- 严格按路由表分发。"""
     routing = MESSAGE_ROUTING_TABLE.get(msg_type)
@@ -1200,6 +1203,8 @@ async def send_message_v2(
                     message=admin_message,
                     ok=True,
                     parse_mode=parse_mode,
+                    msg_type=msg_type,
+                    message_kind=journal_kind,
                 )
         except Exception as e:
             interaction_journal.record_message(
@@ -1210,6 +1215,8 @@ async def send_message_v2(
                 ok=False,
                 error=str(e),
                 parse_mode=parse_mode,
+                msg_type=msg_type,
+                message_kind=journal_kind,
             )
             runtime_stability.record_runtime_fault(
                 user_ctx,
@@ -1244,6 +1251,42 @@ async def send_message_v2(
         )
 
     return sent_message
+
+
+async def _send_message_v2_safe(
+    client,
+    msg_type: str,
+    message: str,
+    user_ctx: UserContext,
+    global_config: dict,
+    parse_mode: str = "markdown",
+    title=None,
+    desp=None,
+    journal_kind: str = "",
+):
+    try:
+        return await send_message_v2(
+            client,
+            msg_type,
+            message,
+            user_ctx,
+            global_config,
+            parse_mode=parse_mode,
+            title=title,
+            desp=desp,
+            journal_kind=journal_kind,
+        )
+    except TypeError:
+        return await send_message_v2(
+            client,
+            msg_type,
+            message,
+            user_ctx,
+            global_config,
+            parse_mode=parse_mode,
+            title=title,
+            desp=desp,
+        )
 
 
 # 兼容旧接口
@@ -1297,8 +1340,25 @@ async def send_message(
     return None
 
 
-async def send_to_admin(client, message: str, user_ctx: UserContext, global_config: dict):
-    return await send_message_v2(client, "info", message, user_ctx, global_config)
+async def send_to_admin(
+    client,
+    message: str,
+    user_ctx: UserContext,
+    global_config: dict,
+    *,
+    msg_type: str = "info",
+    journal_kind: str = "",
+    parse_mode: str = "markdown",
+):
+    return await _send_message_v2_safe(
+        client,
+        msg_type,
+        message,
+        user_ctx,
+        global_config,
+        parse_mode=parse_mode,
+        journal_kind=journal_kind,
+    )
 
 
 async def _refresh_admin_dashboard(client, user_ctx: UserContext, global_config: dict):
@@ -1308,7 +1368,14 @@ async def _refresh_admin_dashboard(client, user_ctx: UserContext, global_config:
     except Exception:
         pass
     dashboard = format_dashboard(user_ctx)
-    user_ctx.dashboard_message = await send_to_admin(client, dashboard, user_ctx, global_config)
+    user_ctx.dashboard_message = await _send_message_v2_safe(
+        client,
+        "dashboard",
+        dashboard,
+        user_ctx,
+        global_config,
+        journal_kind="dashboard",
+    )
     return user_ctx.dashboard_message
 
 
@@ -1339,6 +1406,7 @@ async def send_to_watch(
                 message=watch_message,
                 ok=True,
                 parse_mode=parse_mode,
+                message_kind="watch_event",
             )
     except Exception as e:
         interaction_journal.record_message(
@@ -1349,6 +1417,7 @@ async def send_to_watch(
             ok=False,
             error=str(e),
             parse_mode=parse_mode,
+            message_kind="watch_event",
         )
         runtime_stability.record_runtime_fault(
             user_ctx,
@@ -1377,7 +1446,17 @@ async def _send_watch_query_result(
     global_config: dict,
 ):
     """手动 watch 查询统一回 admin_chat，主动播报仍走 watch 通道。"""
-    return await send_to_admin(client, message, user_ctx, global_config)
+    try:
+        return await send_to_admin(
+            client,
+            message,
+            user_ctx,
+            global_config,
+            msg_type="info",
+            journal_kind="command_result",
+        )
+    except TypeError:
+        return await send_to_admin(client, message, user_ctx, global_config)
 
 
 async def _reply_admin_command_result(
@@ -1389,13 +1468,14 @@ async def _reply_admin_command_result(
     parse_mode: str = "markdown",
 ):
     """命令类反馈统一回 admin_chat，避免 reply/send 分散导致观察链路断裂。"""
-    return await send_message_v2(
+    return await _send_message_v2_safe(
         client,
         "info",
         message,
         user_ctx,
         global_config,
         parse_mode=parse_mode,
+        journal_kind="command_result",
     )
 
 
@@ -1484,6 +1564,8 @@ async def _send_transient_admin_notice(
     message: str,
     ttl_seconds: int = 120,
     attr_name: str = "transient_notice_message",
+    msg_type: str = "info",
+    journal_kind: str = "runtime_event",
 ):
     """
     发送“短时说明通知”（用于暂停结束/恢复等状态提示）：
@@ -1493,7 +1575,17 @@ async def _send_transient_admin_notice(
     old_message = getattr(user_ctx, attr_name, None)
     if old_message:
         await cleanup_message(client, old_message)
-    sent = await send_to_admin(client, message, user_ctx, global_config)
+    try:
+        sent = await send_to_admin(
+            client,
+            message,
+            user_ctx,
+            global_config,
+            msg_type=msg_type,
+            journal_kind=journal_kind,
+        )
+    except TypeError:
+        sent = await send_to_admin(client, message, user_ctx, global_config)
     if sent:
         setattr(user_ctx, attr_name, sent)
         chat_id = getattr(sent, "chat_id", None)
@@ -2334,9 +2426,14 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
 
                     if not is_fund_available(user_ctx, current_need):
                         if not rt.get("fund_pause_notified", False):
-                            display_fund = max(0, rt.get("gambling_fund", 0))
-                            mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
-                            await send_message_v2(
+                            mes = _build_fund_status_card(
+                                user_ctx,
+                                action="菠菜资金不足，已暂停押注",
+                                reason="观望前检测到资金不足",
+                                next_amount=current_need,
+                                hint="可用 `gf [金额]` 补资金后继续",
+                            )
+                            await _send_message_v2_safe(
                                 client,
                                 "fund_pause",
                                 mes,
@@ -2344,6 +2441,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                                 global_config,
                                 title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
                                 desp=mes,
+                                journal_kind="runtime_event",
                             )
                             await _emit_watch_event(
                                 client,
@@ -2375,14 +2473,16 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                         client,
                         user_ctx,
                         global_config,
-                        (
-                            "🧭 本局模型判定为观望\n"
-                            f"触发点：第 {next_sequence} 手\n"
-                            f"依据：{rt.get('last_predict_info', '信号冲突')}\n"
-                            "动作：不下注，等待下一局新信号"
+                        _build_observe_card(
+                            user_ctx,
+                            action="模型建议观望，本局不下注",
+                            reason=str(rt.get("last_predict_info", "") or "信号冲突"),
+                            current_text=f"第 {next_sequence} 手前判定 | 本局保持空仓",
+                            signal_text=_format_predict_signal_brief(rt),
                         ),
                         ttl_seconds=90,
                         attr_name="risk_pause_message",
+                        journal_kind="runtime_event",
                     )
                 rt["last_execution_action"] = "strategy_observe"
                 rt["last_blocked_by"] = ""
@@ -2493,9 +2593,20 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 client,
                 user_ctx,
                 global_config,
-                risk_control.build_fk1_message(fk1_result, analysis_snapshot),
+                _build_observe_card(
+                    user_ctx,
+                    action=str(fk1_result.get("action_text", "盘面风控建议观望，本局不下注") or "盘面风控建议观望，本局不下注"),
+                    reason=str(fk1_result.get("reason_text", "") or "当前盘面证据不足"),
+                    current_text=(
+                        f"盘面 {str(fk1_result.get('regime_label', analysis_snapshot.get('regime_label', '震荡盘')) or '震荡盘')} | "
+                        f"相似样本 {int(fk1_result.get('similar_count', 0) or 0)}"
+                    ),
+                    hint="等待下一局新信号",
+                ),
                 ttl_seconds=90,
                 attr_name="risk_pause_message",
+                msg_type="risk_pause",
+                journal_kind="runtime_event",
             )
             user_ctx.save_state()
             return
@@ -2564,9 +2675,14 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
 
             if not is_fund_available(user_ctx, preview_bet_amount):
                 if not rt.get("fund_pause_notified", False):
-                    display_fund = max(0, rt.get("gambling_fund", 0))
-                    mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
-                    await send_message_v2(
+                    mes = _build_fund_status_card(
+                        user_ctx,
+                        action="菠菜资金不足，已暂停押注",
+                        reason="下注前检测到资金不足",
+                        next_amount=preview_bet_amount,
+                        hint="可用 `gf [金额]` 补资金后继续",
+                    )
+                    await _send_message_v2_safe(
                         client,
                         "fund_pause",
                         mes,
@@ -2574,6 +2690,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                         global_config,
                         title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
                         desp=mes,
+                        journal_kind="runtime_event",
                     )
                     rt["fund_pause_notified"] = True
                 rt["bet"] = False
@@ -2672,9 +2789,14 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
 
             if not is_fund_available(user_ctx, bet_amount):
                 if not rt.get("fund_pause_notified", False):
-                    display_fund = max(0, rt.get("gambling_fund", 0))
-                    mes = f"**菠菜资金不足，已暂停押注**\n当前剩余：{display_fund / 10000:.2f} 万\n请使用 `gf [金额]` 恢复"
-                    await send_message_v2(
+                    mes = _build_fund_status_card(
+                        user_ctx,
+                        action="菠菜资金不足，已暂停押注",
+                        reason="真实下注前资金不足",
+                        next_amount=bet_amount,
+                        hint="可用 `gf [金额]` 补资金后继续",
+                    )
+                    await _send_message_v2_safe(
                         client,
                         "fund_pause",
                         mes,
@@ -2682,6 +2804,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                         global_config,
                         title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
                         desp=mes,
+                        journal_kind="runtime_event",
                     )
                     rt["fund_pause_notified"] = True
                 rt["bet"] = False
@@ -3727,16 +3850,19 @@ async def _apply_entry_gate_pause(
     else:
         wr_text = "样本不足（N/A）"
 
-    pause_msg = (
-        "⛔ 高倍入场暂停（已生效）\n"
-        f"触发点：第 {next_sequence} 手下注前\n"
-        f"触发类型：{gate.get('gate_name', '高倍入场门控')}\n"
-        f"当前信号：标签 {gate.get('tag', 'UNKNOWN')} | 置信度 {gate.get('confidence', 0)}% | 来源 {gate.get('source', 'unknown')}\n"
-        f"最近胜率：{wr_text}\n"
-        f"未通过条件：{gate.get('reason_text', '信号质量不足')}\n"
-        f"本次暂停：{pause_rounds} 局\n"
-        "暂停期间：保留当前倍投进度，不会重置首注\n"
-        f"{_build_pause_resume_hint(rt)}"
+    pause_msg = _build_auto_pause_card(
+        user_ctx,
+        action=f"{gate.get('gate_name', '高倍入场门控')}，已暂停 {pause_rounds} 局",
+        reason=str(gate.get("reason_text", "入场风控未通过") or "入场风控未通过"),
+        remaining_rounds=pause_rounds,
+        total_rounds=pause_rounds,
+        current_text=f"第 {next_sequence} 手下注前阻断 | 最近胜率 {wr_text}",
+        signal_text=(
+            f"标签 {gate.get('tag', 'UNKNOWN')} | "
+            f"置信度 {gate.get('confidence', 0)}% | 来源 {gate.get('source', 'unknown')}"
+        ),
+        hint="暂停期间保留当前倍投进度，不会重置首注",
+        extra_lines=[_build_pause_resume_hint(rt)],
     )
 
     if hasattr(user_ctx, "risk_pause_message") and user_ctx.risk_pause_message:
@@ -4063,14 +4189,19 @@ async def _refresh_pause_countdown_notice(
     reason = str(rt.get("pause_countdown_reason", "自动暂停")).strip() or "自动暂停"
     progress_rounds = max(0, total_rounds - remaining_rounds)
     resume_hint = _build_pause_resume_hint(rt)
-    countdown_msg = (
-        "⏸️⏸️ 暂停倒计时提醒（自动）⏸️⏸️\n\n"
-        f"📌 暂停原因：{reason}\n"
-        "🧱 当前状态：暂停中，本局不会下注\n"
-        f"🔢 倒计时：{remaining_rounds} 局\n"
-        f"📊 暂停进度：{progress_rounds}/{total_rounds}\n"
-        f"🔄 {resume_hint}\n"
-        "ℹ️ 若恢复时仍不满足风控门槛，会再次自动暂停"
+    countdown_msg = _build_auto_pause_card(
+        user_ctx,
+        action=f"{reason}，已暂停 {total_rounds} 局",
+        reason=reason,
+        remaining_rounds=remaining_rounds,
+        total_rounds=total_rounds,
+        current_text="自动暂停中，本局不会下注",
+        signal_text=_format_predict_signal_brief(rt) if str(rt.get("last_predict_source", "") or "").strip() else "",
+        hint="若恢复时仍不满足风控门槛，会再次自动暂停",
+        extra_lines=[
+            f"已完成：{progress_rounds} 局",
+            resume_hint,
+        ],
     )
 
     if hasattr(user_ctx, "pause_countdown_message") and user_ctx.pause_countdown_message:
@@ -4562,6 +4693,8 @@ def _build_transition_card(
     reason: str = "",
     hint: str = "",
     current_text: str = "",
+    signal_text: str = "",
+    extra_lines: Optional[List[str]] = None,
 ) -> str:
     lines = [
         title,
@@ -4572,9 +4705,91 @@ def _build_transition_card(
     ]
     if reason:
         lines.append(f"原因：{_compact_multiline_text(reason, max_len=120)}")
+    if signal_text:
+        lines.append(f"信号：{_compact_multiline_text(signal_text, max_len=120)}")
+    for line in extra_lines or []:
+        clean = _compact_multiline_text(line, max_len=120)
+        if clean:
+            lines.append(clean)
     if hint:
         lines.append(f"下一步：{_compact_multiline_text(hint, max_len=120)}")
     return "\n".join(lines)
+
+
+def _build_auto_pause_card(
+    user_ctx: UserContext,
+    *,
+    action: str,
+    reason: str,
+    remaining_rounds: int,
+    total_rounds: int = 0,
+    current_text: str = "",
+    signal_text: str = "",
+    hint: str = "",
+    extra_lines: Optional[List[str]] = None,
+) -> str:
+    details = [f"倒计时：剩 {max(0, int(remaining_rounds))} 局"]
+    if total_rounds > 0:
+        finished = max(0, int(total_rounds) - max(0, int(remaining_rounds)))
+        details.append(f"进度：{finished}/{int(total_rounds)}")
+    details.extend(extra_lines or [])
+    return _build_transition_card(
+        user_ctx,
+        title="⏸️ 自动暂停卡",
+        action=action,
+        reason=reason,
+        current_text=current_text or "自动暂停中，本局不会下注",
+        signal_text=signal_text,
+        extra_lines=details,
+        hint=hint or "倒计时结束后会先复核，再决定是否恢复下注",
+    )
+
+
+def _build_observe_card(
+    user_ctx: UserContext,
+    *,
+    action: str,
+    reason: str,
+    current_text: str = "",
+    signal_text: str = "",
+    hint: str = "等待下一局新信号",
+    extra_lines: Optional[List[str]] = None,
+) -> str:
+    return _build_transition_card(
+        user_ctx,
+        title="🧭 观望卡",
+        action=action,
+        reason=reason,
+        current_text=current_text or "本局不下注，保持空仓",
+        signal_text=signal_text,
+        extra_lines=extra_lines,
+        hint=hint,
+    )
+
+
+def _build_fund_status_card(
+    user_ctx: UserContext,
+    *,
+    action: str,
+    reason: str,
+    next_amount: int,
+    hint: str,
+    title: str = "💰 资金状态卡",
+    current_text: str = "",
+) -> str:
+    rt = user_ctx.state.runtime
+    return _build_transition_card(
+        user_ctx,
+        title=title,
+        action=action,
+        reason=reason,
+        current_text=(
+            current_text
+            or f"资金 {rt.get('gambling_fund', 0) / 10000:.2f} 万 | 接续金额 {format_number(next_amount)}"
+        ),
+        extra_lines=[f"账户：{_dashboard_balance_text(rt)}"],
+        hint=hint,
+    )
 
 
 def _build_manual_pause_card(user_ctx: UserContext, *, already_paused: bool = False) -> str:
@@ -4622,7 +4837,8 @@ def _build_auto_resume_card(
         current_text=(
             f"已执行第 {sequence_count} 手 | {_render_direction_label(direction)} | {format_number(amount)}"
         ),
-    ) + f"\n信号：{_compact_multiline_text(_format_predict_signal_brief(user_ctx.state.runtime), max_len=120)}"
+        signal_text=_format_predict_signal_brief(user_ctx.state.runtime),
+    )
 
 
 def _build_bet_event_card(
@@ -4890,13 +5106,14 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
 
                 if not is_fund_available(user_ctx, next_bet_amount):
                     if not rt.get("fund_pause_notified", False):
-                        display_fund = max(0, rt.get("gambling_fund", 0))
-                        mes = (
-                            f"**菠菜资金不足，已暂停押注**\n"
-                            f"当前剩余：{display_fund / 10000:.2f} 万\n"
-                            "请使用 `gf [金额]` 恢复"
+                        mes = _build_fund_status_card(
+                            user_ctx,
+                            action="菠菜资金不足，已暂停押注",
+                            reason="结算后检测到下一手资金不足",
+                            next_amount=next_bet_amount,
+                            hint="可用 `gf [金额]` 补资金后继续",
                         )
-                        await send_message_v2(
+                        await _send_message_v2_safe(
                             client,
                             "fund_pause",
                             mes,
@@ -4904,6 +5121,7 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                             global_config,
                             title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
                             desp=mes,
+                            journal_kind="runtime_event",
                         )
                         rt["fund_pause_notified"] = True
                     rt["bet"] = False
@@ -7261,11 +7479,12 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
         rt["pause_count"] = 0
         rt["fund_pause_notified"] = False
         user_ctx.save_state()
-        mes = (
-            "✅ 资金条件已满足，恢复可下注状态\n"
-            f"当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n"
-            f"接续倍投金额：{format_number(next_bet_amount)}\n"
-            "说明：本提示仅表示“可下注”，实际下注仍以盘口事件触发为准"
+        mes = _build_fund_status_card(
+            user_ctx,
+            action="资金条件已满足，恢复可下注状态",
+            reason="当前资金已覆盖接续倍投金额",
+            next_amount=next_bet_amount,
+            hint="本提示仅表示可下注，真实下单仍以盘口事件触发为准",
         )
         await _send_transient_admin_notice(
             client,
@@ -7274,6 +7493,7 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
             mes,
             ttl_seconds=120,
             attr_name="status_transition_message",
+            journal_kind="runtime_event",
         )
         await _emit_watch_event(
             client,
@@ -7307,11 +7527,12 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
             rt["pause_count"] = 0
             rt["fund_pause_notified"] = False
             user_ctx.save_state()
-            mes = (
-                "✅ 资金同步后已恢复可下注状态\n"
-                f"当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n"
-                f"接续倍投金额：{format_number(next_bet_amount)}\n"
-                "说明：本提示仅表示“可下注”，实际下注仍以盘口事件触发为准"
+            mes = _build_fund_status_card(
+                user_ctx,
+                action="资金同步后已恢复可下注状态",
+                reason="账户资金已同步到菠菜资金",
+                next_amount=next_bet_amount,
+                hint="本提示仅表示可下注，真实下单仍以盘口事件触发为准",
             )
             await _send_transient_admin_notice(
                 client,
@@ -7320,6 +7541,7 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
                 mes,
                 ttl_seconds=120,
                 attr_name="status_transition_message",
+                journal_kind="runtime_event",
             )
             await _emit_watch_event(
                 client,
@@ -7337,8 +7559,14 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
         rt["mode_stop"] = True
         _clear_lose_recovery_tracking(rt)
         if not rt.get("fund_pause_notified", False):
-            mes = "⚠️ 菠菜资金不足，已自动暂停押注"
-            await send_message_v2(
+            mes = _build_fund_status_card(
+                user_ctx,
+                action="菠菜资金不足，已自动暂停押注",
+                reason="当前资金低于接续倍投金额",
+                next_amount=next_bet_amount,
+                hint="补资金后脚本会恢复到可下注状态",
+            )
+            await _send_message_v2_safe(
                 client,
                 "fund_pause",
                 mes,
@@ -7346,6 +7574,7 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
                 global_config,
                 title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
                 desp=mes,
+                journal_kind="runtime_event",
             )
             await _emit_watch_event(
                 client,
