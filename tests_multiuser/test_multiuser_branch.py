@@ -138,6 +138,40 @@ def test_model_manager_apply_shared_config_uses_shared_chain():
     assert mgr.get_model("2")["model_id"] == "model-2"
 
 
+def test_model_manager_call_model_immediately_falls_back_to_next_ranked_model():
+    mgr = ModelManager()
+    mgr.apply_shared_config(
+        {
+            "ai": {
+                "enabled": True,
+                "api_keys": ["k1"],
+                "base_url": "https://apis.iflow.cn/v1",
+                "models": {
+                    "1": {"model_id": "model-1", "enabled": True},
+                    "2": {"model_id": "model-2", "enabled": True},
+                },
+                "fallback_chain": ["1", "2"],
+            }
+        }
+    )
+
+    async def fake_iflow(config, messages, **kwargs):
+        if config["model_id"] == "model-1":
+            return {"success": False, "error": "model-1 unavailable", "content": ""}
+        return {"success": True, "error": "", "content": '{"prediction": 1}'}
+
+    mgr._call_iflow = fake_iflow
+
+    result = asyncio.run(
+        mgr.call_model("model-1", [{"role": "user", "content": "ping"}], temperature=0.1, max_tokens=10)
+    )
+
+    assert result["success"] is True
+    assert result["model_id"] == "model-2"
+    assert result["requested_model_id"] == "model-1"
+    assert result["fallback_used"] is True
+
+
 def test_parse_analysis_result_insight_supports_skip_prediction():
     parsed = zm.parse_analysis_result_insight(
         '{"prediction":"SKIP","confidence":66,"reason":"证据冲突"}',
@@ -2685,8 +2719,6 @@ def test_process_red_packet_ignores_game_message(tmp_path, monkeypatch):
 
     assert event.clicked == []
     assert sent["called"] is False
-
-
 def test_compute_replay_linkage_coverage_only_counts_settled_records():
     settled_tokens = next(
         const
@@ -2855,6 +2887,50 @@ def test_process_bet_on_records_decision_linkage_fields(tmp_path, monkeypatch):
     assert rt["pending_bet_id"] == entry["bet_id"]
 
 
+def test_predict_next_bet_v10_updates_current_model_after_fallback(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "fallback_model_user"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "闄嶇骇妯″瀷鐢ㄦ埛"},
+            "telegram": {"user_id": 70121},
+            "groups": {"admin_chat": 70121},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+            "ai": {
+                "enabled": True,
+                "api_keys": ["k1"],
+                "models": {
+                    "1": {"model_id": "model-1", "enabled": True},
+                    "2": {"model_id": "model-2", "enabled": True},
+                },
+                "fallback_chain": ["1", "2"],
+            },
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    ctx.state.history = [0, 1] * 30
+    rt = ctx.state.runtime
+    rt["current_model_id"] = "model-1"
+
+    class FakeModelManager:
+        async def call_model(self, model_id, messages, **kwargs):
+            assert model_id == "model-1"
+            return {
+                "success": True,
+                "error": "",
+                "content": '{"prediction": 1, "confidence": 91, "reason": "fallback"}',
+                "model_id": "model-2",
+                "requested_model_id": "model-1",
+                "fallback_used": True,
+            }
+
+    monkeypatch.setattr(ctx, "get_model_manager", lambda: FakeModelManager())
+
+    prediction = asyncio.run(zm.predict_next_bet_v10(ctx, {}))
+
+    assert prediction == 1
+    assert rt["current_model_id"] == "model-2"
+    assert '"model_id": "model-2"' in rt["last_logic_audit"]
 def test_process_settle_updates_target_pending_entry_by_pending_bet_id(tmp_path, monkeypatch):
     settled_tokens = next(
         const

@@ -88,6 +88,7 @@ class _FakeClient:
 def test_single_account_startup_and_one_bet_settle_loop(tmp_path, monkeypatch):
     clear_registered_user_contexts()
     ctx = _make_user_context(tmp_path, user_id=9961)
+    initial_gambling_fund = int(ctx.state.runtime.get("gambling_fund", 0) or 0)
     client = _FakeClient()
     admin_messages = []
     routed_messages = []
@@ -228,7 +229,7 @@ def test_single_account_startup_and_one_bet_settle_loop(tmp_path, monkeypatch):
 
     assert started_client is client
     assert {"bet_on_handler", "settle_handler", "red_packet_handler", "user_handler"}.issubset(set(client.handlers.keys()))
-    assert ctx.state.runtime["gambling_fund"] == 1_000_000
+    assert ctx.state.runtime["gambling_fund"] == initial_gambling_fund
     assert ctx.state.runtime["account_balance"] == 1_000_000
     assert client.sent_messages
 

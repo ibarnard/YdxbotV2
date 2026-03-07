@@ -875,7 +875,11 @@ def get_bet_status_text(rt: Dict[str, Any]) -> str:
         if total_rounds > 0 and 0 < last_remaining <= total_rounds:
             remaining_rounds = last_remaining
         elif total_rounds > 0 and stop_count > 0:
-            remaining_rounds = total_rounds if stop_count > total_rounds else stop_count
+            # 兼容内部 stop_count=暂停局数+1 的实现细节，展示时尽量贴近“真实剩余局数”。
+            if stop_count > total_rounds:
+                remaining_rounds = total_rounds
+            else:
+                remaining_rounds = stop_count
         elif stop_count > 0:
             remaining_rounds = max(0, stop_count - 1)
 
@@ -1670,6 +1674,7 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
         # ========== 第三步：深度博弈推理Prompt（M-SMP架构） ==========
         
         current_model_id = rt.get('current_model_id', 'qwen3-coder-plus')
+        actual_model_id = current_model_id
         
         prompt = f"""[System Instruction]
 你是专门破解博弈陷阱的量化交易员。你可以在证据不足时输出 SKIP（-1），避免低质量交易。
@@ -1747,6 +1752,18 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
                 raise Exception(f"Model Error: {result['error']}")
 
             _clear_ai_key_issue(rt)
+            actual_model_id = str(result.get("model_id") or current_model_id)
+            if actual_model_id != current_model_id:
+                rt["current_model_id"] = actual_model_id
+                log_event(
+                    logging.WARNING,
+                    'predict_v10',
+                    '主模型不可用，已按排序自动降级',
+                    user_id=user_ctx.user_id,
+                    data=f'{current_model_id} -> {actual_model_id}'
+                )
+                user_ctx.save_state()
+                current_model_id = actual_model_id
             
             default_pred = trend_gap['regression_target']
             final_result = parse_analysis_result_insight(result['content'], default_prediction=default_pred)
@@ -1799,7 +1816,7 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
             "mode": "M-SMP",
             "input_payload": payload,
             "output": final_result,
-            "model_id": current_model_id,
+            "model_id": actual_model_id,
             "prediction_source": rt.get("last_predict_source", "unknown"),
             "pattern_tag": pattern_tag,
             "policy_id": str(policy_context.get("policy_id", "") or ""),
