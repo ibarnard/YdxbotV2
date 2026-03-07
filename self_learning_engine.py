@@ -1785,23 +1785,25 @@ def build_learning_overview_text(user_ctx) -> str:
         status = str(item.get("status", LEARNING_STATUS_GENERATED) or LEARNING_STATUS_GENERATED)
         status_counter[status] = status_counter.get(status, 0) + 1
     status_text = " / ".join(f"{key}:{value}" for key, value in sorted(status_counter.items())) or "无"
+    latest_label = str(latest.get("candidate_version", "") or latest.get("candidate_id", "") or "-")
+    latest_summary = str(latest.get("summary", "") or "-")
+    active_shadow_text = active_shadow.get("candidate_version", "-") if active_shadow else "-"
+    active_gray_text = active_gray.get("candidate_version", "-") if active_gray else "-"
+    promoted_text = promoted.get("candidate_version", "-") if promoted else "-"
     lines = [
         "🧠 受控自学习中心",
-        "",
-        "当前实现：H1/H2/H3/H4/H5 已启用（候选中心 / 规则生成 / 离线评估 / 影子验证 / 灰度转正回滚）",
         f"当前策略：{active_policy.get('policy_id', '')}@{active_policy.get('policy_version', '')} ({active_policy.get('policy_mode', '')})",
-        f"候选总数：{len(candidates)}",
+        f"学习状态：候选 {len(candidates)} 个 | 影子 {active_shadow_text} | 灰度 {active_gray_text} | 最近转正 {promoted_text}",
         f"状态分布：{status_text}",
-        f"最近生成：{center.get('last_generated_at', '') or '-'}",
-        f"最近候选：{latest.get('candidate_id', '') or '-'}",
-        f"候选摘要：{latest.get('summary', '') or '-'}",
+        (
+            f"最近动作：生成 {center.get('last_generated_at', '') or '-'} | "
+            f"影子 {center.get('last_shadow_recorded_at', '') or '-'} | "
+            f"晋退 {center.get('last_promotion_event_at', '') or '-'}"
+        ),
+        f"最近候选：{latest_label} | {latest_summary}",
         f"最近评估：{latest.get('last_evaluation_status', '') or '-'} / {latest.get('last_score_total', '-')}",
-        f"影子运行：{active_shadow.get('candidate_version', '-') if active_shadow else '-'}",
-        f"灰度运行：{active_gray.get('candidate_version', '-') if active_gray else '-'}",
-        f"最近转正：{promoted.get('candidate_version', '-') if promoted else '-'}",
-        f"最近影子：{center.get('last_shadow_recorded_at', '') or '-'}",
-        f"最近晋退事件：{center.get('last_promotion_event_at', '') or '-'}",
         "",
+        "建议：先看 `watch learn`，再用 `learn list` / `learn show <id|cX>` 深看。",
         "命令：`learn` / `learn gen` / `learn list` / `learn show <id|cX>` / `learn eval [id|cX]`",
         "影子：`learn shadow` / `learn shadow <id|cX> on` / `learn shadow off`",
         "灰度：`learn gray <id|cX> [当前账号名|ID]` / `learn promote <id|cX>` / `learn rollback`",

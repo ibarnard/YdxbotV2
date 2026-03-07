@@ -708,14 +708,18 @@ def _dashboard_learning_focus_text(user_ctx: UserContext) -> str:
             str(center.get("promoted_candidate_id", "") or ""),
         )
         if active_gray:
-            return f"gray {active_gray.get('candidate_version', '-') or '-'}"
+            return f"灰度 {active_gray.get('candidate_version', '-') or '-'}"
         if active_shadow:
-            return f"shadow {active_shadow.get('candidate_version', '-') or '-'}"
+            return f"影子 {active_shadow.get('candidate_version', '-') or '-'}"
         if promoted:
-            return f"promoted {promoted.get('candidate_version', '-') or '-'}"
+            return f"已转正 {promoted.get('candidate_version', '-') or '-'}"
     except Exception:
         pass
     return "无"
+
+
+def _policy_mode_text(mode: str) -> str:
+    return "基线" if str(mode or "baseline") == "baseline" else "灰度"
 
 
 # 仪表盘格式化 - admin 驾驶舱 V1
@@ -808,17 +812,23 @@ def format_dashboard(user_ctx: UserContext) -> str:
 
     risk_modes = _normalize_risk_switches(rt, apply_default=False)
     win_rate_24h = float(overview_24h.get("win_rate", 0.0) or 0.0) * 100
+    period_profit_text = _format_signed_amount(rt.get("period_profit", 0))
+    earnings_text = _format_signed_amount(rt.get("earnings", 0))
+    pnl_24h_text = _format_signed_amount(overview_24h.get("pnl_total", 0))
     lines = [
         "📍 Admin 驾驶舱",
         (
-            f"账号：{user_ctx.config.name.strip()} | 刷新：{datetime.now().strftime('%H:%M:%S')} | "
-            f"版本：{get_software_version_text()}"
+            f"账号：{user_ctx.config.name.strip()} | 刷新 {datetime.now().strftime('%H:%M:%S')} | "
+            f"版本 {get_software_version_text()}"
         ),
-        f"脚本：{status_text} | 模式：{mode_text} | 模型：{rt.get('current_model_id', 'unknown')}",
-        f"🔢 **软件版本：{get_software_version_text()}**",
-        f"🚦 **当前押注状态：{status_text}**",
-        f"📋 **预设名称：{current_preset_name}**",
-        f"🤖 **预设参数：{preset_params}**",
+        f"状态：{status_text} | 模式 {mode_text} | 模型 {rt.get('current_model_id', 'unknown')}",
+        (
+            f"策略：{current_preset_name} -> {dynamic_tier} | "
+            f"policy {policy_version}/{_policy_mode_text(policy_mode)} | learn {learning_text}"
+        ),
+        f"任务：{current_run_text}",
+        f"资金：账户 {balance_text} | 菠菜 {_format_amount_wan(display_fund)}",
+        f"收益：本局 {period_profit_text} | 累计 {earnings_text} | 24h {pnl_24h_text}",
         "",
         "📊 近 40 盘结果（由近及远）",
         _format_dashboard_results(history),
@@ -827,33 +837,27 @@ def format_dashboard(user_ctx: UserContext) -> str:
         f"判断：{current_action_text} | 限档 {current_tier_cap} | 相似样本 {_safe_int(similar_cases.get('similar_count', 0), 0)}",
         f"手况：{pending_text}",
         f"上手：{last_settled_text}",
-        f"局面：{current_episode_text}",
-        f"轮次：{current_run_text}",
-        (
-            f"策略：{current_preset_name} -> {dynamic_tier} | policy {policy_version} ({policy_mode}) | "
-            f"learn {learning_text}"
-        ),
+        f"当前局：{current_episode_text}",
         (
             f"参数：首注 {format_number(rt.get('initial_amount', 500) or 500)} | "
-            f"连投上限 {rt.get('lose_stop', 13)} | 炸 {rt.get('explode', 5)} 停 {rt.get('stop', 3)} | "
-            f"倍率 {rt.get('lose_once', 3.0)}/{rt.get('lose_twice', 2.1)}/{rt.get('lose_three', 2.05)}/{rt.get('lose_four', 2.0)}"
+            f"连投上限 {rt.get('lose_stop', 13)} | 炸 {rt.get('explode', 5)} 停 {rt.get('stop', 3)}"
         ),
         (
-            f"资金：账户 {balance_text} | 菠菜 {_format_amount_wan(display_fund)} | "
-            f"本轮 {_format_amount_wan(rt.get('period_profit', 0))} | 总 {_format_amount_wan(rt.get('earnings', 0))}"
+            f"倍率：{rt.get('lose_once', 3.0)} / {rt.get('lose_twice', 2.1)} / "
+            f"{rt.get('lose_three', 2.05)} / {rt.get('lose_four', 2.0)}"
         ),
         (
             f"24h：样本 {_safe_int(overview_24h.get('settled_count', 0), 0)} | "
-            f"胜率 {win_rate_24h:.1f}% | 盈亏 {_safe_int(overview_24h.get('pnl_total', 0), 0):+,} | "
+            f"胜率 {win_rate_24h:.1f}% | "
             f"回撤 {_safe_int(overview_24h.get('max_drawdown', 0), 0):,} | "
             f"观望 {_safe_int(overview_24h.get('observe_count', 0), 0)} | 阻断 {_safe_int(overview_24h.get('blocked_count', 0), 0)}"
         ),
         (
             f"风控：fk1 {_risk_switch_label(risk_modes['fk1_enabled'])} / "
             f"fk2 {_risk_switch_label(risk_modes['fk2_enabled'])} / "
-            f"fk3 {_risk_switch_label(risk_modes['fk3_enabled'])} | 当前连输 {lose_count}"
+            f"fk3 {_risk_switch_label(risk_modes['fk3_enabled'])} | 连输 {lose_count}"
         ),
-        f"轮廓：dynamic {dynamic_base_tier}->{dynamic_tier} | round_key {current_round_key}",
+        f"执行档：{dynamic_base_tier} -> {dynamic_tier} | round_key {current_round_key}",
     ]
     return "\n".join(lines)
 
@@ -4531,7 +4535,7 @@ def _build_strategy_brief(user_ctx: UserContext, applied_tier: str = "") -> str:
     )
     policy_version = str(rt.get("policy_active_version", "-") or "-")
     policy_mode = str(rt.get("policy_active_mode", "baseline") or "baseline")
-    strategy_text = f"{current_preset_name} -> {current_tier} | policy {policy_version} ({policy_mode})"
+    strategy_text = f"{current_preset_name} -> {current_tier} | policy {policy_version}/{_policy_mode_text(policy_mode)}"
     learning_text = _dashboard_learning_focus_text(user_ctx)
     if learning_text != "无":
         strategy_text = f"{strategy_text} | learn {learning_text}"
@@ -4561,15 +4565,15 @@ def _build_transition_card(
 ) -> str:
     lines = [
         title,
+        f"账号：{user_ctx.config.name.strip()} | 脚本 {get_bet_status_text(user_ctx.state.runtime)}",
         f"动作：{action}",
-        f"脚本：{get_bet_status_text(user_ctx.state.runtime)}",
-        f"策略：{_build_strategy_brief(user_ctx)}",
         f"当前：{current_text or _build_status_context_brief(user_ctx)}",
+        f"策略：{_build_strategy_brief(user_ctx)}",
     ]
     if reason:
         lines.append(f"原因：{_compact_multiline_text(reason, max_len=120)}")
     if hint:
-        lines.append(f"提示：{_compact_multiline_text(hint, max_len=120)}")
+        lines.append(f"下一步：{_compact_multiline_text(hint, max_len=120)}")
     return "\n".join(lines)
 
 
@@ -4636,16 +4640,16 @@ def _build_bet_event_card(
     streak_len, streak_side = _get_current_streak(list(getattr(state, "history", []) or []))
     lines = [
         "🎯 下单卡",
-        f"手位：第 {sequence_count} 手 | {_render_direction_label(direction)} | {format_number(amount)}",
+        f"动作：第 {sequence_count} 手 | {_render_direction_label(direction)} | {format_number(amount)}",
         f"盘口：第 {_safe_int(rt.get('current_round', 0), 0)} 盘 | {str(rt.get('current_round_key', '') or '-')}",
-        f"bet_id：{bet_id or '-'}",
+        f"状态：待结算 | 当前连{streak_side}{streak_len}",
         f"策略：{_build_strategy_brief(user_ctx, applied_tier=applied_tier)}",
-        f"信号：{_compact_multiline_text(_format_predict_signal_brief(rt), max_len=120)}",
-        f"执行：待结算 | 当前连{streak_side}{streak_len}",
     ]
     compact_dynamic_summary = _compact_multiline_text(dynamic_summary, max_len=120)
     if compact_dynamic_summary:
-        lines.append(f"动态：{compact_dynamic_summary}")
+        lines.append(f"调整：{compact_dynamic_summary}")
+    lines.append(f"信号：{_compact_multiline_text(_format_predict_signal_brief(rt), max_len=120)}")
+    lines.append(f"bet_id：{bet_id or '-'}")
     return "\n".join(lines)
 
 
@@ -4667,17 +4671,17 @@ def _build_settle_event_card(
         "🧾 结算卡（押注结果）",
         f"结果：{result_text} {_format_signed_amount(profit)} | 开奖 {result_type}({result_num})",
         f"手位：第 {sequence_count} 手 | {_render_direction_label(direction)} | {format_number(bet_amount)}",
-        f"bet_id：{bet_label or '-'}",
         (
             f"收益：本手 {_format_signed_amount(profit)} | 本局 {_format_signed_amount(rt.get('period_profit', 0))} | "
             f"累计 {_format_signed_amount(rt.get('earnings', 0))}"
         ),
-        f"链路：连续押注 {max(sequence_count, _safe_int(rt.get('bet_sequence_count', 0), 0))} 次 | 当前连输 {_safe_int(rt.get('lose_count', 0), 0)}",
         f"资金：菠菜 {_format_amount_wan(rt.get('gambling_fund', 0))} | 账户 {_dashboard_balance_text(rt)}",
+        f"链路：连续押注 {max(sequence_count, _safe_int(rt.get('bet_sequence_count', 0), 0))} 次 | 当前连输 {_safe_int(rt.get('lose_count', 0), 0)}",
     ]
     signal_text = _compact_multiline_text(predict_info or rt.get("last_predict_info", "N/A"), max_len=120)
     if signal_text:
         lines.append(f"信号：{signal_text}")
+    lines.append(f"bet_id：{bet_label or '-'}")
     return "\n".join(lines)
 
 
@@ -5422,17 +5426,18 @@ async def handle_model_command_multiuser(client, event, args, user_ctx: UserCont
 
     if sub_cmd == "list":
         models = user_ctx.config.ai.get("models", {})
-        msg = "**可用模型列表**\n"
-        idx = 1
         current_model_id = rt.get("current_model_id", "")
-        
+        lines = ["🤖 模型卡", f"当前：`{current_model_id or '-'}`", "可用："]
+        idx = 1
         for k, m in models.items():
             if m.get("enabled", True):
-                status = "✅"
-                current = "👈 当前" if m.get('model_id') == current_model_id else ""
-                msg += f"{idx}. `{m.get('model_id', 'unknown')}` {status} {current}\n"
+                current = "（当前）" if m.get('model_id') == current_model_id else ""
+                lines.append(f"{idx}. `{m.get('model_id', 'unknown')}` {current}".rstrip())
                 idx += 1
-        await _reply_admin_command_result(client, event, msg, user_ctx, global_config)
+        if idx == 1:
+            lines.append("- 暂无可用模型")
+        lines.append("命令：`model select <编号|id>` / `model reload`")
+        await _reply_admin_command_result(client, event, "\n".join(lines), user_ctx, global_config)
         
     elif sub_cmd in ["select", "use", "switch"]:
         if len(args) < 2:
@@ -5473,7 +5478,14 @@ async def handle_model_command_multiuser(client, event, args, user_ctx: UserCont
         await _reply_admin_command_result(
             client,
             event,
-            f"🔄 正在切换模型 `{target_id}`...",
+            "\n".join(
+                [
+                    "🤖 模型卡",
+                    "动作：切换模型",
+                    f"目标：`{target_id}`",
+                    "当前：等待切换完成",
+                ]
+            ),
             user_ctx,
             global_config,
         )
@@ -5482,17 +5494,32 @@ async def handle_model_command_multiuser(client, event, args, user_ctx: UserCont
         rt["current_model_id"] = target_id
         user_ctx.save_state()
         
-        success_msg = (
-            f"✅ **模型切换成功**\n"
-            f"🤖 **当前模型**: `{target_id}`\n"
-            f"🔗 **连接状态**: 🟢 正常\n"
-            f"🧠 **算法模式**: V10 (已激活)"
+        success_msg = "\n".join(
+            [
+                "🤖 模型卡",
+                "动作：切换模型完成",
+                f"当前：`{target_id}`",
+                "状态：连接正常 | 算法 V10",
+                "下一步：后续预测将使用新模型",
+            ]
         )
         await _reply_admin_command_result(client, event, success_msg, user_ctx, global_config)
         log_event(logging.INFO, 'model', '切换模型', user_id=user_ctx.user_id, model=target_id)
             
     elif sub_cmd == "reload":
-        await _reply_admin_command_result(client, event, "🔄 重新加载模型配置...", user_ctx, global_config)
+        await _reply_admin_command_result(
+            client,
+            event,
+            "\n".join(
+                [
+                    "🤖 模型卡",
+                    "动作：重新加载模型配置",
+                    "当前：读取配置中...",
+                ]
+            ),
+            user_ctx,
+            global_config,
+        )
         try:
             user_ctx.reload_user_config()
             model_mgr = user_ctx.get_model_manager()
@@ -5508,7 +5535,14 @@ async def handle_model_command_multiuser(client, event, args, user_ctx: UserCont
             await _reply_admin_command_result(
                 client,
                 event,
-                f"✅ 模型配置已重新加载（可用模型：{enabled_count}）",
+                "\n".join(
+                    [
+                        "🤖 模型卡",
+                        "动作：重新加载模型配置完成",
+                        f"当前：可用模型 {enabled_count} 个",
+                        "下一步：如需切换，请发送 `model select <编号|id>`",
+                    ]
+                ),
                 user_ctx,
                 global_config,
             )
@@ -5517,7 +5551,13 @@ async def handle_model_command_multiuser(client, event, args, user_ctx: UserCont
             await _reply_admin_command_result(
                 client,
                 event,
-                f"❌ 模型配置重载失败：{str(e)[:120]}",
+                "\n".join(
+                    [
+                        "🤖 模型卡",
+                        "动作：重新加载模型配置失败",
+                        f"原因：{str(e)[:120]}",
+                    ]
+                ),
                 user_ctx,
                 global_config,
             )
@@ -5525,7 +5565,7 @@ async def handle_model_command_multiuser(client, event, args, user_ctx: UserCont
         await _reply_admin_command_result(
             client,
             event,
-            "未知命令。用法:\n`model list`\n`model select <id>`\n`model reload`",
+            "🤖 模型卡\n用法：`model list` / `model select <id>` / `model reload`",
             user_ctx,
             global_config,
         )
@@ -5839,45 +5879,13 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             else:
                 mes = """**命令速览**
 
-**先看状态**
-- `status` / `dashboard`
-- `watch`
-- `doctor`
-
-**常用控制**
-- `pause` / `resume`
-- `open` / `off`
-- `st <预设名>`
-
-**值守查询**
-- `watch risk`
-- `watch task`
-- `watch funds`
-- `watch learn`
-- `watch alerts`
-
-**任务与策略**
-- `task` / `task list`
-- `pkg` / `pkg list`
-- `policy` / `policy list`
-- `learn` / `learn list`
-
-**复盘与数据**
-- `fp brief` / `fp gaps` / `fp action`
-- `replay 3`
-- `explain`
-- `stats`
-- `balance`
-
-**模型与版本**
-- `model list` / `model select <id>` / `model reload`
-- `ver`
-
-**多账号**
-- `fleet`
-- `fleet task`
-- `fleet policy`
-- `fleet show <账号名|ID>`
+先看：`status` / `dashboard` / `watch` / `doctor`
+控制：`pause` / `resume` / `open` / `off` / `st <预设名>`
+值守：`watch risk` / `watch task` / `watch funds` / `watch learn` / `watch alerts`
+任务与策略：`task` / `pkg` / `policy` / `learn`
+复盘与数据：`fp brief` / `replay 3` / `explain` / `stats` / `balance`
+模型与版本：`model list` / `model select <id>` / `model reload` / `ver`
+多账号：`fleet` / `fleet task` / `fleet policy` / `fleet show <账号名|ID>`
 
 说明：
 - 命令回复统一回管理员 chat：`"""
@@ -6780,7 +6788,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 current_tag_exact = current.get("current_tag", "") or ""
                 nearest_tag = current.get("nearest_tag", "") or ""
                 if current_tag_exact:
-                    current_tag_display = current_tag_exact.upper()
+                    current_tag_display = current_tag_exact
                 elif nearest_tag:
                     current_tag_display = f"无（最近: {nearest_tag}）"
                 else:
@@ -6795,7 +6803,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
                 latest_tag_target = pending_tags[0] if pending_tags else ""
                 if latest_tag_target:
-                    latest_tag_line = f"{latest_tag_target}（复制 `update {latest_tag_target}`）"
+                    latest_tag_line = f"{latest_tag_target}（`update {latest_tag_target}`）"
                 else:
                     latest_tag_line = "无（已是最新）"
 
@@ -6804,24 +6812,23 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     latest_commit_target = remote_head_short
 
                 if latest_commit_target:
-                    extra_tag_note = f" | Tag:{remote_head_tag}" if remote_head_tag else " | 未打Tag"
-                    latest_commit_line = f"{latest_commit_target}{extra_tag_note}（复制 `update {latest_commit_target}`）"
+                    extra_tag_note = f" | Tag {remote_head_tag}" if remote_head_tag else " | 未打 Tag"
+                    latest_commit_line = f"{latest_commit_target}{extra_tag_note}（`update {latest_commit_target}`）"
                 else:
                     latest_commit_line = "无（已是最新）"
 
                 lines = [
                     "📦 版本信息概览",
-                    f"当前 Tag：{current_tag_display}",
-                    f"当前Commit：{current_short}",
-                    f"最新 Tag：{latest_tag_line}",
-                    f"最新Commit：{latest_commit_line}",
+                    f"当前：{current_tag_display} | {current_short}",
+                    f"可更新 Tag：{latest_tag_line}",
+                    f"可更新 Commit：{latest_commit_line}",
                     "",
-                    "⚠️  操作提示：",
-                    "- update <Tag版本号|Commit哈希>：更新到指定版本/提交",
-                    "- reback <Tag版本号|Commit哈希>：回滚到指定版本/提交",
-                    "- restart：重启应用",
+                    "操作：",
+                    "- `update <Tag|Commit>` 更新到目标版本",
+                    "- `reback <Tag|Commit>` 回滚到目标版本",
+                    "- `restart` 重启脚本",
                     "",
-                    "🔖 最近 3 个正式版本（Tag，新→旧）",
+                    "最近 Tag（新 -> 旧）：",
                 ]
 
                 if recent_tags:
@@ -6833,7 +6840,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 else:
                     lines.append("1. 无")
 
-                lines.extend(["", "💻 最近 3 个开发提交（Commit，新→旧）"])
+                lines.extend(["", "最近 Commit（新 -> 旧）："])
                 if recent_commits:
                     for idx, item in enumerate(recent_commits[:3], 1):
                         short_commit = item.get("short_commit", "") or "-"

@@ -144,14 +144,16 @@ def test_format_dashboard_builds_admin_cockpit(tmp_path, monkeypatch):
 
     assert "📍 Admin 驾驶舱" in message
     assert "📊 近 40 盘结果（由近及远）" in message
-    assert "脚本：运行中 | 模式：预测 | 模型：gpt-test" in message
+    assert "状态：运行中 | 模式 预测 | 模型 gpt-test" in message
+    assert "策略：yc10 -> yc20 | policy v4/灰度 | learn 灰度 c2" in message
+    assert "任务：午盘包 / 午盘任务 | 3/8 手 | auto" in message
+    assert "收益：本局 +3,500 | 累计 +100,000 | 24h -5,000" in message
     assert "盘面：第 128 盘 | 延续盘 | 温度 偏冷" in message
     assert "手况：待结算 | 第 3 手 | 大 | 50,000 | bet_9951_pending" in message
     assert "上手：输 -8,000 | 第 2 手 | 小 | 2026-03-07 12:00:00" in message
-    assert "局面：任务局 | 3/8 手 | 盈亏 +3,500 | 连输 2" in message
-    assert "轮次：午盘包 / 午盘任务 | 3/8 手 | auto" in message
-    assert "策略：yc10 -> yc20 | policy v4 (gray) | learn gray c2" in message
-    assert "24h：样本 18 | 胜率 50.0% | 盈亏 -5,000 | 回撤 6,200 | 观望 2 | 阻断 1" in message
+    assert "当前局：任务局 | 3/8 手 | 盈亏 +3,500 | 连输 2" in message
+    assert "24h：样本 18 | 胜率 50.0% | 回撤 6,200 | 观望 2 | 阻断 1" in message
+    assert max(len(line) for line in message.splitlines()) <= 70
 
 
 def test_get_bet_status_text_shows_pause_reason_and_remaining_rounds():
@@ -227,13 +229,13 @@ def test_build_bet_event_card_includes_core_context(tmp_path):
     )
 
     assert "🎯 下单卡" in message
-    assert "手位：第 3 手 | 大 | 50,000" in message
+    assert "动作：第 3 手 | 大 | 50,000" in message
     assert "盘口：第 128 盘 | rk_9953" in message
     assert "bet_id：20260307_1_3" in message
-    assert "策略：yc10 -> yc20 | policy v4 (gray)" in message
+    assert "策略：yc10 -> yc20 | policy v4/灰度" in message
     assert "信号：来源 model-a | 标签 DRAGON | 置信度 72%" in message
-    assert "执行：待结算 | 当前连大2" in message
-    assert "动态：基础档：yc10 | 执行档：yc20 | 原因：长龙保护" in message
+    assert "状态：待结算 | 当前连大2" in message
+    assert "调整：基础档：yc10 | 执行档：yc20 | 原因：长龙保护" in message
 
 
 def test_build_settle_event_card_includes_pnl_context(tmp_path):
@@ -313,7 +315,9 @@ def test_process_user_command_pause_resume_uses_status_cards(tmp_path, monkeypat
 
     assert ctx.state.runtime["manual_pause"] is True
     assert "⏸️ 状态卡" in sent_messages[-1]
+    assert "账号：驾驶舱用户" in sent_messages[-1]
     assert "动作：手动暂停当前账号" in sent_messages[-1]
+    assert "下一步：暂停后不再发起新下注" in sent_messages[-1]
     assert refreshed == [ctx.user_id]
 
     asyncio.run(
@@ -328,4 +332,5 @@ def test_process_user_command_pause_resume_uses_status_cards(tmp_path, monkeypat
     assert ctx.state.runtime["manual_pause"] is False
     assert "▶️ 状态卡" in sent_messages[-1]
     assert "动作：恢复当前账号下注" in sent_messages[-1]
+    assert "下一步：恢复后等待下一次有效盘口信号再发起真实下单" in sent_messages[-1]
     assert refreshed == [ctx.user_id, ctx.user_id]

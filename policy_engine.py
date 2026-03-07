@@ -413,17 +413,30 @@ def build_policy_overview_text(user_ctx) -> str:
     active = _find_policy_version(store, store.get("active_version", "")) or _sorted_policies(store)[-1]
     _update_runtime_policy_snapshot(user_ctx, store, active)
     mode_text = "基线" if str(active.get("activation_mode", "baseline")) == "baseline" else "灰度"
+    evidence = active.get("evidence_package", {}) if isinstance(active.get("evidence_package", {}), dict) else {}
+    similar = evidence.get("similar_cases", {}) if isinstance(evidence.get("similar_cases", {}), dict) else {}
+    overview = evidence.get("overview_24h", {}) if isinstance(evidence.get("overview_24h", {}), dict) else {}
+    if mode_text == "灰度":
+        suggestion = "当前建议：灰度版本运行中，先盯表现，不要急着切换。"
+    else:
+        suggestion = "当前建议：基线版本稳定，先看状态，确需变更再切换。"
     lines = [
         "🧠 策略版本中心",
-        "",
-        f"策略ID：{store.get('policy_id', '')}",
         f"当前版本：{active.get('policy_version', '')}（{mode_text}）",
         f"上一版本：{store.get('previous_version', '') or '-'}",
-        f"最近同步：{store.get('last_synced_at', '') or '-'}",
+        f"策略ID：{store.get('policy_id', '')}",
         f"摘要：{active.get('summary', '') or '基线策略'}",
+        (
+            f"证据：{evidence.get('current_regime', '未评估')} | "
+            f"相似样本 {similar.get('similar_count', 0)} | "
+            f"24h {int(overview.get('settled_count', 0) or 0)} 笔"
+        ),
+        suggestion,
+        f"最近同步：{store.get('last_synced_at', '') or '-'}",
         f"写回条数：{len(active.get('writeback_lines', []) or [])}",
         "",
-        "用法：`policy list` / `policy show [vX]` / `policy sync` / `policy use <vX>` / `policy rollback`",
+        "用法：`policy list` / `policy show [vX]`",
+        "控制：`policy sync` / `policy use <vX>` / `policy rollback`",
     ]
     return "\n".join(lines)
 

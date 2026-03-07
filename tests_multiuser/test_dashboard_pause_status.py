@@ -35,7 +35,7 @@ def test_format_dashboard_includes_bet_status_line(tmp_path, monkeypatch):
     )
 
     msg = zm.format_dashboard(ctx)
-    assert "🚦 **当前押注状态：运行中**" in msg
+    assert "状态：运行中 | 模式 预测" in msg
 
 
 def test_get_bet_status_text_shows_pause_reason_and_remaining_rounds():

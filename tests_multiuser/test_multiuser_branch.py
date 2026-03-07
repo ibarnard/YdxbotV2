@@ -2553,9 +2553,10 @@ def test_format_dashboard_shows_software_version_and_preset_lines(tmp_path, monk
     monkeypatch.setattr(zm, "get_current_repo_info", lambda: {"current_tag": "v1.0.10", "nearest_tag": "v1.0.10", "short_commit": "abcd1234"})
 
     msg = zm.format_dashboard(ctx)
-    assert "🔢 **软件版本：v1.0.10(abcd1234)**" in msg
-    assert "📋 **预设名称：yc10**" in msg
-    assert "🤖 **预设参数：1 11 2.8 2.3 2.2 2.05 10000**" in msg
+    assert "版本 v1.0.10(abcd1234)" in msg
+    assert "策略：yc10 -> yc10" in msg
+    assert "参数：首注 10,000 | 连投上限 11" in msg
+    assert "倍率：2.8 / 2.3 / 2.2 / 2.05" in msg
 
 
 def test_st_command_triggers_auto_yc_report(tmp_path, monkeypatch):

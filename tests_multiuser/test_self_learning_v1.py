@@ -282,7 +282,9 @@ def test_build_learning_texts(tmp_path, monkeypatch):
     detail = self_learning_engine.build_learning_detail_text(ctx, "c1")
 
     assert "受控自学习中心" in overview
-    assert "候选总数" in overview
+    assert "学习状态：候选" in overview
+    assert "建议：先看 `watch learn`" in overview
+    assert max(len(line) for line in overview.splitlines()) <= 95
     assert "学习候选列表" in listing
     assert "混乱/偏冷观望加强" in listing or "高档位收紧" in listing
     assert "学习候选详情" in detail

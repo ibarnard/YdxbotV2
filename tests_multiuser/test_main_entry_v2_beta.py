@@ -262,7 +262,8 @@ def test_process_user_command_model_list_routes_to_admin_chat(tmp_path, monkeypa
         )
     )
 
-    assert "可用模型列表" in sent["message"]
+    assert "🤖 模型卡" in sent["message"]
+    assert "当前：" in sent["message"]
     assert "qwen3-coder-plus" in sent["message"]
     assert sent["parse_mode"] == "markdown"
 
@@ -323,3 +324,6 @@ def test_process_user_command_help_defaults_to_compact_summary(tmp_path, monkeyp
     assert "命令速览" in sent["message"]
     assert "`help all`" in sent["message"]
     assert "管理员 chat" in sent["message"]
+    assert "`task` / `pkg`" in sent["message"]
+    assert "`policy` / `learn`" in sent["message"]
+    assert len(sent["message"].splitlines()) <= 30
