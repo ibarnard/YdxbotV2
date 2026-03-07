@@ -5167,6 +5167,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `watch` : 发送当前账号值守摘要到值守通道
 - `watch fleet` : 发送多账号值守摘要到值守通道
 - `watch learn` : 发送学习值守摘要到值守通道
+- `watch alerts` : 发送当前值守告警摘要到值守通道
 - `fleet` / `users` : 查看多账号总览
 - `fleet task` : 查看多账号任务/任务包视图
 - `fleet policy` : 查看多账号策略灰度视图
@@ -5760,6 +5761,12 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
                     await _send_watch_command_ack(client, event, "👀 学习值守摘要已发送到值守通道")
                 return
+            if subcmd == "alerts":
+                await send_to_watch(client, tg_watch.build_watch_alerts_text(user_ctx), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
+                    await _send_watch_command_ack(client, event, "🚨 值守告警摘要已发送到值守通道")
+                return
 
             message = await send_to_admin(
                 client,
@@ -5768,7 +5775,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "用法：\n"
                     "`watch`\n"
                     "`watch fleet`\n"
-                    "`watch learn`"
+                    "`watch learn`\n"
+                    "`watch alerts`"
                 ),
                 user_ctx,
                 global_config,

@@ -400,3 +400,106 @@ def test_check_bet_status_fund_pause_emits_watch_event(tmp_path, monkeypatch):
     assert sent["msg_type"] == "fund_pause"
     assert emitted["event_type"] == "fund_pause"
     assert "菠菜资金不足" in emitted["message"]
+
+
+def test_build_watch_alerts_text_combines_current_and_recent_alerts(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "8110"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "告警用户"},
+            "telegram": {"user_id": 8110},
+            "groups": {"admin_chat": 8110},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["fund_pause_notified"] = True
+    rt["gambling_fund"] = 1200
+    rt["account_balance"] = 2300
+    rt["stop_count"] = 0
+    rt["watch_alerts"] = [
+        {
+            "event_type": "model_timeout",
+            "severity": "warning",
+            "message": "⚠️ 模型预测超时\n触发点：第 7 手",
+            "last_notified_at": "2026-03-07 11:00:00",
+            "last_seen_at": "2026-03-07 11:00:00",
+            "count": 2,
+        }
+    ]
+
+    monkeypatch.setattr(tg_watch, "_all_users", lambda current_user_ctx: {ctx.user_id: ctx})
+    monkeypatch.setattr(
+        tg_watch,
+        "_build_watch_evidence",
+        lambda user_ctx: {
+            "recent_temperature": {"level": "very_cold"},
+            "overview_24h": {"pnl_total": -8800, "max_drawdown": 12000},
+        },
+    )
+    monkeypatch.setattr(
+        tg_watch.self_learning_engine,
+        "load_learning_center",
+        lambda user_ctx: {"active_gray_candidate_id": "cand_gray"},
+    )
+    monkeypatch.setattr(
+        tg_watch.self_learning_engine,
+        "_find_candidate_strict",
+        lambda center, ident: {"candidate_version": "c3", "gray_policy_version": "v9"} if ident == "cand_gray" else None,
+    )
+
+    text = tg_watch.build_watch_alerts_text(ctx)
+
+    assert "🚨 值守告警" in text
+    assert "当前风险：" in text
+    assert "资金不足暂停" in text
+    assert "学习灰度中 | c3 -> v9" in text
+    assert "24h 偏冷 | 盈亏 -8,800 | 回撤 12,000 | 温度 很冷" in text
+    assert "最近播报：" in text
+    assert "模型预测超时 x2" in text
+
+
+def test_process_user_command_watch_alerts_routes_alert_summary(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "8111"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "告警命令用户"},
+            "telegram": {"user_id": 8111},
+            "groups": {"admin_chat": 8111},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent = {}
+    acked = {}
+
+    async def fake_send_to_watch(client, message, user_ctx, global_config, parse_mode="markdown", title=None, desp=None):
+        sent["message"] = message
+        return SimpleNamespace(chat_id=-9111, id=6)
+
+    async def fake_send_watch_ack(client, event, text):
+        acked["text"] = text
+        return None
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_watch", fake_send_to_watch)
+    monkeypatch.setattr(zm, "_send_watch_command_ack", fake_send_watch_ack)
+    monkeypatch.setattr(zm, "_watch_reply_visible_in_chat", lambda user_ctx, chat_id: False)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(tg_watch, "build_watch_alerts_text", lambda user_ctx: "WATCH_ALERTS")
+
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="watch alerts", chat_id=8111, id=3),
+            ctx,
+            {},
+        )
+    )
+
+    assert sent["message"] == "WATCH_ALERTS"
+    assert acked["text"] == "🚨 值守告警摘要已发送到值守通道"

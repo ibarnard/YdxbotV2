@@ -309,3 +309,121 @@ def build_watch_learn_text(user_ctx) -> str:
     )
     lines.append("操作：`learn shadow` / `learn gray` / `learn promote` / `learn rollback`")
     return "\n".join(lines)
+
+
+def _event_label(event_type: str) -> str:
+    mapping = {
+        "fund_pause": "资金不足暂停",
+        "fund_resume": "资金恢复",
+        "fund_resume_sync": "资金同步恢复",
+        "model_timeout": "模型预测超时",
+        "risk_pause_fk2": "入场风控暂停",
+        "risk_pause_fk3": "连输风控暂停",
+        "risk_pause_shadow_probe": "影子验证未达标",
+        "risk_resume": "自动暂停恢复",
+        "risk_resume_shadow_probe": "影子验证恢复",
+        "task_package_switch": "任务包切换",
+        "task_takeover": "任务接管",
+        "learn_shadow_on": "学习影子开启",
+        "learn_shadow_off": "学习影子关闭",
+        "learn_gray": "学习灰度启动",
+        "learn_promote": "学习候选转正",
+        "learn_rollback": "学习候选回滚",
+    }
+    return mapping.get(str(event_type or "").strip(), str(event_type or "未知事件") or "未知事件")
+
+
+def _current_watch_alerts(user_ctx) -> List[Tuple[int, str]]:
+    rt = user_ctx.state.runtime
+    name = multi_account_orchestrator._account_name(user_ctx)  # type: ignore[attr-defined]
+    alerts: List[Tuple[int, str]] = []
+
+    if bool(rt.get("fund_pause_notified", False)):
+        alerts.append(
+            (
+                0,
+                f"- {name} ({user_ctx.user_id}) | 资金不足暂停 | 资金 {int(rt.get('gambling_fund', 0) or 0):,} | 余额 {int(rt.get('account_balance', 0) or 0):,}",
+            )
+        )
+
+    if int(rt.get("stop_count", 0) or 0) > 0 and not bool(rt.get("manual_pause", False)):
+        remaining = max(int(rt.get("stop_count", 0) or 0) - 1, 0)
+        reason = str(rt.get("pause_countdown_reason", "") or rt.get("pause_resume_pending_reason", "") or "自动暂停")
+        alerts.append(
+            (
+                1,
+                f"- {name} ({user_ctx.user_id}) | 自动暂停中 | 原因 {reason} | 剩余 {remaining} 局",
+            )
+        )
+
+    center = self_learning_engine.load_learning_center(user_ctx)
+    active_gray = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("active_gray_candidate_id", "") or ""),
+    )
+    if active_gray:
+        alerts.append(
+            (
+                2,
+                f"- {name} ({user_ctx.user_id}) | 学习灰度中 | {active_gray.get('candidate_version', '-') or '-'} -> {active_gray.get('gray_policy_version', '-') or '-'}",
+            )
+        )
+
+    evidence = _build_watch_evidence(user_ctx)
+    overview = evidence.get("overview_24h", {}) if isinstance(evidence.get("overview_24h", {}), dict) else {}
+    temp = evidence.get("recent_temperature", {}) if isinstance(evidence.get("recent_temperature", {}), dict) else {}
+    temp_level = str(temp.get("level", "normal") or "normal")
+    pnl24 = int(overview.get("pnl_total", 0) or 0)
+    if temp_level in {"cold", "very_cold"} and pnl24 < 0:
+        alerts.append(
+            (
+                3,
+                f"- {name} ({user_ctx.user_id}) | 24h 偏冷 | 盈亏 {pnl24:+,} | 回撤 {int(overview.get('max_drawdown', 0) or 0):,} | 温度 {_temperature_text(temp_level)}",
+            )
+        )
+
+    return alerts
+
+
+def build_watch_alerts_text(current_user_ctx) -> str:
+    users = _all_users(current_user_ctx)
+    if not users:
+        return "🚨 值守告警\n\n暂无已加载账号"
+
+    current_alerts: List[Tuple[int, str]] = []
+    recent_rows: List[Tuple[str, str]] = []
+    for user_ctx in users.values():
+        current_alerts.extend(_current_watch_alerts(user_ctx))
+        name = multi_account_orchestrator._account_name(user_ctx)  # type: ignore[attr-defined]
+        for item in list_watch_alerts(user_ctx, limit=10):
+            severity = str(item.get("severity", "info") or "info")
+            if severity not in {"warning", "error"}:
+                continue
+            when = str(item.get("last_notified_at", "") or item.get("last_seen_at", "") or "-")
+            count = int(item.get("count", 0) or 0)
+            count_text = f" x{count}" if count > 1 else ""
+            recent_rows.append(
+                (
+                    when,
+                    f"- {when} | {name} ({user_ctx.user_id}) | {_event_label(str(item.get('event_type', '') or ''))}{count_text} | {str(item.get('message', '') or '').splitlines()[0]}",
+                )
+            )
+
+    current_alerts.sort(key=lambda item: item[0])
+    recent_rows.sort(key=lambda item: item[0], reverse=True)
+
+    lines = ["🚨 值守告警", ""]
+    if current_alerts:
+        lines.append("当前风险：")
+        lines.extend(line for _, line in current_alerts[:8])
+    else:
+        lines.append("当前风险：")
+        lines.append("- 暂无需要立即处理的事项")
+
+    lines.append("")
+    lines.append("最近播报：")
+    if recent_rows:
+        lines.extend(line for _, line in recent_rows[:8])
+    else:
+        lines.append("- 暂无近期告警播报")
+    return "\n".join(lines)
