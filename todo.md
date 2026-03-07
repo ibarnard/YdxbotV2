@@ -135,6 +135,7 @@ python -m pytest `
   tests_multiuser\test_runtime_stability_v1.py `
   tests_multiuser\test_review_action_v1.py `
   tests_multiuser\test_admin_cockpit_v1.py `
+  tests_multiuser\test_single_account_loop_v1.py `
   -q
 ```
 

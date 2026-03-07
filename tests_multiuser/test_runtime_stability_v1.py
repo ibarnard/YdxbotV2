@@ -96,6 +96,36 @@ def test_inspect_user_context_reports_blockers_and_warnings(tmp_path):
     assert any("cookie/csrf" in text for text in warning_messages)
 
 
+def test_inspect_user_context_treats_zero_targets_as_missing(tmp_path):
+    clear_registered_user_contexts()
+    ctx = _make_user_context(
+        tmp_path,
+        "zero-targets",
+        9708,
+        override={
+            "groups": {"admin_chat": 0, "zq_group": [0], "zq_bot": 0},
+            "notification": {
+                "admin_chat": 0,
+                "watch": {
+                    "admin_chat": 0,
+                    "tg_bot": {"enable": True, "bot_token": "watch-token", "chat_id": "0"},
+                },
+                "tg_bot": {"enable": True, "bot_token": "base-token", "chat_id": "0"},
+            },
+        },
+    )
+
+    result = runtime_stability.inspect_user_context(ctx)
+    blocker_messages = [item["message"] for item in result["blockers"]]
+    warning_messages = [item["message"] for item in result["warnings"]]
+
+    assert result["status"] == "blocked"
+    assert any("zq_group" in text for text in blocker_messages)
+    assert any("zq_bot" in text for text in blocker_messages)
+    assert any("admin_chat" in text for text in warning_messages)
+    assert any("值守播报" in text for text in warning_messages)
+
+
 def test_reconcile_runtime_state_clears_stale_runtime_fields(tmp_path):
     clear_registered_user_contexts()
     ctx = _make_user_context(tmp_path, "清理用户", 9702)

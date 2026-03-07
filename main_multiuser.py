@@ -234,13 +234,21 @@ def _resolve_admin_chat(user_ctx: UserContext):
 
 
 def _normalize_target(value: Any) -> Any:
+    if isinstance(value, bool):
+        return ""
+    if isinstance(value, int):
+        return "" if value == 0 else value
+    if isinstance(value, float) and value.is_integer():
+        parsed = int(value)
+        return "" if parsed == 0 else parsed
     if isinstance(value, str):
         text = value.strip()
         if not text:
             return ""
         if text.lstrip("-").isdigit():
             try:
-                return int(text)
+                parsed = int(text)
+                return "" if parsed == 0 else parsed
             except Exception:
                 return value
         return text

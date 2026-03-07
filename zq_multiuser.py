@@ -1029,20 +1029,37 @@ def _ensure_account_prefix(text: str, account_prefix: str) -> str:
 
 def _iter_targets(target):
     if isinstance(target, (list, tuple, set)):
-        return [item for item in target if item not in (None, "")]
-    if target in (None, ""):
+        result = []
+        for item in target:
+            normalized = _coerce_chat_target(item)
+            if normalized not in (None, ""):
+                result.append(normalized)
+        return result
+    normalized = _coerce_chat_target(target)
+    if normalized in (None, ""):
         return []
-    return [target]
+    return [normalized]
 
 
 def _coerce_chat_target(target):
+    if isinstance(target, bool):
+        return ""
+    if isinstance(target, int):
+        return "" if target == 0 else target
+    if isinstance(target, float) and target.is_integer():
+        parsed = int(target)
+        return "" if parsed == 0 else parsed
     if isinstance(target, str):
         text = target.strip()
+        if not text:
+            return ""
         if text.lstrip("-").isdigit():
             try:
-                return int(text)
+                parsed = int(text)
+                return "" if parsed == 0 else parsed
             except Exception:
                 return target
+        return text
     return target
 
 
@@ -1102,8 +1119,8 @@ async def _send_tg_bot_notification(
         return
 
     bot_token = tg_bot_cfg.get("bot_token")
-    chat_id = tg_bot_cfg.get("chat_id")
-    if bot_token and chat_id:
+    chat_id = _coerce_chat_target(tg_bot_cfg.get("chat_id"))
+    if bot_token and chat_id not in (None, ""):
         url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
         payload = {"chat_id": chat_id, "text": text}
         try:

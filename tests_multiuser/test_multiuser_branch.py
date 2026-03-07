@@ -109,6 +109,13 @@ def test_user_context_merges_global_common_and_user_private_config(tmp_path):
     assert ctx.config.ai["base_url"] == "https://apis.iflow.cn/v1"
 
 
+def test_target_normalization_drops_zero_placeholder_values():
+    assert mm._iter_targets([0, "0", "", None, -1001, "me"]) == [-1001, "me"]
+    assert zm._iter_targets([0, "0", "", None, -1001, "me"]) == [-1001, "me"]
+    assert zm._coerce_chat_target("0") == ""
+    assert zm._coerce_chat_target(0) == ""
+
+
 def test_model_manager_apply_shared_config_uses_shared_chain():
     mgr = ModelManager()
     mgr.apply_shared_config(

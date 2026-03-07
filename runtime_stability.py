@@ -31,8 +31,27 @@ def _all_users(current_user_ctx) -> Dict[int, Any]:
 
 
 def _iter_targets(target: Any) -> List[Any]:
+    def _normalize(value: Any) -> Any:
+        if isinstance(value, bool):
+            return ""
+        if isinstance(value, int):
+            return "" if value == 0 else value
+        if isinstance(value, float) and value.is_integer():
+            parsed = int(value)
+            return "" if parsed == 0 else parsed
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return ""
+            if text.lstrip("-").isdigit():
+                parsed = int(text)
+                return "" if parsed == 0 else parsed
+            return text
+        return value
+
     if isinstance(target, (list, tuple, set)):
-        return [item for item in target if item not in (None, "")]
+        return [value for value in (_normalize(item) for item in target) if value not in (None, "")]
+    target = _normalize(target)
     if target in (None, ""):
         return []
     return [target]
@@ -299,9 +318,9 @@ def inspect_user_context(user_ctx) -> Dict[str, Any]:
         blockers.append(_issue("缺少 `groups.zq_bot`，无法识别下注机器人"))
 
     admin_chat = notification.get("admin_chat")
-    if admin_chat in (None, ""):
+    if not _iter_targets(admin_chat):
         admin_chat = groups.get("admin_chat")
-    if admin_chat in (None, ""):
+    if not _iter_targets(admin_chat):
         warnings.append(_issue("未配置 `admin_chat`，命令回显和管理员通知会不可用"))
 
     watch_cfg = notification.get("watch", {}) if isinstance(notification.get("watch", {}), dict) else {}
@@ -312,15 +331,15 @@ def inspect_user_context(user_ctx) -> Dict[str, Any]:
         isinstance(watch_bot, dict)
         and watch_bot.get("enable")
         and watch_bot.get("bot_token")
-        and watch_bot.get("chat_id")
+        and _iter_targets(watch_bot.get("chat_id"))
     )
     if has_watch_chat or has_watch_bot:
         infos.append(_issue("已配置值守播报目标"))
-    elif admin_chat or (
+    elif _iter_targets(admin_chat) or (
         isinstance(notification.get("tg_bot", {}), dict)
         and notification.get("tg_bot", {}).get("enable")
         and notification.get("tg_bot", {}).get("bot_token")
-        and notification.get("tg_bot", {}).get("chat_id")
+        and _iter_targets(notification.get("tg_bot", {}).get("chat_id"))
     ):
         warnings.append(_issue("未配置独立 `notification.watch`，值守播报会回退到现有管理员通道"))
     else:
