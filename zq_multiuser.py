@@ -29,6 +29,7 @@ import risk_control
 import self_learning_engine
 import task_engine
 import task_package_engine
+import tg_watch
 from update_manager import (
     get_current_repo_info,
     list_version_catalog,
@@ -1062,6 +1063,21 @@ async def send_to_watch(
     watch_tg_bot_cfg = _resolve_watch_tg_bot(user_ctx)
     await _send_tg_bot_notification(watch_tg_bot_cfg, watch_desp, user_ctx, 'TG Watch通知失败')
     return sent_message
+
+
+def _watch_reply_visible_in_chat(user_ctx: UserContext, chat_id: Any) -> bool:
+    return _coerce_chat_target(chat_id) == _resolve_watch_chat(user_ctx)
+
+
+async def _send_watch_command_ack(client, event, text: str):
+    try:
+        sent = await client.send_message(event.chat_id, text, parse_mode="markdown")
+    except Exception:
+        return None
+    msg_id = getattr(sent, "id", None)
+    if msg_id is not None:
+        asyncio.create_task(delete_later(client, event.chat_id, msg_id, 15))
+    return sent
 
 
 async def _send_transient_admin_notice(
@@ -4981,6 +4997,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `learn eval [id|cX]` : 对候选执行离线评估
 - `learn shadow` / `learn shadow <id|cX> on` / `learn shadow off` : 管理学习候选影子验证
 - `learn gray <id|cX> [当前账号名|ID]` / `learn promote <id|cX>` / `learn rollback` : 学习候选灰度、转正、回滚
+- `watch` : 发送当前账号值守摘要到值守通道
+- `watch fleet` : 发送多账号值守摘要到值守通道
+- `watch learn` : 发送学习值守摘要到值守通道
 - `fleet` / `users` : 查看多账号总览
 - `fleet task` : 查看多账号任务/任务包视图
 - `fleet policy` : 查看多账号策略灰度视图
@@ -5545,6 +5564,45 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 user_ctx,
                 global_config,
             )
+            return
+
+        if cmd == "watch":
+            if len(my) == 1:
+                await send_to_watch(client, tg_watch.build_watch_overview_text(user_ctx), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
+                    await _send_watch_command_ack(client, event, "👀 值守摘要已发送到值守通道")
+                return
+
+            subcmd = str(my[1]).strip().lower()
+            if subcmd == "fleet":
+                await send_to_watch(client, tg_watch.build_watch_fleet_text(user_ctx), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
+                    await _send_watch_command_ack(client, event, "👀 多账号值守摘要已发送到值守通道")
+                return
+            if subcmd == "learn":
+                await send_to_watch(client, tg_watch.build_watch_learn_text(user_ctx), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
+                    await _send_watch_command_ack(client, event, "👀 学习值守摘要已发送到值守通道")
+                return
+
+            message = await send_to_admin(
+                client,
+                (
+                    "❌ 参数格式错误\n"
+                    "用法：\n"
+                    "`watch`\n"
+                    "`watch fleet`\n"
+                    "`watch learn`"
+                ),
+                user_ctx,
+                global_config,
+            )
+            asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+            if message:
+                asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
             return
 
         # st - 启动预设 - 与master一致

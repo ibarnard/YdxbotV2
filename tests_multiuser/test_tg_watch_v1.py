@@ -3,6 +3,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 
+import tg_watch
 from user_manager import UserContext
 import zq_multiuser as zm
 
@@ -125,3 +126,137 @@ def test_send_to_watch_falls_back_to_admin_and_tg_bot_when_watch_missing(tmp_pat
     assert requests_payloads[0]["url"] == "https://api.telegram.org/botbase-token/sendMessage"
     assert requests_payloads[0]["json"]["chat_id"] == "base-chat"
     assert requests_payloads[0]["json"]["text"].startswith("【账号：回退用户】")
+
+
+def test_build_watch_overview_text_includes_key_fields(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "8104"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "摘要用户"},
+            "telegram": {"user_id": 8104},
+            "groups": {"admin_chat": 8104},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["current_preset_name"] = "yc10"
+    rt["task_current_name"] = "午盘"
+    rt["earnings"] = 36000
+    rt["gambling_fund"] = 880000
+    rt["account_balance"] = 930000
+    rt["current_fk1_action_text"] = "观望"
+    rt["last_predict_tag"] = "STABILITY"
+    rt["last_predict_confidence"] = 82
+    rt["last_predict_source"] = "model"
+
+    monkeypatch.setattr(tg_watch, "_policy_brief", lambda user_ctx: "v3(基线)")
+    monkeypatch.setattr(tg_watch, "_task_brief", lambda runtime: "午盘")
+    monkeypatch.setattr(tg_watch, "_learning_brief", lambda user_ctx: "shadow c2")
+    monkeypatch.setattr(
+        tg_watch,
+        "_build_watch_evidence",
+        lambda user_ctx: {
+            "current_regime": "延续盘",
+            "similar_cases": {"similar_count": 17, "recommended_tier_cap": "mid"},
+            "recent_temperature": {"level": "cold"},
+            "overview_24h": {
+                "win_rate": 0.58,
+                "pnl_total": 12800,
+                "max_drawdown": 6400,
+                "settled_count": 24,
+            },
+        },
+    )
+
+    text = tg_watch.build_watch_overview_text(ctx)
+
+    assert "👀 值守摘要" in text
+    assert "预设：yc10 | 任务 午盘 | 策略 v3(基线)" in text
+    assert "学习：shadow c2 | 当前建议 观望" in text
+    assert "24h：胜率 58.0% | 盈亏 +12,800 | 回撤 6,400 | 样本 24" in text
+    assert "盘面：延续盘 | 温度 偏冷 | 相似 17 | 历史建议 mid" in text
+    assert "最近决策：STABILITY / 82% / model" in text
+
+
+def test_process_user_command_watch_routes_summary_to_watch_channel(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "8105"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "命令用户"},
+            "telegram": {"user_id": 8105},
+            "groups": {"admin_chat": 8105},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent = {}
+    acked = {}
+
+    async def fake_send_to_watch(client, message, user_ctx, global_config, parse_mode="markdown", title=None, desp=None):
+        sent["message"] = message
+        return SimpleNamespace(chat_id=-9005, id=3)
+
+    async def fake_send_watch_ack(client, event, text):
+        acked["text"] = text
+        return SimpleNamespace(chat_id=event.chat_id, id=4)
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_watch", fake_send_to_watch)
+    monkeypatch.setattr(zm, "_send_watch_command_ack", fake_send_watch_ack)
+    monkeypatch.setattr(zm, "_watch_reply_visible_in_chat", lambda user_ctx, chat_id: False)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(tg_watch, "build_watch_overview_text", lambda user_ctx: "WATCH_BODY")
+
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="watch", chat_id=8105, id=1),
+            ctx,
+            {},
+        )
+    )
+
+    assert sent["message"] == "WATCH_BODY"
+    assert acked["text"] == "👀 值守摘要已发送到值守通道"
+
+
+def test_process_user_command_watch_fleet_routes_fleet_summary(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "8106"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "多账号命令用户"},
+            "telegram": {"user_id": 8106},
+            "groups": {"admin_chat": 8106},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent = {}
+
+    async def fake_send_to_watch(client, message, user_ctx, global_config, parse_mode="markdown", title=None, desp=None):
+        sent["message"] = message
+        return SimpleNamespace(chat_id=-9006, id=5)
+
+    def fake_create_task(coro):
+        coro.close()
+        return None
+
+    monkeypatch.setattr(zm, "send_to_watch", fake_send_to_watch)
+    monkeypatch.setattr(zm, "_watch_reply_visible_in_chat", lambda user_ctx, chat_id: True)
+    monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
+    monkeypatch.setattr(tg_watch, "build_watch_fleet_text", lambda user_ctx: "WATCH_FLEET")
+
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="watch fleet", chat_id=8106, id=2),
+            ctx,
+            {},
+        )
+    )
+
+    assert sent["message"] == "WATCH_FLEET"
