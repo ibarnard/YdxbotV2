@@ -260,3 +260,143 @@ def test_process_user_command_watch_fleet_routes_fleet_summary(tmp_path, monkeyp
     )
 
     assert sent["message"] == "WATCH_FLEET"
+
+
+def test_record_watch_event_throttles_same_fingerprint(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "8107"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "节流用户"},
+            "telegram": {"user_id": 8107},
+            "groups": {"admin_chat": 8107},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    timeline = iter([100, 100, 100, 100, 120, 120])
+    textline = iter(
+        [
+            "2026-03-07 10:00:00",
+            "2026-03-07 10:00:00",
+            "2026-03-07 10:00:00",
+            "2026-03-07 10:00:00",
+            "2026-03-07 10:02:00",
+            "2026-03-07 10:02:00",
+        ]
+    )
+
+    monkeypatch.setattr(tg_watch, "_now_ts", lambda: next(timeline))
+    monkeypatch.setattr(tg_watch, "_now_text", lambda: next(textline))
+
+    first = tg_watch.record_watch_event(ctx, "fund_pause", "A", fingerprint="same", throttle_sec=300)
+    second = tg_watch.record_watch_event(ctx, "fund_pause", "A", fingerprint="same", throttle_sec=300)
+    third = tg_watch.record_watch_event(ctx, "fund_pause", "B", fingerprint="other", throttle_sec=300)
+
+    alerts = tg_watch.list_watch_alerts(ctx, 10)
+
+    assert first["should_notify"] is True
+    assert second["should_notify"] is False
+    assert third["should_notify"] is True
+    assert len(alerts) == 2
+    assert alerts[0]["count"] == 2
+    assert alerts[1]["fingerprint"] == "other"
+
+
+def test_process_user_command_learn_promote_emits_watch_event(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "8108"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "学习播报用户"},
+            "telegram": {"user_id": 8108},
+            "groups": {"admin_chat": 8108},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    sent = {}
+    emitted = {}
+
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
+        sent["message"] = message
+        return None
+
+    async def fake_emit_learning_watch_event(client, user_ctx, global_config, event_type, result, severity="info", throttle_sec=60):
+        emitted["event_type"] = event_type
+        emitted["message"] = result["message"]
+        return True
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+    monkeypatch.setattr(zm, "_emit_learning_watch_event", fake_emit_learning_watch_event)
+    monkeypatch.setattr(
+        zm.self_learning_engine,
+        "promote_candidate",
+        lambda user_ctx, ident="": {
+            "ok": True,
+            "message": "PROMOTE_MSG",
+            "candidate": {"candidate_id": "cand_1"},
+        },
+    )
+
+    asyncio.run(
+        zm.process_user_command(
+            SimpleNamespace(),
+            SimpleNamespace(raw_text="learn promote c1", chat_id=8108, id=1),
+            ctx,
+            {},
+        )
+    )
+
+    assert sent["message"] == "PROMOTE_MSG"
+    assert emitted["event_type"] == "learn_promote"
+    assert emitted["message"] == "PROMOTE_MSG"
+
+
+def test_check_bet_status_fund_pause_emits_watch_event(tmp_path, monkeypatch):
+    user_dir = tmp_path / "users" / "8109"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "资金播报用户"},
+            "telegram": {"user_id": 8109},
+            "groups": {"admin_chat": 8109},
+            "notification": {"iyuu": {"enable": False}, "tg_bot": {"enable": False}},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["switch"] = True
+    rt["bet"] = False
+    rt["bet_on"] = True
+    rt["stop_count"] = 0
+    rt["fund_pause_notified"] = False
+    rt["gambling_fund"] = 100
+    rt["account_balance"] = 100
+
+    sent = {}
+    emitted = {}
+
+    async def fake_send_message_v2(client, msg_type, message, user_ctx, global_config, parse_mode="markdown", title=None, desp=None):
+        sent["msg_type"] = msg_type
+        sent["message"] = message
+        return None
+
+    async def fake_emit_watch_event(client, user_ctx, global_config, event_type, message, severity="info", fingerprint="", throttle_sec=300, meta=None):
+        emitted["event_type"] = event_type
+        emitted["message"] = message
+        return True
+
+    async def fake_clear_pause_countdown_notice(client, user_ctx):
+        return None
+
+    monkeypatch.setattr(zm, "calculate_bet_amount", lambda runtime: 500)
+    monkeypatch.setattr(zm, "is_fund_available", lambda user_ctx, amount: False)
+    monkeypatch.setattr(zm, "_sync_fund_from_account_when_insufficient", lambda runtime, amount: False)
+    monkeypatch.setattr(zm, "send_message_v2", fake_send_message_v2)
+    monkeypatch.setattr(zm, "_emit_watch_event", fake_emit_watch_event)
+    monkeypatch.setattr(zm, "_clear_pause_countdown_notice", fake_clear_pause_countdown_notice)
+
+    asyncio.run(zm.check_bet_status(SimpleNamespace(), ctx, {}))
+
+    assert sent["msg_type"] == "fund_pause"
+    assert emitted["event_type"] == "fund_pause"
+    assert "菠菜资金不足" in emitted["message"]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Dict, List, Tuple
 
 import history_analysis
@@ -8,6 +9,10 @@ import policy_engine
 import risk_control
 import self_learning_engine
 from user_manager import get_registered_user_contexts
+
+WATCH_EVENT_STATE_KEY = "watch_event_state"
+WATCH_ALERTS_KEY = "watch_alerts"
+WATCH_ALERT_LIMIT = 30
 
 
 def _all_users(current_user_ctx) -> Dict[int, Any]:
@@ -76,6 +81,109 @@ def _learning_brief(user_ctx) -> str:
 def _build_watch_evidence(user_ctx) -> Dict[str, Any]:
     snapshot = history_analysis.build_current_analysis_snapshot(user_ctx)
     return history_analysis.build_policy_evidence_package(user_ctx, analysis_snapshot=snapshot)
+
+
+def _now_text() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _now_ts() -> int:
+    return int(datetime.now().timestamp())
+
+
+def record_watch_event(
+    user_ctx,
+    event_type: str,
+    message: str,
+    *,
+    severity: str = "info",
+    fingerprint: str = "",
+    throttle_sec: int = 300,
+    meta: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    rt = user_ctx.state.runtime
+    event_key = str(event_type or "").strip() or "generic"
+    event_message = str(message or "").strip()
+    normalized_fingerprint = str(fingerprint or "").strip()
+    state = rt.get(WATCH_EVENT_STATE_KEY, {})
+    if not isinstance(state, dict):
+        state = {}
+
+    current = state.get(event_key, {})
+    if not isinstance(current, dict):
+        current = {}
+
+    now_text = _now_text()
+    now_ts = _now_ts()
+    throttle = max(0, int(throttle_sec or 0))
+    last_sent_ts = int(current.get("last_sent_ts", 0) or 0)
+    last_fingerprint = str(current.get("fingerprint", "") or "")
+    should_notify = (
+        normalized_fingerprint != last_fingerprint
+        or throttle == 0
+        or (now_ts - last_sent_ts) >= throttle
+    )
+
+    state[event_key] = {
+        "fingerprint": normalized_fingerprint,
+        "severity": severity,
+        "last_message": event_message,
+        "last_seen_at": now_text,
+        "last_seen_ts": now_ts,
+        "last_sent_at": now_text if should_notify else str(current.get("last_sent_at", "") or ""),
+        "last_sent_ts": now_ts if should_notify else last_sent_ts,
+    }
+    rt[WATCH_EVENT_STATE_KEY] = state
+
+    alerts = rt.get(WATCH_ALERTS_KEY, [])
+    if not isinstance(alerts, list):
+        alerts = []
+
+    entry = None
+    for item in reversed(alerts):
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("event_type", "") or "") == event_key and str(item.get("fingerprint", "") or "") == normalized_fingerprint:
+            entry = item
+            break
+
+    if entry is None:
+        entry = {
+            "event_type": event_key,
+            "severity": severity,
+            "message": event_message,
+            "fingerprint": normalized_fingerprint,
+            "first_seen_at": now_text,
+            "last_seen_at": now_text,
+            "last_notified_at": now_text if should_notify else "",
+            "count": 1,
+            "meta": dict(meta or {}),
+        }
+        alerts.append(entry)
+    else:
+        entry["severity"] = severity
+        entry["message"] = event_message
+        entry["last_seen_at"] = now_text
+        entry["count"] = int(entry.get("count", 0) or 0) + 1
+        if meta:
+            merged_meta = entry.get("meta", {})
+            if not isinstance(merged_meta, dict):
+                merged_meta = {}
+            merged_meta.update(dict(meta))
+            entry["meta"] = merged_meta
+        if should_notify:
+            entry["last_notified_at"] = now_text
+
+    rt[WATCH_ALERTS_KEY] = alerts[-WATCH_ALERT_LIMIT:]
+    return {"should_notify": should_notify, "event": entry}
+
+
+def list_watch_alerts(user_ctx, limit: int = 10) -> List[Dict[str, Any]]:
+    alerts = user_ctx.state.runtime.get(WATCH_ALERTS_KEY, [])
+    if not isinstance(alerts, list):
+        return []
+    rows = [item for item in alerts if isinstance(item, dict)]
+    return rows[-max(1, int(limit or 1)) :]
 
 
 def build_watch_overview_text(user_ctx) -> str:

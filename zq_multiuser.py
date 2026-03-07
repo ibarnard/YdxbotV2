@@ -1080,6 +1080,67 @@ async def _send_watch_command_ack(client, event, text: str):
     return sent
 
 
+async def _emit_watch_event(
+    client,
+    user_ctx: UserContext,
+    global_config: dict,
+    event_type: str,
+    message: str,
+    *,
+    severity: str = "info",
+    fingerprint: str = "",
+    throttle_sec: int = 300,
+    meta: Dict[str, Any] | None = None,
+) -> bool:
+    recorded = tg_watch.record_watch_event(
+        user_ctx,
+        event_type,
+        message,
+        severity=severity,
+        fingerprint=fingerprint,
+        throttle_sec=throttle_sec,
+        meta=meta,
+    )
+    user_ctx.save_state()
+    if not recorded.get("should_notify", False):
+        return False
+    await send_to_watch(client, message, user_ctx, global_config)
+    return True
+
+
+async def _emit_learning_watch_event(
+    client,
+    user_ctx: UserContext,
+    global_config: dict,
+    event_type: str,
+    result: Dict[str, Any],
+    *,
+    severity: str = "info",
+    throttle_sec: int = 60,
+) -> bool:
+    if not isinstance(result, dict) or not result.get("ok", False):
+        return False
+    message = str(result.get("message", "") or "").strip()
+    if not message:
+        return False
+    candidate = result.get("candidate", {}) if isinstance(result.get("candidate", {}), dict) else {}
+    fingerprint = (
+        str(candidate.get("candidate_id", "") or "")
+        or str(candidate.get("candidate_version", "") or "")
+        or message.splitlines()[0]
+    )
+    return await _emit_watch_event(
+        client,
+        user_ctx,
+        global_config,
+        event_type,
+        message,
+        severity=severity,
+        fingerprint=fingerprint,
+        throttle_sec=throttle_sec,
+    )
+
+
 async def _send_transient_admin_notice(
     client,
     user_ctx: UserContext,
@@ -1669,19 +1730,30 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     if package_plan.get("started", False):
         package_info = package_plan.get("package", {}) if isinstance(package_plan.get("package", {}), dict) else {}
         package_task = package_plan.get("task", {}) if isinstance(package_plan.get("task", {}), dict) else {}
+        package_message = (
+            "🧰 任务包已切换\n"
+            f"任务包：{package_info.get('name', '')}\n"
+            f"当前任务：{package_task.get('name', '')}\n"
+            f"原因：{package_plan.get('message', '') or package_info.get('last_reason', '')}"
+        )
         try:
             await _send_transient_admin_notice(
                 client,
                 user_ctx,
                 global_config,
-                (
-                    "🧰 任务包已切换\n"
-                    f"任务包：{package_info.get('name', '')}\n"
-                    f"当前任务：{package_task.get('name', '')}\n"
-                    f"原因：{package_plan.get('message', '') or package_info.get('last_reason', '')}"
-                ),
+                package_message,
                 ttl_seconds=90,
                 attr_name="package_transition_message",
+            )
+            await _emit_watch_event(
+                client,
+                user_ctx,
+                global_config,
+                "task_package_switch",
+                package_message,
+                severity="info",
+                fingerprint=f"{package_info.get('package_id', '')}:{package_task.get('task_id', '')}:{package_plan.get('message', '')}",
+                throttle_sec=300,
             )
         except Exception:
             pass
@@ -1689,20 +1761,31 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
     task_plan = task_engine.prepare_task_for_round(user_ctx, analysis_snapshot)
     if task_plan.get("started", False):
         task_info = task_plan.get("task", {}) if isinstance(task_plan.get("task", {}), dict) else {}
+        task_message = (
+            "📦 任务已接管本轮\n"
+            f"任务：{task_info.get('name', '')}\n"
+            f"触发：{task_info.get('last_reason', '') or task_plan.get('message', '')}\n"
+            f"基准预设：{task_info.get('base_preset', '')}\n"
+            f"目标：{task_info.get('max_bets', 0)} 笔"
+        )
         try:
             await _send_transient_admin_notice(
                 client,
                 user_ctx,
                 global_config,
-                (
-                    "📦 任务已接管本轮\n"
-                    f"任务：{task_info.get('name', '')}\n"
-                    f"触发：{task_info.get('last_reason', '') or task_plan.get('message', '')}\n"
-                    f"基准预设：{task_info.get('base_preset', '')}\n"
-                    f"目标：{task_info.get('max_bets', 0)} 笔"
-                ),
+                task_message,
                 ttl_seconds=90,
                 attr_name="task_transition_message",
+            )
+            await _emit_watch_event(
+                client,
+                user_ctx,
+                global_config,
+                "task_takeover",
+                task_message,
+                severity="info",
+                fingerprint=f"{task_info.get('task_id', '')}:{task_plan.get('message', '')}",
+                throttle_sec=300,
             )
         except Exception:
             pass
@@ -1758,6 +1841,22 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 '预测超时，本局放弃下注',
                 user_id=user_ctx.user_id,
                 timeout=predict_timeout_sec,
+            )
+            await _emit_watch_event(
+                client,
+                user_ctx,
+                global_config,
+                "model_timeout",
+                (
+                    "⚠️ 模型预测超时\n"
+                    f"触发点：第 {next_sequence} 手\n"
+                    f"超时阈值：{predict_timeout_sec:.1f}s\n"
+                    "当前动作：本局先停止下注决策，等待门控或兜底逻辑处理"
+                ),
+                severity="warning",
+                fingerprint=f"{rt.get('current_round_key', '')}:{next_sequence}",
+                throttle_sec=900,
+                meta={"next_sequence": next_sequence},
             )
             timeout_guard = _record_hand_stall_block(rt, next_sequence, history_len, "timeout")
             if timeout_guard.get("force_unlock", False):
@@ -1890,6 +1989,20 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                                 global_config,
                                 title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
                                 desp=mes,
+                            )
+                            await _emit_watch_event(
+                                client,
+                                user_ctx,
+                                global_config,
+                                "fund_pause",
+                                (
+                                    "⚠️ 菠菜资金不足，已自动暂停押注\n"
+                                    f"当前资金：{display_fund / 10000:.2f} 万\n"
+                                    f"接续倍投金额：{format_number(current_need)}"
+                                ),
+                                severity="warning",
+                                fingerprint=f"pause:{current_need}:{display_fund}",
+                                throttle_sec=900,
                             )
                             rt["fund_pause_notified"] = True
                         rt["bet"] = False
@@ -2444,6 +2557,16 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 resume_msg,
                 ttl_seconds=120,
                 attr_name="pause_transition_message",
+            )
+            await _emit_watch_event(
+                client,
+                user_ctx,
+                global_config,
+                "risk_resume",
+                resume_msg,
+                severity="info",
+                fingerprint=f"{reason_text}:{rt.get('bet_sequence_count', 1)}",
+                throttle_sec=300,
             )
             rt["pause_resume_pending"] = False
             rt["pause_resume_pending_reason"] = ""
@@ -3263,6 +3386,17 @@ async def _apply_entry_gate_pause(
     if hasattr(user_ctx, "risk_pause_message") and user_ctx.risk_pause_message:
         await cleanup_message(client, user_ctx.risk_pause_message)
     user_ctx.risk_pause_message = await send_to_admin(client, pause_msg, user_ctx, global_config)
+    await _emit_watch_event(
+        client,
+        user_ctx,
+        global_config,
+        "risk_pause_fk2",
+        pause_msg,
+        severity="warning",
+        fingerprint=f"{gate.get('gate_name', '')}:{next_sequence}:{pause_rounds}",
+        throttle_sec=300,
+        meta={"next_sequence": next_sequence, "pause_rounds": pause_rounds},
+    )
     await _refresh_pause_countdown_notice(
         client,
         user_ctx,
@@ -3689,6 +3823,17 @@ async def _trigger_deep_risk_pause_after_settle(
     if hasattr(user_ctx, "risk_pause_message") and user_ctx.risk_pause_message:
         await cleanup_message(client, user_ctx.risk_pause_message)
     user_ctx.risk_pause_message = await send_to_admin(client, pause_msg, user_ctx, global_config)
+    await _emit_watch_event(
+        client,
+        user_ctx,
+        global_config,
+        "risk_pause_fk3",
+        pause_msg,
+        severity="warning",
+        fingerprint=f"{deep_milestone}:{next_sequence}:{pause_rounds}",
+        throttle_sec=300,
+        meta={"milestone": deep_milestone, "pause_rounds": pause_rounds},
+    )
     await _refresh_pause_countdown_notice(
         client,
         user_ctx,
@@ -4056,29 +4201,51 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             hit_text = "命中" if shadow_progress.get("hit", False) else "未命中"
             if shadow_progress.get("done", False):
                 if shadow_progress.get("passed", False):
+                    shadow_pass_message = (
+                        "✅ 影子验证通过，恢复真钱下注\n"
+                        f"结果：{hits}/{target_rounds} 命中（阈值 {pass_required}）\n"
+                        "后续动作：下一次有效信号将继续原倍投进度下注"
+                    )
                     await _send_transient_admin_notice(
                         client,
                         user_ctx,
                         global_config,
-                        (
-                            "✅ 影子验证通过，恢复真钱下注\n"
-                            f"结果：{hits}/{target_rounds} 命中（阈值 {pass_required}）\n"
-                            "后续动作：下一次有效信号将继续原倍投进度下注"
-                        ),
+                        shadow_pass_message,
                         ttl_seconds=150,
                         attr_name="shadow_probe_message",
                     )
-                else:
-                    pause_rounds = int(shadow_progress.get("pause_rounds", SHADOW_PROBE_RETRY_PAUSE_ROUNDS))
-                    await send_to_admin(
+                    await _emit_watch_event(
                         client,
-                        (
-                            "⛔ 影子验证未达标，继续暂停观察\n"
-                            f"结果：{hits}/{target_rounds} 命中（阈值 {pass_required}）\n"
-                            f"本次继续暂停：{pause_rounds} 局"
-                        ),
                         user_ctx,
                         global_config,
+                        "risk_resume_shadow_probe",
+                        shadow_pass_message,
+                        severity="info",
+                        fingerprint=f"{hits}:{target_rounds}:{pass_required}",
+                        throttle_sec=300,
+                    )
+                else:
+                    pause_rounds = int(shadow_progress.get("pause_rounds", SHADOW_PROBE_RETRY_PAUSE_ROUNDS))
+                    shadow_fail_message = (
+                        "⛔ 影子验证未达标，继续暂停观察\n"
+                        f"结果：{hits}/{target_rounds} 命中（阈值 {pass_required}）\n"
+                        f"本次继续暂停：{pause_rounds} 局"
+                    )
+                    await send_to_admin(
+                        client,
+                        shadow_fail_message,
+                        user_ctx,
+                        global_config,
+                    )
+                    await _emit_watch_event(
+                        client,
+                        user_ctx,
+                        global_config,
+                        "risk_pause_shadow_probe",
+                        shadow_fail_message,
+                        severity="warning",
+                        fingerprint=f"{hits}:{target_rounds}:{pause_rounds}",
+                        throttle_sec=300,
                     )
                     await _refresh_pause_countdown_notice(
                         client,
@@ -5512,16 +5679,19 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     result = self_learning_engine.deactivate_candidate_shadow(user_ctx)
                     user_ctx.save_state()
                     await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                    await _emit_learning_watch_event(client, user_ctx, global_config, "learn_shadow_off", result)
                     return
                 if action == "on":
                     result = self_learning_engine.activate_candidate_shadow(user_ctx, ident)
                     user_ctx.save_state()
                     await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                    await _emit_learning_watch_event(client, user_ctx, global_config, "learn_shadow_on", result)
                     return
                 if action == "off":
                     result = self_learning_engine.deactivate_candidate_shadow(user_ctx, ident)
                     user_ctx.save_state()
                     await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                    await _emit_learning_watch_event(client, user_ctx, global_config, "learn_shadow_off", result)
                     return
                 await send_to_admin(client, self_learning_engine.build_learning_shadow_text(user_ctx, ident), user_ctx, global_config)
                 return
@@ -5531,17 +5701,20 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 result = self_learning_engine.gray_candidate(user_ctx, ident, target)
                 user_ctx.save_state()
                 await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                await _emit_learning_watch_event(client, user_ctx, global_config, "learn_gray", result, severity="warning", throttle_sec=120)
                 return
             if subcmd == "promote":
                 ident = my[2] if len(my) >= 3 else ""
                 result = self_learning_engine.promote_candidate(user_ctx, ident)
                 user_ctx.save_state()
                 await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                await _emit_learning_watch_event(client, user_ctx, global_config, "learn_promote", result, throttle_sec=120)
                 return
             if subcmd == "rollback":
                 result = self_learning_engine.rollback_candidate(user_ctx)
                 user_ctx.save_state()
                 await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                await _emit_learning_watch_event(client, user_ctx, global_config, "learn_rollback", result, severity="warning", throttle_sec=120)
                 return
 
             await send_to_admin(
@@ -6300,6 +6473,16 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
             ttl_seconds=120,
             attr_name="status_transition_message",
         )
+        await _emit_watch_event(
+            client,
+            user_ctx,
+            global_config,
+            "fund_resume",
+            mes,
+            severity="info",
+            fingerprint=f"resume:{next_bet_amount}:{rt.get('gambling_fund', 0)}",
+            throttle_sec=300,
+        )
     elif not is_fund_available(user_ctx, next_bet_amount):
         if _sync_fund_from_account_when_insufficient(rt, next_bet_amount):
             log_event(
@@ -6336,6 +6519,16 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
                 ttl_seconds=120,
                 attr_name="status_transition_message",
             )
+            await _emit_watch_event(
+                client,
+                user_ctx,
+                global_config,
+                "fund_resume_sync",
+                mes,
+                severity="info",
+                fingerprint=f"sync:{next_bet_amount}:{rt.get('gambling_fund', 0)}",
+                throttle_sec=300,
+            )
             return
 
         rt["bet_on"] = False
@@ -6351,6 +6544,20 @@ async def check_bet_status(client, user_ctx: UserContext, global_config: dict):
                 global_config,
                 title=f"菠菜机器人 {user_ctx.config.name} 资金风控暂停",
                 desp=mes,
+            )
+            await _emit_watch_event(
+                client,
+                user_ctx,
+                global_config,
+                "fund_pause",
+                (
+                    "⚠️ 菠菜资金不足，已自动暂停押注\n"
+                    f"当前资金：{rt.get('gambling_fund', 0) / 10000:.2f} 万\n"
+                    f"接续倍投金额：{format_number(next_bet_amount)}"
+                ),
+                severity="warning",
+                fingerprint=f"pause:{next_bet_amount}:{rt.get('gambling_fund', 0)}",
+                throttle_sec=900,
             )
             rt["fund_pause_notified"] = True
         user_ctx.save_state()
