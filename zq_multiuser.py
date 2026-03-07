@@ -863,7 +863,7 @@ def format_dashboard(user_ctx: UserContext) -> str:
 
 
 def get_bet_status_text(rt: Dict[str, Any]) -> str:
-    """统一押注状态展示。"""
+    """Unified betting status text used by dashboard and status cards."""
     if rt.get("manual_pause", False):
         return "手动暂停"
     if not rt.get("switch", True):
@@ -880,11 +880,8 @@ def get_bet_status_text(rt: Dict[str, Any]) -> str:
         if total_rounds > 0 and 0 < last_remaining <= total_rounds:
             remaining_rounds = last_remaining
         elif total_rounds > 0 and stop_count > 0:
-            # 兼容内部 stop_count=暂停局数+1 的实现细节，展示时尽量贴近“真实剩余局数”。
-            if stop_count > total_rounds:
-                remaining_rounds = total_rounds
-            else:
-                remaining_rounds = stop_count
+            # stop_count is stored as pause_rounds + 1 in part of the legacy flow.
+            remaining_rounds = total_rounds if stop_count > total_rounds else stop_count
         elif stop_count > 0:
             remaining_rounds = max(0, stop_count - 1)
 
@@ -896,8 +893,12 @@ def get_bet_status_text(rt: Dict[str, Any]) -> str:
             return f"自动暂停（{reason}）"
         return "自动暂停"
 
+    if rt.get("bet", False):
+        return "待结算"
     if rt.get("bet_on", False):
         return "运行中"
+    if rt.get("mode_stop", False):
+        return "待机中"
     return "已暂停"
 
 
