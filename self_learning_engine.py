@@ -22,6 +22,9 @@ LEARNING_STATUS_ROLLED_BACK = "rolled_back"
 LEARNING_EVAL_PASS = "pass"
 LEARNING_EVAL_WATCH = "watch"
 LEARNING_EVAL_FAIL = "fail"
+LEARNING_SHADOW_PASS = "pass"
+LEARNING_SHADOW_WATCH = "watch"
+LEARNING_SHADOW_FAIL = "fail"
 LEARNING_EVAL_HOURS = 24 * 7
 
 
@@ -44,6 +47,7 @@ def _default_learning_center(user_ctx) -> Dict[str, Any]:
         "sequence": 0,
         "last_generated_at": "",
         "last_generated_candidate_id": "",
+        "last_shadow_recorded_at": "",
         "active_shadow_candidate_id": "",
         "active_gray_candidate_id": "",
         "promoted_candidate_id": "",
@@ -76,6 +80,7 @@ def _update_runtime_learning_snapshot(user_ctx, center: Dict[str, Any]) -> None:
     rt["learning_candidate_count"] = len(candidates)
     rt["learning_last_generated_at"] = str(center.get("last_generated_at", "") or "")
     rt["learning_last_candidate_id"] = str(center.get("last_generated_candidate_id", "") or "")
+    rt["learning_last_shadow_at"] = str(center.get("last_shadow_recorded_at", "") or "")
     rt["learning_shadow_candidate_id"] = str(center.get("active_shadow_candidate_id", "") or "")
     rt["learning_gray_candidate_id"] = str(center.get("active_gray_candidate_id", "") or "")
     rt["learning_last_summary"] = str(latest.get("summary", "") or "")
@@ -105,6 +110,7 @@ def load_learning_center(user_ctx) -> Dict[str, Any]:
         "sequence": int(payload.get("sequence", 0) or 0),
         "last_generated_at": str(payload.get("last_generated_at", "") or ""),
         "last_generated_candidate_id": str(payload.get("last_generated_candidate_id", "") or ""),
+        "last_shadow_recorded_at": str(payload.get("last_shadow_recorded_at", "") or ""),
         "active_shadow_candidate_id": str(payload.get("active_shadow_candidate_id", "") or ""),
         "active_gray_candidate_id": str(payload.get("active_gray_candidate_id", "") or ""),
         "promoted_candidate_id": str(payload.get("promoted_candidate_id", "") or ""),
@@ -461,8 +467,8 @@ def _build_generation_message(candidates: List[Dict[str, Any]]) -> str:
     lines.extend(
         [
             "",
-            "说明：当前仅完成 H1/H2（候选中心 / 规则生成）。",
-            "后续阶段：`learn eval` / `learn shadow` / `learn gray` / `learn promote` / `learn rollback`",
+            "说明：当前已完成 H1/H2/H3/H4（候选中心 / 规则生成 / 离线评估 / 影子验证）。",
+            "后续阶段：`learn gray` / `learn promote` / `learn rollback`",
         ]
     )
     return "\n".join(lines)
@@ -816,6 +822,525 @@ def evaluate_candidate_offline(user_ctx, ident: str = "", hours: int = LEARNING_
     }
 
 
+def _normalize_result_side(result_num: Any, result_type: Any) -> str:
+    text = str(result_type or "").strip().lower()
+    if text in {"大", "big", "1"}:
+        return "big"
+    if text in {"小", "small", "0"}:
+        return "small"
+    try:
+        return "big" if int(result_num) == 1 else "small"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _shadow_status_text(status: str) -> str:
+    mapping = {
+        LEARNING_SHADOW_PASS: "通过",
+        LEARNING_SHADOW_WATCH: "观察",
+        LEARNING_SHADOW_FAIL: "偏弱",
+    }
+    return mapping.get(str(status or LEARNING_SHADOW_WATCH), str(status or LEARNING_SHADOW_WATCH))
+
+
+def _parse_shadow_payload(row: Dict[str, Any]) -> Dict[str, Any]:
+    raw = row.get("payload_json", {})
+    if isinstance(raw, dict):
+        return raw
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            return parsed if isinstance(parsed, dict) else {}
+        except Exception:
+            return {}
+    return {}
+
+
+def _shadow_diff_type(
+    base_action: str,
+    candidate_action: str,
+    base_tier: str,
+    candidate_tier: str,
+    base_direction: str,
+    candidate_direction: str,
+) -> str:
+    if (
+        base_action == candidate_action
+        and base_tier == candidate_tier
+        and str(base_direction or "") == str(candidate_direction or "")
+    ):
+        return "same"
+    if base_action == "bet" and candidate_action == "observe":
+        return "observe_vs_bet"
+    if base_action == "bet" and candidate_action == "bet":
+        base_rank = _tier_rank(base_tier)
+        candidate_rank = _tier_rank(candidate_tier)
+        if base_rank >= 0 and candidate_rank >= 0:
+            if candidate_rank < base_rank:
+                return "tier_more_conservative"
+            if candidate_rank > base_rank:
+                return "tier_more_aggressive"
+    if (
+        base_action == "bet"
+        and candidate_action == "bet"
+        and base_direction
+        and candidate_direction
+        and base_direction != candidate_direction
+    ):
+        return "direction_diff"
+    return "same"
+
+
+def _shadow_rows(user_ctx, candidate_id: str) -> List[Dict[str, Any]]:
+    return history_analysis._analytics_rows(
+        user_ctx,
+        "SELECT * FROM learning_shadows WHERE candidate_id = ? ORDER BY created_at ASC",
+        (str(candidate_id or ""),),
+    )
+
+
+def _shadow_status_from_metrics(metrics: Dict[str, Any]) -> str:
+    sample_size = int(metrics.get("sample_size", 0) or 0)
+    aggressive_count = int(metrics.get("aggressive_count", 0) or 0)
+    base_total_pnl = int(metrics.get("base_total_pnl", 0) or 0)
+    candidate_total_pnl = int(metrics.get("candidate_total_pnl", 0) or 0)
+    base_drawdown = int(metrics.get("base_drawdown", 0) or 0)
+    candidate_drawdown = int(metrics.get("candidate_drawdown", 0) or 0)
+    tolerance = max(2000, int(abs(base_total_pnl) * 0.2))
+
+    if sample_size < 12:
+        return LEARNING_SHADOW_WATCH
+    if aggressive_count > max(2, sample_size // 4) and candidate_total_pnl < base_total_pnl:
+        return LEARNING_SHADOW_FAIL
+    if candidate_drawdown > base_drawdown and candidate_total_pnl + tolerance < base_total_pnl:
+        return LEARNING_SHADOW_FAIL
+    if (
+        aggressive_count <= max(1, sample_size // 10)
+        and candidate_drawdown <= base_drawdown
+        and candidate_total_pnl + tolerance >= base_total_pnl
+    ):
+        return LEARNING_SHADOW_PASS
+    return LEARNING_SHADOW_WATCH
+
+
+def _summarize_shadow_metrics(metrics: Dict[str, Any]) -> str:
+    status = str(metrics.get("status", LEARNING_SHADOW_WATCH) or LEARNING_SHADOW_WATCH)
+    sample_size = int(metrics.get("sample_size", 0) or 0)
+    diff_count = int(metrics.get("diff_count", 0) or 0)
+    conservative_count = int(metrics.get("conservative_count", 0) or 0)
+    aggressive_count = int(metrics.get("aggressive_count", 0) or 0)
+    delta_pnl = int(metrics.get("delta_pnl", 0) or 0)
+    delta_drawdown = int(metrics.get("delta_drawdown", 0) or 0)
+    return (
+        f"影子{_shadow_status_text(status)}：样本 {sample_size}，差异 {diff_count}，"
+        f"保守 {conservative_count} / 激进 {aggressive_count}，"
+        f"收益变化 {delta_pnl:+,}，回撤改善 {delta_drawdown:+,}"
+    )
+
+
+def _shadow_metrics_from_rows(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    base_pnls: List[int] = []
+    candidate_pnls: List[int] = []
+    diff_count = 0
+    same_count = 0
+    conservative_count = 0
+    aggressive_count = 0
+    observe_vs_bet_count = 0
+    direction_diff_count = 0
+    signal_total = 0
+    signal_hits = 0
+    bet_total = 0
+    bet_hits = 0
+    last_recorded_at = ""
+
+    for row in rows:
+        payload = _parse_shadow_payload(row)
+        base_decision = payload.get("base_decision", {}) if isinstance(payload.get("base_decision", {}), dict) else {}
+        candidate_decision = (
+            payload.get("candidate_decision", {})
+            if isinstance(payload.get("candidate_decision", {}), dict)
+            else {}
+        )
+        diff_type = str(row.get("diff_type", payload.get("decision_diff_type", "same")) or "same")
+        base_action = str(base_decision.get("action", "") or "")
+        candidate_action = str(candidate_decision.get("action", "") or "")
+        base_pnls.append(int(base_decision.get("pnl", 0) or 0))
+        candidate_pnls.append(int(candidate_decision.get("pnl", 0) or 0))
+        last_recorded_at = str(row.get("created_at", last_recorded_at) or last_recorded_at)
+
+        if diff_type == "same":
+            same_count += 1
+        else:
+            diff_count += 1
+        if diff_type in {"observe_vs_bet", "tier_more_conservative"}:
+            conservative_count += 1
+        if diff_type == "observe_vs_bet":
+            observe_vs_bet_count += 1
+        if diff_type == "tier_more_aggressive":
+            aggressive_count += 1
+        if diff_type == "direction_diff":
+            direction_diff_count += 1
+
+        if candidate_action != "observe":
+            signal_total += 1
+            signal_hits += 1 if int(candidate_decision.get("signal_hit", 0) or 0) == 1 else 0
+        if candidate_action == "bet":
+            bet_total += 1
+            bet_hits += 1 if int(candidate_decision.get("bet_hit", 0) or 0) == 1 else 0
+        if base_action == "bet" and candidate_action == "observe":
+            aggressive_count += 0
+
+    base_total_pnl = sum(base_pnls)
+    candidate_total_pnl = sum(candidate_pnls)
+    base_drawdown = history_analysis._max_drawdown(base_pnls)
+    candidate_drawdown = history_analysis._max_drawdown(candidate_pnls)
+    metrics = {
+        "sample_size": len(rows),
+        "same_count": same_count,
+        "diff_count": diff_count,
+        "conservative_count": conservative_count,
+        "aggressive_count": aggressive_count,
+        "observe_vs_bet_count": observe_vs_bet_count,
+        "direction_diff_count": direction_diff_count,
+        "candidate_signal_hit_rate": round(signal_hits / signal_total, 4) if signal_total else 0.0,
+        "candidate_bet_hit_rate": round(bet_hits / bet_total, 4) if bet_total else 0.0,
+        "base_total_pnl": base_total_pnl,
+        "candidate_total_pnl": candidate_total_pnl,
+        "delta_pnl": int(candidate_total_pnl - base_total_pnl),
+        "base_drawdown": base_drawdown,
+        "candidate_drawdown": candidate_drawdown,
+        "delta_drawdown": int(base_drawdown - candidate_drawdown),
+        "last_recorded_at": last_recorded_at,
+    }
+    metrics["status"] = _shadow_status_from_metrics(metrics)
+    metrics["summary"] = _summarize_shadow_metrics(metrics)
+    return metrics
+
+
+def _shadow_metrics(user_ctx, candidate_id: str) -> Dict[str, Any]:
+    return _shadow_metrics_from_rows(_shadow_rows(user_ctx, candidate_id))
+
+
+def _apply_shadow_metrics(candidate: Dict[str, Any], metrics: Dict[str, Any]) -> None:
+    candidate["last_shadow_sample_size"] = int(metrics.get("sample_size", 0) or 0)
+    candidate["last_shadow_diff_count"] = int(metrics.get("diff_count", 0) or 0)
+    candidate["last_shadow_conservative_count"] = int(metrics.get("conservative_count", 0) or 0)
+    candidate["last_shadow_aggressive_count"] = int(metrics.get("aggressive_count", 0) or 0)
+    candidate["last_shadow_delta_pnl"] = int(metrics.get("delta_pnl", 0) or 0)
+    candidate["last_shadow_delta_drawdown"] = int(metrics.get("delta_drawdown", 0) or 0)
+    candidate["last_shadow_status"] = str(metrics.get("status", LEARNING_SHADOW_WATCH) or LEARNING_SHADOW_WATCH)
+    candidate["last_shadow_summary"] = str(metrics.get("summary", "") or "")
+    candidate["last_shadowed_at"] = str(metrics.get("last_recorded_at", candidate.get("last_shadowed_at", "")) or "")
+
+
+def activate_candidate_shadow(user_ctx, ident: str = "") -> Dict[str, Any]:
+    center = load_learning_center(user_ctx)
+    candidate = _find_candidate(center, ident)
+    if not candidate:
+        return {"ok": False, "message": "❌ 未找到对应学习候选"}
+
+    eval_status = str(candidate.get("last_evaluation_status", "") or "")
+    if not eval_status:
+        return {"ok": False, "message": "❌ 请先执行 `learn eval`，再开启影子验证"}
+    if eval_status == LEARNING_EVAL_FAIL:
+        return {"ok": False, "message": "❌ 当前候选离线评估偏弱，暂不允许开启影子验证"}
+
+    candidate_id = str(candidate.get("candidate_id", "") or "")
+    if str(center.get("active_shadow_candidate_id", "") or "") == candidate_id:
+        return {
+            "ok": True,
+            "candidate": candidate,
+            "message": (
+                "🧠 影子验证已在运行\n\n"
+                f"候选：{candidate.get('candidate_version', '')} | {candidate.get('rule_name', '')}\n"
+                "查看详情：`learn shadow`"
+            ),
+        }
+
+    now_text = _now_text()
+    center["active_shadow_candidate_id"] = candidate_id
+    idx = _find_candidate_index(center, candidate_id)
+    if idx >= 0:
+        center["candidates"][idx]["status"] = LEARNING_STATUS_SHADOW
+        center["candidates"][idx]["updated_at"] = now_text
+        center["candidates"][idx]["shadow_started_at"] = now_text
+        metrics = _shadow_metrics(user_ctx, candidate_id)
+        _apply_shadow_metrics(center["candidates"][idx], metrics)
+        try:
+            history_analysis.record_learning_candidate(user_ctx, center["candidates"][idx])
+        except Exception:
+            pass
+
+    _write_learning_center(user_ctx, center)
+    _update_runtime_learning_snapshot(user_ctx, center)
+    return {
+        "ok": True,
+        "candidate": _find_candidate(center, candidate_id),
+        "message": (
+            "🧠 已开启影子验证\n\n"
+            f"候选：{candidate.get('candidate_version', '')} | {candidate.get('rule_name', '')}\n"
+            f"离线状态：{candidate.get('last_evaluation_status', '-') or '-'}\n"
+            "后续：系统会在每次结算时记录同盘面对比，不影响真钱下注。"
+        ),
+    }
+
+
+def deactivate_candidate_shadow(user_ctx, ident: str = "") -> Dict[str, Any]:
+    center = load_learning_center(user_ctx)
+    active_id = str(center.get("active_shadow_candidate_id", "") or "")
+    if not active_id:
+        return {"ok": True, "message": "🧠 当前没有运行中的影子验证"}
+
+    candidate = _find_candidate(center, ident or active_id)
+    if not candidate:
+        center["active_shadow_candidate_id"] = ""
+        _write_learning_center(user_ctx, center)
+        _update_runtime_learning_snapshot(user_ctx, center)
+        return {"ok": True, "message": "🧠 已清理失效的影子验证标记"}
+
+    candidate_id = str(candidate.get("candidate_id", "") or "")
+    if candidate_id != active_id:
+        return {"ok": False, "message": "❌ 指定候选当前不是运行中的影子验证对象"}
+
+    now_text = _now_text()
+    metrics = _shadow_metrics(user_ctx, candidate_id)
+    idx = _find_candidate_index(center, candidate_id)
+    if idx >= 0:
+        center["candidates"][idx]["updated_at"] = now_text
+        center["candidates"][idx]["shadow_stopped_at"] = now_text
+        _apply_shadow_metrics(center["candidates"][idx], metrics)
+        try:
+            history_analysis.record_learning_candidate(user_ctx, center["candidates"][idx])
+        except Exception:
+            pass
+    center["active_shadow_candidate_id"] = ""
+    _write_learning_center(user_ctx, center)
+    _update_runtime_learning_snapshot(user_ctx, center)
+    return {
+        "ok": True,
+        "candidate": candidate,
+        "metrics": metrics,
+        "message": (
+            "🧠 已关闭影子验证\n\n"
+            f"候选：{candidate.get('candidate_version', '')} | {candidate.get('rule_name', '')}\n"
+            f"摘要：{metrics.get('summary', '暂无影子样本') or '暂无影子样本'}"
+        ),
+    }
+
+
+def _shadow_round_context(user_ctx, round_key: str) -> Dict[str, Dict[str, Any]]:
+    rounds = history_analysis._rows_by_round_key(user_ctx, "rounds", [round_key])
+    decisions = history_analysis._rows_by_round_key(user_ctx, "decisions", [round_key])
+    executions = history_analysis._rows_by_round_key(user_ctx, "execution_records", [round_key])
+    settlements = history_analysis._rows_by_round_key(user_ctx, "settlements", [round_key])
+    regimes = history_analysis._rows_by_round_key(user_ctx, "regime_features", [round_key])
+    return {
+        "round_row": history_analysis._latest_row_map(rounds).get(round_key, {}),
+        "decision_row": history_analysis._latest_row_map(decisions).get(round_key, {}),
+        "execution_row": history_analysis._latest_row_map(executions).get(round_key, {}),
+        "settlement_row": history_analysis._latest_row_map(settlements).get(round_key, {}),
+        "regime_row": history_analysis._latest_row_map(regimes).get(round_key, {}),
+    }
+
+
+def _fallback_execution_row(user_ctx, round_key: str) -> Dict[str, Any]:
+    rt = user_ctx.state.runtime
+    action_type = str(rt.get("last_execution_action", "") or "")
+    if action_type not in {"bet", "blocked", "observe", "strategy_observe"}:
+        return {}
+    normalized_action = "observe" if action_type == "strategy_observe" else action_type
+    return {
+        "round_key": round_key,
+        "action_type": normalized_action,
+        "blocked_by": str(rt.get("last_blocked_by", "") or ""),
+        "preset_name": str(rt.get("current_dynamic_tier", rt.get("current_preset_name", "")) or ""),
+        "bet_amount": int(rt.get("bet_amount", 0) or 0),
+    }
+
+
+def _synthetic_shadow_settlement(
+    user_ctx,
+    round_key: str,
+    result_side: str,
+    decision_row: Dict[str, Any],
+    execution_row: Dict[str, Any],
+) -> Dict[str, Any]:
+    action_type = str(execution_row.get("action_type", "") or "")
+    if action_type != "bet":
+        return {"round_key": round_key, "profit": 0, "is_win": 0}
+
+    bet_amount = int(execution_row.get("bet_amount", 0) or 0)
+    if bet_amount <= 0:
+        for item in reversed(list(getattr(user_ctx.state, "bet_sequence_log", []) or [])):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("round_key", "") or "") != round_key:
+                continue
+            bet_amount = int(item.get("amount", 0) or 0)
+            break
+    direction_code = str(decision_row.get("direction_code", "") or "")
+    is_win = 1 if direction_code in {"big", "small"} and direction_code == result_side else 0
+    profit = int(round(bet_amount * 0.99)) if is_win and bet_amount > 0 else -bet_amount
+    return {
+        "round_key": round_key,
+        "profit": profit,
+        "is_win": is_win,
+    }
+
+
+def _shadow_temperature_level(user_ctx, round_key: str) -> str:
+    rows = history_analysis._analytics_rows(
+        user_ctx,
+        "SELECT round_key, profit FROM settlements ORDER BY settled_at ASC",
+    )
+    pnls = [
+        int(row.get("profit", 0) or 0)
+        for row in rows
+        if str(row.get("round_key", "") or "") != str(round_key or "")
+    ]
+    return _derive_temperature_level(pnls)
+
+
+def record_active_shadow_round(
+    user_ctx,
+    round_key: str = "",
+    result_num: Any = None,
+    result_type: Any = "",
+) -> Dict[str, Any]:
+    center = load_learning_center(user_ctx)
+    candidate = _find_candidate(center, str(center.get("active_shadow_candidate_id", "") or ""))
+    if not candidate:
+        if str(center.get("active_shadow_candidate_id", "") or ""):
+            center["active_shadow_candidate_id"] = ""
+            _write_learning_center(user_ctx, center)
+            _update_runtime_learning_snapshot(user_ctx, center)
+        return {"ok": True, "recorded": False}
+
+    round_key = str(round_key or getattr(user_ctx.state, "runtime", {}).get("current_round_key", "") or "")
+    if not round_key:
+        return {"ok": True, "recorded": False}
+
+    context = _shadow_round_context(user_ctx, round_key)
+    decision_row = context.get("decision_row", {}) if isinstance(context.get("decision_row", {}), dict) else {}
+    if not decision_row:
+        return {"ok": True, "recorded": False}
+
+    execution_row = context.get("execution_row", {}) if isinstance(context.get("execution_row", {}), dict) else {}
+    if not execution_row:
+        execution_row = _fallback_execution_row(user_ctx, round_key)
+    if not execution_row:
+        return {"ok": True, "recorded": False}
+
+    round_row = context.get("round_row", {}) if isinstance(context.get("round_row", {}), dict) else {}
+    result_side = str(round_row.get("result_side", "") or "") or _normalize_result_side(result_num, result_type)
+    if not round_row:
+        round_row = {"round_key": round_key, "result_side": result_side}
+    elif result_side and not str(round_row.get("result_side", "") or ""):
+        round_row["result_side"] = result_side
+
+    settlement_row = (
+        context.get("settlement_row", {})
+        if isinstance(context.get("settlement_row", {}), dict)
+        else {}
+    )
+    if not settlement_row:
+        settlement_row = _synthetic_shadow_settlement(user_ctx, round_key, result_side, decision_row, execution_row)
+    regime_row = context.get("regime_row", {}) if isinstance(context.get("regime_row", {}), dict) else {}
+    rolling_temp = _shadow_temperature_level(user_ctx, round_key)
+    simulated = _simulate_candidate_round(
+        candidate,
+        round_row,
+        regime_row,
+        decision_row,
+        execution_row,
+        settlement_row,
+        rolling_temp,
+    )
+    base_direction = str(decision_row.get("direction_code", "") or "")
+    candidate_direction = base_direction
+    diff_type = _shadow_diff_type(
+        str(simulated.get("base_action", "") or ""),
+        str(simulated.get("candidate_action", "") or ""),
+        str(simulated.get("base_tier", "") or ""),
+        str(simulated.get("candidate_tier", "") or ""),
+        base_direction,
+        candidate_direction,
+    )
+    created_at = _now_text()
+    base_bet_amount = int(execution_row.get("bet_amount", 0) or 0) if simulated.get("base_action") == "bet" else 0
+    candidate_tier = str(simulated.get("candidate_tier", "") or "")
+    candidate_bet_amount = _tier_amount(candidate_tier) if candidate_tier else 0
+    payload = {
+        "round_key": round_key,
+        "result_side": result_side,
+        "regime_label": str(simulated.get("regime_label", "") or ""),
+        "decision_diff_type": diff_type,
+        "base_policy_version": str(
+            decision_row.get("policy_version", candidate.get("based_on_policy_version", "")) or ""
+        ),
+        "candidate_version": str(candidate.get("candidate_version", "") or ""),
+        "base_decision": {
+            "action": str(simulated.get("base_action", "") or ""),
+            "direction_code": base_direction,
+            "tier": str(simulated.get("base_tier", "") or ""),
+            "bet_amount": base_bet_amount,
+            "pnl": int(simulated.get("base_pnl", 0) or 0),
+            "blocked_by": str(execution_row.get("blocked_by", "") or ""),
+            "signal_hit": 1
+            if str(simulated.get("base_action", "") or "") != "observe"
+            and base_direction in {"big", "small"}
+            and base_direction == result_side
+            else 0,
+            "bet_hit": int(settlement_row.get("is_win", 0) or 0)
+            if str(simulated.get("base_action", "") or "") == "bet"
+            else 0,
+        },
+        "candidate_decision": {
+            "action": str(simulated.get("candidate_action", "") or ""),
+            "direction_code": candidate_direction,
+            "tier": candidate_tier,
+            "bet_amount": candidate_bet_amount,
+            "pnl": int(simulated.get("candidate_pnl", 0) or 0),
+            "signal_hit": int(simulated.get("signal_hit", 0) or 0),
+            "bet_hit": int(simulated.get("bet_hit", 0) or 0),
+            "reasons": list(simulated.get("reasons", []) or []),
+        },
+    }
+    shadow_record = {
+        "shadow_id": f"{str(candidate.get('candidate_id', '') or '')}:{round_key}",
+        "candidate_id": str(candidate.get("candidate_id", "") or ""),
+        "candidate_version": str(candidate.get("candidate_version", "") or ""),
+        "round_key": round_key,
+        "status": "recorded",
+        "diff_type": diff_type,
+        "payload": payload,
+        "created_at": created_at,
+    }
+    history_analysis.record_learning_shadow(user_ctx, shadow_record)
+
+    center["last_shadow_recorded_at"] = created_at
+    idx = _find_candidate_index(center, str(candidate.get("candidate_id", "") or ""))
+    metrics: Dict[str, Any] = {}
+    if idx >= 0:
+        center["candidates"][idx]["status"] = LEARNING_STATUS_SHADOW
+        center["candidates"][idx]["updated_at"] = created_at
+        center["candidates"][idx]["last_shadow_diff_type"] = diff_type
+        metrics = _shadow_metrics(user_ctx, str(candidate.get("candidate_id", "") or ""))
+        _apply_shadow_metrics(center["candidates"][idx], metrics)
+        try:
+            history_analysis.record_learning_candidate(user_ctx, center["candidates"][idx])
+        except Exception:
+            pass
+    _write_learning_center(user_ctx, center)
+    _update_runtime_learning_snapshot(user_ctx, center)
+    return {
+        "ok": True,
+        "recorded": True,
+        "shadow": shadow_record,
+        "metrics": metrics,
+    }
+
+
 def build_learning_evaluation_text(candidate: Dict[str, Any], evaluation: Dict[str, Any]) -> str:
     metrics = evaluation.get("metrics", {}) if isinstance(evaluation.get("metrics", {}), dict) else {}
     status = str(evaluation.get("status", LEARNING_EVAL_WATCH) or LEARNING_EVAL_WATCH)
@@ -842,6 +1367,7 @@ def build_learning_overview_text(user_ctx) -> str:
     center = load_learning_center(user_ctx)
     candidates = _sorted_candidates(center)
     latest = candidates[-1] if candidates else {}
+    active_shadow = _find_candidate(center, str(center.get("active_shadow_candidate_id", "") or ""))
     active_policy = policy_engine.build_policy_prompt_context(user_ctx)
     status_counter: Dict[str, int] = {}
     for item in candidates:
@@ -851,7 +1377,7 @@ def build_learning_overview_text(user_ctx) -> str:
     lines = [
         "🧠 受控自学习中心",
         "",
-        "当前实现：H1/H2/H3 已启用（候选中心 / 规则生成 / 离线评估）",
+        "当前实现：H1/H2/H3/H4 已启用（候选中心 / 规则生成 / 离线评估 / 影子验证）",
         f"当前策略：{active_policy.get('policy_id', '')}@{active_policy.get('policy_version', '')} ({active_policy.get('policy_mode', '')})",
         f"候选总数：{len(candidates)}",
         f"状态分布：{status_text}",
@@ -859,9 +1385,12 @@ def build_learning_overview_text(user_ctx) -> str:
         f"最近候选：{latest.get('candidate_id', '') or '-'}",
         f"候选摘要：{latest.get('summary', '') or '-'}",
         f"最近评估：{latest.get('last_evaluation_status', '') or '-'} / {latest.get('last_score_total', '-')}",
+        f"影子运行：{active_shadow.get('candidate_version', '-') if active_shadow else '-'}",
+        f"最近影子：{center.get('last_shadow_recorded_at', '') or '-'}",
         "",
         "命令：`learn` / `learn gen` / `learn list` / `learn show <id|cX>` / `learn eval [id|cX]`",
-        "后续：`learn shadow` / `learn gray` / `learn promote` / `learn rollback`",
+        "影子：`learn shadow` / `learn shadow <id|cX> on` / `learn shadow off`",
+        "后续：`learn gray` / `learn promote` / `learn rollback`",
     ]
     return "\n".join(lines)
 
@@ -874,8 +1403,12 @@ def build_learning_list_text(user_ctx) -> str:
     lines = ["🧠 学习候选列表", ""]
     for item in candidates[-10:]:
         score_text = item.get("last_score_total", "-")
+        shadow_text = ""
+        shadow_samples = int(item.get("last_shadow_sample_size", 0) or 0)
+        if shadow_samples > 0:
+            shadow_text = f" | shadow {shadow_samples}/{item.get('last_shadow_status', '-')}"
         lines.append(
-            f"- {item.get('candidate_version', '')} | {item.get('rule_name', '')} | {item.get('status', '')} | score {score_text} | {item.get('summary', '')}"
+            f"- {item.get('candidate_version', '')} | {item.get('rule_name', '')} | {item.get('status', '')} | score {score_text}{shadow_text} | {item.get('summary', '')}"
         )
     return "\n".join(lines)
 
@@ -901,6 +1434,7 @@ def build_learning_detail_text(user_ctx, ident: str = "") -> str:
         f"基于策略：{candidate.get('based_on_policy_id', '')}@{candidate.get('based_on_policy_version', '')}",
         f"创建时间：{candidate.get('created_at', '')}",
         f"最近评估：{candidate.get('last_evaluation_status', '') or '-'} / {candidate.get('last_score_total', '-')}",
+        f"影子状态：{candidate.get('last_shadow_status', '-') or '-'} | 样本 {int(candidate.get('last_shadow_sample_size', 0) or 0)}",
         f"摘要：{candidate.get('summary', '')}",
         f"标签：{', '.join(candidate.get('tags', []) or []) or '-'}",
         "",
@@ -923,12 +1457,55 @@ def build_learning_detail_text(user_ctx, ident: str = "") -> str:
     )
     if candidate.get("last_evaluation_summary"):
         lines.extend(["", "离线评估摘要：", str(candidate.get("last_evaluation_summary", "") or "-")])
+    if candidate.get("last_shadow_summary"):
+        lines.extend(["", "影子验证摘要：", str(candidate.get("last_shadow_summary", "") or "-")])
+    return "\n".join(lines)
+
+
+def build_learning_shadow_text(user_ctx, ident: str = "") -> str:
+    center = load_learning_center(user_ctx)
+    active_candidate = _find_candidate(center, str(center.get("active_shadow_candidate_id", "") or ""))
+    target = _find_candidate(center, ident) if ident else active_candidate
+    lines = [
+        "🧠 学习候选影子验证",
+        "",
+        f"当前运行：{active_candidate.get('candidate_version', '-') if active_candidate else '-'}",
+        f"最近记录：{center.get('last_shadow_recorded_at', '') or '-'}",
+    ]
+    if not target:
+        lines.extend(
+            [
+                "",
+                "当前没有运行中的影子候选。",
+                "启用：`learn shadow <id|cX> on`",
+                "关闭：`learn shadow off`",
+            ]
+        )
+        return "\n".join(lines)
+
+    metrics = _shadow_metrics(user_ctx, str(target.get("candidate_id", "") or ""))
+    running = active_candidate and str(active_candidate.get("candidate_id", "") or "") == str(target.get("candidate_id", "") or "")
+    lines.extend(
+        [
+            "",
+            f"候选：{target.get('candidate_version', '')} | {target.get('rule_name', '')}",
+            f"运行状态：{'运行中' if running else '未运行'}",
+            f"影子结论：{_shadow_status_text(str(metrics.get('status', LEARNING_SHADOW_WATCH) or LEARNING_SHADOW_WATCH))}",
+            f"样本：{int(metrics.get('sample_size', 0) or 0)} | 差异：{int(metrics.get('diff_count', 0) or 0)} | 相同：{int(metrics.get('same_count', 0) or 0)}",
+            f"保守：{int(metrics.get('conservative_count', 0) or 0)} | 激进：{int(metrics.get('aggressive_count', 0) or 0)} | 方向差异：{int(metrics.get('direction_diff_count', 0) or 0)}",
+            f"候选命中：{float(metrics.get('candidate_signal_hit_rate', 0.0) or 0.0) * 100:.1f}% | 候选实盘命中：{float(metrics.get('candidate_bet_hit_rate', 0.0) or 0.0) * 100:.1f}%",
+            f"收益：{int(metrics.get('candidate_total_pnl', 0) or 0):+,} | 基线：{int(metrics.get('base_total_pnl', 0) or 0):+,} | Δ {int(metrics.get('delta_pnl', 0) or 0):+,}",
+            f"回撤：{int(metrics.get('candidate_drawdown', 0) or 0):,} | 基线：{int(metrics.get('base_drawdown', 0) or 0):,} | 改善 {int(metrics.get('delta_drawdown', 0) or 0):+,}",
+            f"摘要：{metrics.get('summary', '暂无影子样本') or '暂无影子样本'}",
+            "",
+            "命令：`learn shadow <id|cX> on` / `learn shadow off`",
+        ]
+    )
     return "\n".join(lines)
 
 
 def build_learning_pending_text(subcmd: str) -> str:
     mapping = {
-        "shadow": "H4 影子验证器",
         "gray": "H5 单账号灰度",
         "promote": "H5 转正",
         "rollback": "H5 回滚",
@@ -936,5 +1513,5 @@ def build_learning_pending_text(subcmd: str) -> str:
     stage_text = mapping.get(str(subcmd or "").strip().lower(), "后续阶段")
     return (
         f"🧠 `{subcmd}` 尚未实现\n\n"
-        f"该命令属于 {stage_text}，当前分支已完成 H1/H2，接下来会按顺序继续实现。"
+        f"该命令属于 {stage_text}，当前分支已完成 H1/H2/H3/H4，接下来会按顺序继续实现。"
     )

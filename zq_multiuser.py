@@ -4019,6 +4019,15 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                     ttl_seconds=90,
                     attr_name="shadow_probe_message",
                 )
+        try:
+            self_learning_engine.record_active_shadow_round(
+                user_ctx,
+                round_key=str(rt.get("current_round_key", "") or ""),
+                result_num=result_num,
+                result_type=result_type,
+            )
+        except Exception as e:
+            log_event(logging.WARNING, 'learning_shadow', '写入学习影子记录失败', user_id=user_ctx.user_id, data=str(e))
         
         log_event(logging.INFO, 'settle', '更新历史记录', 
                   user_id=user_ctx.user_id, data=f'result={result}, history_len={len(state.history)}')
@@ -4906,7 +4915,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `learn` : 查看受控自学习中心
 - `learn gen` / `learn list` / `learn show <id|cX>` : 生成、查看学习候选
 - `learn eval [id|cX]` : 对候选执行离线评估
-- `learn shadow` / `learn gray` / `learn promote` / `learn rollback` : 受控自学习后续阶段入口
+- `learn shadow` / `learn shadow <id|cX> on` / `learn shadow off` : 管理学习候选影子验证
+- `learn gray` / `learn promote` / `learn rollback` : 受控自学习后续阶段入口
 - `fleet` / `users` : 查看多账号总览
 - `fleet task` : 查看多账号任务/任务包视图
 - `fleet policy` : 查看多账号策略灰度视图
@@ -5409,7 +5419,30 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 user_ctx.save_state()
                 await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
                 return
-            if subcmd in {"shadow", "gray", "promote", "rollback"}:
+            if subcmd == "shadow":
+                ident = my[2] if len(my) >= 3 else ""
+                action = str(my[3]).strip().lower() if len(my) >= 4 else ""
+                if not ident:
+                    await send_to_admin(client, self_learning_engine.build_learning_shadow_text(user_ctx), user_ctx, global_config)
+                    return
+                if ident.lower() == "off":
+                    result = self_learning_engine.deactivate_candidate_shadow(user_ctx)
+                    user_ctx.save_state()
+                    await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                    return
+                if action == "on":
+                    result = self_learning_engine.activate_candidate_shadow(user_ctx, ident)
+                    user_ctx.save_state()
+                    await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                    return
+                if action == "off":
+                    result = self_learning_engine.deactivate_candidate_shadow(user_ctx, ident)
+                    user_ctx.save_state()
+                    await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                    return
+                await send_to_admin(client, self_learning_engine.build_learning_shadow_text(user_ctx, ident), user_ctx, global_config)
+                return
+            if subcmd in {"gray", "promote", "rollback"}:
                 await send_to_admin(client, self_learning_engine.build_learning_pending_text(subcmd), user_ctx, global_config)
                 return
 
@@ -5424,6 +5457,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "`learn show <id|cX>`\n"
                     "`learn eval [id|cX]`\n"
                     "`learn shadow`\n"
+                    "`learn shadow <id|cX> on`\n"
+                    "`learn shadow off`\n"
                     "`learn gray`\n"
                     "`learn promote`\n"
                     "`learn rollback`"

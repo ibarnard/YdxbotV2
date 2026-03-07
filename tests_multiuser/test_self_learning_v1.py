@@ -378,3 +378,112 @@ def test_process_user_command_learn(tmp_path, monkeypatch):
     assert any("学习候选列表" in text for text in sent_messages)
     assert any("学习候选详情" in text for text in sent_messages)
     assert any("学习候选离线评估" in text for text in sent_messages)
+
+
+def test_activate_shadow_and_record_learning_shadow(tmp_path, monkeypatch):
+    ctx = _make_user_context(tmp_path, user_id=9806)
+    _seed_learning_eval_analytics(ctx)
+    monkeypatch.setattr(
+        self_learning_engine.policy_engine,
+        "build_policy_prompt_context",
+        lambda user_ctx, analysis_snapshot=None: _sample_policy_context(),
+    )
+    generated = self_learning_engine.generate_candidates_from_evidence(ctx)
+    assert generated["created_count"] >= 1
+
+    center = self_learning_engine.load_learning_center(ctx)
+    candidate = center["candidates"][0]
+    candidate["status"] = self_learning_engine.LEARNING_STATUS_EVALUATED
+    candidate["last_evaluation_status"] = self_learning_engine.LEARNING_EVAL_WATCH
+    candidate["last_score_total"] = 55.0
+    self_learning_engine._write_learning_center(ctx, center)
+
+    activated = self_learning_engine.activate_candidate_shadow(ctx, candidate["candidate_version"])
+    assert activated["ok"] is True
+
+    recorded = self_learning_engine.record_active_shadow_round(ctx, "rk_eval_1", 1, "大")
+    assert recorded["ok"] is True
+    assert recorded["recorded"] is True
+    assert recorded["shadow"]["diff_type"] in {
+        "same",
+        "observe_vs_bet",
+        "tier_more_conservative",
+        "tier_more_aggressive",
+        "direction_diff",
+    }
+
+    center_after = self_learning_engine.load_learning_center(ctx)
+    candidate_after = center_after["candidates"][0]
+    assert center_after["active_shadow_candidate_id"] == candidate["candidate_id"]
+    assert candidate_after["status"] == self_learning_engine.LEARNING_STATUS_SHADOW
+    assert int(candidate_after["last_shadow_sample_size"]) >= 1
+    assert candidate_after["last_shadow_status"] in {
+        self_learning_engine.LEARNING_SHADOW_PASS,
+        self_learning_engine.LEARNING_SHADOW_WATCH,
+        self_learning_engine.LEARNING_SHADOW_FAIL,
+    }
+
+    db_path = Path(ctx.user_dir) / "analytics.db"
+    assert _table_count(db_path, "learning_shadows") >= 1
+    row = _table_row(db_path, "SELECT candidate_version, diff_type FROM learning_shadows LIMIT 1")
+    assert row["candidate_version"] == candidate["candidate_version"]
+    assert row["diff_type"]
+
+    shadow_text = self_learning_engine.build_learning_shadow_text(ctx)
+    assert "学习候选影子验证" in shadow_text
+    assert candidate["candidate_version"] in shadow_text
+
+
+def test_process_user_command_learn_shadow(tmp_path, monkeypatch):
+    ctx = _make_user_context(tmp_path, user_id=9807)
+    _seed_learning_eval_analytics(ctx)
+    monkeypatch.setattr(
+        self_learning_engine.policy_engine,
+        "build_policy_prompt_context",
+        lambda user_ctx, analysis_snapshot=None: _sample_policy_context(),
+    )
+    generated = self_learning_engine.generate_candidates_from_evidence(ctx)
+    assert generated["created_count"] >= 1
+
+    center = self_learning_engine.load_learning_center(ctx)
+    center["candidates"][0]["status"] = self_learning_engine.LEARNING_STATUS_EVALUATED
+    center["candidates"][0]["last_evaluation_status"] = self_learning_engine.LEARNING_EVAL_WATCH
+    center["candidates"][0]["last_score_total"] = 54.0
+    self_learning_engine._write_learning_center(ctx, center)
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
+        sent_messages.append(message)
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    asyncio.run(
+        zm.process_user_command(
+            None,
+            type("E", (), {"raw_text": "learn shadow c1 on", "chat_id": 1, "id": 1})(),
+            ctx,
+            {},
+        )
+    )
+    asyncio.run(
+        zm.process_user_command(
+            None,
+            type("E", (), {"raw_text": "learn shadow", "chat_id": 1, "id": 2})(),
+            ctx,
+            {},
+        )
+    )
+    asyncio.run(
+        zm.process_user_command(
+            None,
+            type("E", (), {"raw_text": "learn shadow off", "chat_id": 1, "id": 3})(),
+            ctx,
+            {},
+        )
+    )
+
+    assert any("已开启影子验证" in text for text in sent_messages)
+    assert any("学习候选影子验证" in text for text in sent_messages)
+    assert any("已关闭影子验证" in text for text in sent_messages)

@@ -1879,6 +1879,32 @@ def record_learning_evaluation(user_ctx, evaluation: Dict[str, Any]) -> None:
     )
 
 
+def record_learning_shadow(user_ctx, shadow: Dict[str, Any]) -> None:
+    _write_analytics(
+        user_ctx,
+        [
+            (
+                """
+                INSERT OR REPLACE INTO learning_shadows (
+                    shadow_id, candidate_id, candidate_version, round_key, status,
+                    diff_type, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(shadow.get("shadow_id", "") or ""),
+                    str(shadow.get("candidate_id", "") or ""),
+                    str(shadow.get("candidate_version", "") or ""),
+                    str(shadow.get("round_key", "") or ""),
+                    str(shadow.get("status", "recorded") or "recorded"),
+                    str(shadow.get("diff_type", "same") or "same"),
+                    _json_text(shadow.get("payload", {})),
+                    str(shadow.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")) or ""),
+                ),
+            ),
+        ],
+    )
+
+
 def record_risk_action(
     user_ctx,
     *,

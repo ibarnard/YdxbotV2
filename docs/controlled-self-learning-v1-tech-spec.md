@@ -47,7 +47,7 @@
 - 已完成：`H1 候选中心`
 - 已完成：`H2 候选生成器`
 - 已完成：`H3 离线评估器`
-- 待实现：`H4 影子验证器`
+- 已完成：`H4 影子验证器`
 - 待实现：`H5 灰度与转正`
 
 ---
@@ -595,6 +595,7 @@ V1 建议新增命令族：
 - `learn list`
 - `learn show <candidate_id>`
 - `learn eval <candidate_id>`
+- `learn shadow`
 - `learn shadow <candidate_id> on|off`
 - `learn gray <candidate_id> <账号名|ID>`
 - `learn promote <candidate_id>`
@@ -606,7 +607,9 @@ V1 建议新增命令族：
 - `learn eval`
   - 跑离线评估
 - `learn shadow`
-  - 打开/关闭影子验证
+  - 查看当前影子验证状态
+- `learn shadow <candidate_id> on|off`
+  - 打开/关闭指定候选的影子验证
 - `learn gray`
   - 对指定账号灰度
 - `learn promote`
