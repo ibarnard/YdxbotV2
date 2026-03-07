@@ -70,6 +70,17 @@ def test_create_package_from_template_with_overrides(tmp_path):
     assert all(task["max_loss"] == 18000 for task in ctx.tasks)
 
 
+def test_build_package_overview_text_wraps_command_hints(tmp_path):
+    ctx = _make_user_context(tmp_path, user_id=9406)
+
+    text = task_package_engine.build_package_overview_text(ctx)
+
+    assert "当前运行：无" in text
+    assert "命令：`pkg tpl` / `pkg new <模板>` / `pkg list`" in text
+    assert "详情：`pkg show <id>` / `pkg logs [id]` / `pkg stats [id]`" in text
+    assert "控制：`pkg run <id>` / `pkg pause <id>` / `pkg resume <id>`" in text
+
+
 def test_prepare_package_for_round_selects_trend_task(tmp_path):
     ctx = _make_user_context(tmp_path, user_id=9402)
     result = task_package_engine.create_package_from_template(ctx, "稳健包", "主包")

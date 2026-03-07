@@ -943,7 +943,9 @@ def build_task_overview_text(user_ctx) -> str:
         [
             "",
             f"任务总数：{len(tasks)} | 已启用：{enabled_count}",
-            "命令：`task tpl` / `task new <模板>` / `task list` / `task add ...` / `task show <id>` / `task run <id>` / `task pause <id>` / `task resume <id>` / `task logs [id]` / `task stats [id]`",
+            "命令：`task tpl` / `task new <模板>` / `task list`",
+            "详情：`task add ...` / `task show <id>` / `task run <id>`",
+            "控制：`task pause <id>` / `task resume <id>` / `task logs [id]` / `task stats [id]`",
         ]
     )
     return "\n".join(lines)

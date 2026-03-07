@@ -127,6 +127,44 @@ def get_recent_runtime_fault(user_ctx, max_age_sec: int = 24 * 3600) -> Dict[str
     return dict(fault)
 
 
+def clear_runtime_faults(
+    user_ctx,
+    *,
+    stage_prefixes: List[str] | None = None,
+    error_types: List[str] | None = None,
+) -> Dict[str, Any]:
+    rt = user_ctx.state.runtime
+    faults = rt.get(RUNTIME_FAULTS_KEY, [])
+    if not isinstance(faults, list):
+        return {"changed": False, "removed": 0}
+
+    stage_prefixes = [str(item or "").strip() for item in (stage_prefixes or []) if str(item or "").strip()]
+    error_types = [str(item or "").strip() for item in (error_types or []) if str(item or "").strip()]
+    if not stage_prefixes and not error_types:
+        return {"changed": False, "removed": 0}
+
+    kept: List[Dict[str, Any]] = []
+    removed = 0
+    for item in faults:
+        if not isinstance(item, dict):
+            continue
+        stage = str(item.get("stage", "") or "")
+        error_type = str(item.get("error_type", "") or "")
+        stage_hit = any(stage.startswith(prefix) for prefix in stage_prefixes)
+        error_hit = error_type in error_types if error_types else False
+        if stage_hit or error_hit:
+            removed += 1
+            continue
+        kept.append(dict(item))
+
+    if removed <= 0:
+        return {"changed": False, "removed": 0}
+
+    rt[RUNTIME_FAULTS_KEY] = kept[-RUNTIME_FAULT_LIMIT:]
+    rt[LAST_RUNTIME_FAULT_KEY] = dict(rt[RUNTIME_FAULTS_KEY][-1]) if rt[RUNTIME_FAULTS_KEY] else {}
+    return {"changed": True, "removed": removed}
+
+
 def format_runtime_fault_brief(fault: Dict[str, Any]) -> str:
     if not isinstance(fault, dict) or not fault:
         return "-"
@@ -137,6 +175,22 @@ def format_runtime_fault_brief(fault: Dict[str, Any]) -> str:
     count = int(fault.get("count", 1) or 1)
     suffix = f" x{count}" if count > 1 else ""
     return f"{occurred_at} | {stage} | {error_type}{suffix} | {message}"
+
+
+def format_runtime_fault_lines(fault: Dict[str, Any], *, indent: str = "  ", message_limit: int = 68) -> List[str]:
+    if not isinstance(fault, dict) or not fault:
+        return [f"{indent}-"]
+    occurred_at = str(fault.get("occurred_at", "") or "-")
+    stage = str(fault.get("stage", "") or "runtime")
+    error_type = str(fault.get("error_type", "") or "RuntimeError")
+    count = int(fault.get("count", 1) or 1)
+    suffix = f" x{count}" if count > 1 else ""
+    message = _first_line(fault.get("message", ""), message_limit)
+    return [
+        f"- {occurred_at} | {stage}",
+        f"{indent}{error_type}{suffix}",
+        f"{indent}{message}",
+    ]
 
 
 def record_runtime_fault(
@@ -432,7 +486,7 @@ def build_doctor_text(user_ctx) -> str:
     if last_fault:
         lines.append("")
         lines.append("最近异常：")
-        lines.append(f"- {format_runtime_fault_brief(last_fault)}")
+        lines.extend(format_runtime_fault_lines(last_fault))
 
     lines.append("")
     lines.append("更多：`doctor fleet` / `watch alerts`")

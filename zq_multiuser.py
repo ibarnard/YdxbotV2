@@ -18,6 +18,7 @@ import uuid
 from collections import Counter
 from logging.handlers import TimedRotatingFileHandler
 from datetime import datetime
+import interaction_journal
 from user_manager import UserContext
 from typing import Dict, Any, List, Optional, Tuple
 import constants
@@ -1118,6 +1119,7 @@ async def _send_tg_bot_notification(
     text: str,
     user_ctx: UserContext,
     log_event_name: str,
+    channel_name: str = "tg_bot",
 ):
     if not isinstance(tg_bot_cfg, dict) or not tg_bot_cfg.get("enable"):
         return
@@ -1129,7 +1131,22 @@ async def _send_tg_bot_notification(
         payload = {"chat_id": chat_id, "text": text}
         try:
             await _post_json_async(url, payload, timeout=5)
+            interaction_journal.record_message(
+                user_ctx,
+                channel=channel_name,
+                target=chat_id,
+                message=text,
+                ok=True,
+            )
         except Exception as e:
+            interaction_journal.record_message(
+                user_ctx,
+                channel=channel_name,
+                target=chat_id,
+                message=text,
+                ok=False,
+                error=str(e),
+            )
             runtime_stability.record_runtime_fault(
                 user_ctx,
                 "tg_bot_notify",
@@ -1172,7 +1189,24 @@ async def send_message_v2(
             if admin_chat:
                 # 修复：多用户分支 - 返回管理员消息对象，确保仪表盘/统计可被后续刷新删除。
                 sent_message = await client.send_message(admin_chat, admin_message, parse_mode=parse_mode)
+                interaction_journal.record_message(
+                    user_ctx,
+                    channel="admin_chat",
+                    target=admin_chat,
+                    message=admin_message,
+                    ok=True,
+                    parse_mode=parse_mode,
+                )
         except Exception as e:
+            interaction_journal.record_message(
+                user_ctx,
+                channel="admin_chat",
+                target=_resolve_admin_chat(user_ctx),
+                message=admin_message,
+                ok=False,
+                error=str(e),
+                parse_mode=parse_mode,
+            )
             runtime_stability.record_runtime_fault(
                 user_ctx,
                 "send_admin",
@@ -1197,7 +1231,13 @@ async def send_message_v2(
                 log_event(logging.ERROR, 'send_msg', 'IYUU通知失败', user_id=user_ctx.user_id, data=str(e))
 
         tg_bot_cfg = user_ctx.config.notification.get("tg_bot", {})
-        await _send_tg_bot_notification(tg_bot_cfg, priority_message, user_ctx, 'TG Bot通知失败')
+        await _send_tg_bot_notification(
+            tg_bot_cfg,
+            priority_message,
+            user_ctx,
+            'TG Bot通知失败',
+            channel_name="priority_tg_bot",
+        )
 
     return sent_message
 
@@ -1288,7 +1328,24 @@ async def send_to_watch(
         watch_chat = _resolve_watch_chat(user_ctx)
         if watch_chat:
             sent_message = await client.send_message(watch_chat, watch_message, parse_mode=parse_mode)
+            interaction_journal.record_message(
+                user_ctx,
+                channel="watch_chat",
+                target=watch_chat,
+                message=watch_message,
+                ok=True,
+                parse_mode=parse_mode,
+            )
     except Exception as e:
+        interaction_journal.record_message(
+            user_ctx,
+            channel="watch_chat",
+            target=_resolve_watch_chat(user_ctx),
+            message=watch_message,
+            ok=False,
+            error=str(e),
+            parse_mode=parse_mode,
+        )
         runtime_stability.record_runtime_fault(
             user_ctx,
             "send_watch",
@@ -1298,8 +1355,44 @@ async def send_to_watch(
         log_event(logging.ERROR, 'send_msg', '发送值守播报失败', user_id=user_ctx.user_id, data=str(e))
 
     watch_tg_bot_cfg = _resolve_watch_tg_bot(user_ctx)
-    await _send_tg_bot_notification(watch_tg_bot_cfg, watch_desp, user_ctx, 'TG Watch通知失败')
+    await _send_tg_bot_notification(
+        watch_tg_bot_cfg,
+        watch_desp,
+        user_ctx,
+        'TG Watch通知失败',
+        channel_name="watch_tg_bot",
+    )
     return sent_message
+
+
+async def _send_watch_query_result(
+    client,
+    event,
+    message: str,
+    user_ctx: UserContext,
+    global_config: dict,
+):
+    """手动 watch 查询统一回 admin_chat，主动播报仍走 watch 通道。"""
+    return await send_to_admin(client, message, user_ctx, global_config)
+
+
+async def _reply_admin_command_result(
+    client,
+    event,
+    message: str,
+    user_ctx: UserContext,
+    global_config: dict,
+    parse_mode: str = "markdown",
+):
+    """命令类反馈统一回 admin_chat，避免 reply/send 分散导致观察链路断裂。"""
+    return await send_message_v2(
+        client,
+        "info",
+        message,
+        user_ctx,
+        global_config,
+        parse_mode=parse_mode,
+    )
 
 
 def _watch_reply_visible_in_chat(user_ctx: UserContext, chat_id: Any) -> bool:
@@ -2776,13 +2869,6 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
             bet_id=bet_id,
         )
 
-        bet_report = generate_mobile_bet_report(
-            state.history,
-            direction,
-            rt["bet_amount"],
-            rt.get("bet_sequence_count", 1),
-            bet_id
-        )
         dynamic_summary = dynamic_betting.build_dynamic_summary(
             {
                 "base_tier": str(rt.get("current_dynamic_base_tier", "") or ""),
@@ -2791,8 +2877,15 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
                 "action_text": str(rt.get("current_dynamic_action_text", "") or ""),
             }
         )
-        if dynamic_summary:
-            bet_report = f"{bet_report}\n\n{dynamic_summary}"
+        bet_report = _build_bet_event_card(
+            user_ctx,
+            direction=direction,
+            amount=rt["bet_amount"],
+            sequence_count=rt.get("bet_sequence_count", 1),
+            bet_id=bet_id,
+            applied_tier=actual_preset_name,
+            dynamic_summary=dynamic_summary,
+        )
         message = await send_to_admin(client, bet_report, user_ctx, global_config)
         asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
         if message:
@@ -2802,12 +2895,12 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         # 仅在“暂停后首次真正下单”时发送恢复说明，避免倒计时结束后反复刷“恢复押注”。
         if rt.get("pause_resume_pending", False):
             reason_text = str(rt.get("pause_resume_pending_reason", "自动暂停")).strip() or "自动暂停"
-            resume_msg = (
-                "✅ 恢复押注（已执行）\n"
-                f"恢复原因：{reason_text} 倒计时结束\n"
-                f"模型信号：{_format_predict_signal_brief(rt)}\n"
-                f"当前动作：已执行第 {rt.get('bet_sequence_count', 1)} 手，方向 {direction}，金额 {format_number(rt['bet_amount'])}\n"
-                "提示：若盘面仍触发风控，会再次自动暂停"
+            resume_msg = _build_auto_resume_card(
+                user_ctx,
+                reason_text=reason_text,
+                direction=direction,
+                amount=rt["bet_amount"],
+                sequence_count=rt.get("bet_sequence_count", 1),
             )
             await _send_transient_admin_notice(
                 client,
@@ -4403,6 +4496,191 @@ def generate_mobile_pause_report(
     return "\n".join(lines)
 
 
+def _compact_multiline_text(text: str, *, max_len: int = 140) -> str:
+    parts = [segment.strip() for segment in str(text or "").splitlines() if segment.strip()]
+    compact = " | ".join(parts)
+    if len(compact) <= max_len:
+        return compact
+    return compact[: max_len - 1] + "…"
+
+
+def _render_direction_label(direction: str) -> str:
+    normalized = str(direction or "").strip().lower()
+    return {
+        "1": "大",
+        "big": "大",
+        "大": "大",
+        "0": "小",
+        "small": "小",
+        "小": "小",
+    }.get(normalized, str(direction or "-"))
+
+
+def _format_signed_amount(value: Any) -> str:
+    return f"{_safe_int(value, 0):+,}"
+
+
+def _build_strategy_brief(user_ctx: UserContext, applied_tier: str = "") -> str:
+    rt = user_ctx.state.runtime
+    current_preset_name = str(rt.get("current_preset_name", "none") or "none")
+    current_tier = (
+        str(applied_tier or "").strip()
+        or str(rt.get("current_dynamic_tier", "") or "").strip()
+        or str(rt.get("current_dynamic_base_tier", "") or "").strip()
+        or current_preset_name
+    )
+    policy_version = str(rt.get("policy_active_version", "-") or "-")
+    policy_mode = str(rt.get("policy_active_mode", "baseline") or "baseline")
+    strategy_text = f"{current_preset_name} -> {current_tier} | policy {policy_version} ({policy_mode})"
+    learning_text = _dashboard_learning_focus_text(user_ctx)
+    if learning_text != "无":
+        strategy_text = f"{strategy_text} | learn {learning_text}"
+    return strategy_text
+
+
+def _build_status_context_brief(user_ctx: UserContext) -> str:
+    state = user_ctx.state
+    rt = state.runtime
+    pending_hand = _dashboard_pending_hand(state, rt)
+    if pending_hand:
+        pending_sequence = _safe_int(pending_hand.get("sequence", rt.get("bet_sequence_count", 0)), 0)
+        pending_direction = _render_direction_label(pending_hand.get("direction", "-"))
+        pending_amount = format_number(pending_hand.get("amount", 0) or 0)
+        return f"有待结算挂单 | 第 {pending_sequence} 手 | {pending_direction} | {pending_amount}"
+    return "当前空仓，等待下一次有效盘口信号"
+
+
+def _build_transition_card(
+    user_ctx: UserContext,
+    *,
+    title: str,
+    action: str,
+    reason: str = "",
+    hint: str = "",
+    current_text: str = "",
+) -> str:
+    lines = [
+        title,
+        f"动作：{action}",
+        f"脚本：{get_bet_status_text(user_ctx.state.runtime)}",
+        f"策略：{_build_strategy_brief(user_ctx)}",
+        f"当前：{current_text or _build_status_context_brief(user_ctx)}",
+    ]
+    if reason:
+        lines.append(f"原因：{_compact_multiline_text(reason, max_len=120)}")
+    if hint:
+        lines.append(f"提示：{_compact_multiline_text(hint, max_len=120)}")
+    return "\n".join(lines)
+
+
+def _build_manual_pause_card(user_ctx: UserContext, *, already_paused: bool = False) -> str:
+    if already_paused:
+        return _build_transition_card(
+            user_ctx,
+            title="⏸️ 状态卡",
+            action="当前已是手动暂停",
+            reason="重复收到 pause 命令",
+            hint="恢复请发送 resume",
+        )
+    return _build_transition_card(
+        user_ctx,
+        title="⏸️ 状态卡",
+        action="手动暂停当前账号",
+        reason="管理员命令 pause",
+        hint="暂停后不再发起新下注，已下注挂单仍按正常结算推进",
+    )
+
+
+def _build_manual_resume_card(user_ctx: UserContext) -> str:
+    return _build_transition_card(
+        user_ctx,
+        title="▶️ 状态卡",
+        action="恢复当前账号下注",
+        reason="管理员命令 resume",
+        hint="恢复后等待下一次有效盘口信号再发起真实下单",
+    )
+
+
+def _build_auto_resume_card(
+    user_ctx: UserContext,
+    *,
+    reason_text: str,
+    direction: str,
+    amount: int,
+    sequence_count: int,
+) -> str:
+    return _build_transition_card(
+        user_ctx,
+        title="✅ 恢复押注（已执行）",
+        action="自动暂停结束后已恢复执行",
+        reason=f"{reason_text} 倒计时结束",
+        hint="若盘面再次触发风控，脚本会重新自动暂停",
+        current_text=(
+            f"已执行第 {sequence_count} 手 | {_render_direction_label(direction)} | {format_number(amount)}"
+        ),
+    ) + f"\n信号：{_compact_multiline_text(_format_predict_signal_brief(user_ctx.state.runtime), max_len=120)}"
+
+
+def _build_bet_event_card(
+    user_ctx: UserContext,
+    *,
+    direction: str,
+    amount: int,
+    sequence_count: int,
+    bet_id: str,
+    applied_tier: str = "",
+    dynamic_summary: str = "",
+) -> str:
+    state = user_ctx.state
+    rt = state.runtime
+    streak_len, streak_side = _get_current_streak(list(getattr(state, "history", []) or []))
+    lines = [
+        "🎯 下单卡",
+        f"手位：第 {sequence_count} 手 | {_render_direction_label(direction)} | {format_number(amount)}",
+        f"盘口：第 {_safe_int(rt.get('current_round', 0), 0)} 盘 | {str(rt.get('current_round_key', '') or '-')}",
+        f"bet_id：{bet_id or '-'}",
+        f"策略：{_build_strategy_brief(user_ctx, applied_tier=applied_tier)}",
+        f"信号：{_compact_multiline_text(_format_predict_signal_brief(rt), max_len=120)}",
+        f"执行：待结算 | 当前连{streak_side}{streak_len}",
+    ]
+    compact_dynamic_summary = _compact_multiline_text(dynamic_summary, max_len=120)
+    if compact_dynamic_summary:
+        lines.append(f"动态：{compact_dynamic_summary}")
+    return "\n".join(lines)
+
+
+def _build_settle_event_card(
+    user_ctx: UserContext,
+    *,
+    bet_label: str,
+    sequence_count: int,
+    direction: str,
+    bet_amount: int,
+    result_text: str,
+    profit: int,
+    result_type: str,
+    result_num: int,
+    predict_info: str = "",
+) -> str:
+    rt = user_ctx.state.runtime
+    lines = [
+        "🧾 结算卡（押注结果）",
+        f"结果：{result_text} {_format_signed_amount(profit)} | 开奖 {result_type}({result_num})",
+        f"手位：第 {sequence_count} 手 | {_render_direction_label(direction)} | {format_number(bet_amount)}",
+        f"bet_id：{bet_label or '-'}",
+        (
+            f"收益：本手 {_format_signed_amount(profit)} | 本局 {_format_signed_amount(rt.get('period_profit', 0))} | "
+            f"累计 {_format_signed_amount(rt.get('earnings', 0))}"
+        ),
+        f"链路：连续押注 {max(sequence_count, _safe_int(rt.get('bet_sequence_count', 0), 0))} 次 | 当前连输 {_safe_int(rt.get('lose_count', 0), 0)}",
+        f"资金：菠菜 {_format_amount_wan(rt.get('gambling_fund', 0))} | 账户 {_dashboard_balance_text(rt)}",
+    ]
+    signal_text = _compact_multiline_text(predict_info or rt.get("last_predict_info", "N/A"), max_len=120)
+    if signal_text:
+        lines.append(f"信号：{signal_text}")
+    return "\n".join(lines)
+
+
 async def process_settle(client, event, user_ctx: UserContext, global_config: dict):
     """处理押注结算 - 与master版本zq_settle完全一致，包括连输告警、回补播报、资金安全等"""
     state = user_ctx.state
@@ -4551,7 +4829,6 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         result_text = None
         direction = None
         profit = 0
-        result_amount = 0
         lose_end_payload = None
         
         async def _apply_settle_fund_safety_guard() -> None:
@@ -4861,7 +5138,6 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
 
                     user_ctx.save_state()
 
-                    result_amount = format_number(int(bet_amount * 0.99) if win else bet_amount)
                     last_bet_id = ""
                     if isinstance(settled_entry, dict):
                         last_bet_id = str(settled_entry.get("bet_id", "") or "")
@@ -4869,13 +5145,18 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
                         last_bet_id = str(state.bet_sequence_log[-1].get("bet_id", "") or "")
                     bet_id = format_bet_id(last_bet_id) if last_bet_id else f"{datetime.now().strftime('%m月%d日')}第 {rt.get('current_round', 1)} 轮第 {rt.get('current_bet_seq', 1)} 次"
                     
-                    mes = f"🔢 **{bet_id}押注结果：**\n"
-                    mes += f"😀 连续押注：{rt.get('bet_sequence_count', 0)} 次\n"
-                    mes += f"⚡ 押注方向：{direction}\n"
-                    mes += f"💵 押注本金：{format_number(bet_amount)}\n"
-                    mes += f"📉 输赢结果：{result_text} {result_amount}\n"
-                    mes += f"🎲 开奖结果：{result_type}\n"
-                    mes += f"🤖 预测依据：{rt.get('last_predict_info', 'N/A')}"
+                    mes = _build_settle_event_card(
+                        user_ctx,
+                        bet_label=bet_id,
+                        sequence_count=settle_seq,
+                        direction=direction,
+                        bet_amount=bet_amount,
+                        result_text=result_text,
+                        profit=profit,
+                        result_type=result_type,
+                        result_num=result_num,
+                        predict_info=str(rt.get("last_predict_info", "N/A") or "N/A"),
+                    )
                     
                     log_event(logging.INFO, 'settle', '发送结算通知', 
                               user_id=user_ctx.user_id, data=f'bet_id={bet_id}')
@@ -5124,7 +5405,7 @@ async def delete_later(client, chat_id, message_id, delay=10):
         pass
 
 
-async def handle_model_command_multiuser(event, args, user_ctx: UserContext, global_config: dict):
+async def handle_model_command_multiuser(client, event, args, user_ctx: UserContext, global_config: dict):
     """处理 model 命令 - 与master版本handle_model_command一致"""
     rt = user_ctx.state.runtime
     sub_cmd = args[0] if args else "list"
@@ -5151,11 +5432,17 @@ async def handle_model_command_multiuser(event, args, user_ctx: UserContext, glo
                 current = "👈 当前" if m.get('model_id') == current_model_id else ""
                 msg += f"{idx}. `{m.get('model_id', 'unknown')}` {status} {current}\n"
                 idx += 1
-        await event.reply(msg)
+        await _reply_admin_command_result(client, event, msg, user_ctx, global_config)
         
     elif sub_cmd in ["select", "use", "switch"]:
         if len(args) < 2:
-            await event.reply("请指定模型ID或编号，例如: `model select 1` 或 `model select qwen3-coder-plus`")
+            await _reply_admin_command_result(
+                client,
+                event,
+                "请指定模型ID或编号，例如: `model select 1` 或 `model select qwen3-coder-plus`",
+                user_ctx,
+                global_config,
+            )
             return
             
         target_id = args[1]
@@ -5168,16 +5455,28 @@ async def handle_model_command_multiuser(event, args, user_ctx: UserContext, glo
             if 1 <= idx <= len(enabled_models):
                 target_id = enabled_models[idx-1].get('model_id', '')
             else:
-                await event.reply(f"❌ 编号 {idx} 无效")
+                await _reply_admin_command_result(client, event, f"❌ 编号 {idx} 无效", user_ctx, global_config)
                 return
         
         # 验证模型是否存在
         model_exists = any(m.get('model_id') == target_id for m in models.values() if m.get("enabled"))
         if not model_exists:
-            await event.reply(f"❌ 模型 `{target_id}` 不存在或未启用")
+            await _reply_admin_command_result(
+                client,
+                event,
+                f"❌ 模型 `{target_id}` 不存在或未启用",
+                user_ctx,
+                global_config,
+            )
             return
             
-        await event.reply(f"🔄 正在切换模型 `{target_id}`...")
+        await _reply_admin_command_result(
+            client,
+            event,
+            f"🔄 正在切换模型 `{target_id}`...",
+            user_ctx,
+            global_config,
+        )
         
         # 切换模型
         rt["current_model_id"] = target_id
@@ -5189,11 +5488,11 @@ async def handle_model_command_multiuser(event, args, user_ctx: UserContext, glo
             f"🔗 **连接状态**: 🟢 正常\n"
             f"🧠 **算法模式**: V10 (已激活)"
         )
-        await event.reply(success_msg)
+        await _reply_admin_command_result(client, event, success_msg, user_ctx, global_config)
         log_event(logging.INFO, 'model', '切换模型', user_id=user_ctx.user_id, model=target_id)
             
     elif sub_cmd == "reload":
-        await event.reply("🔄 重新加载模型配置...")
+        await _reply_admin_command_result(client, event, "🔄 重新加载模型配置...", user_ctx, global_config)
         try:
             user_ctx.reload_user_config()
             model_mgr = user_ctx.get_model_manager()
@@ -5206,15 +5505,33 @@ async def handle_model_command_multiuser(event, args, user_ctx: UserContext, glo
                 if model.get("enabled", True)
             )
             log_event(logging.INFO, 'model', '重新加载模型', user_id=user_ctx.user_id, enabled=enabled_count)
-            await event.reply(f"✅ 模型配置已重新加载（可用模型：{enabled_count}）")
+            await _reply_admin_command_result(
+                client,
+                event,
+                f"✅ 模型配置已重新加载（可用模型：{enabled_count}）",
+                user_ctx,
+                global_config,
+            )
         except Exception as e:
             log_event(logging.ERROR, 'model', '重载模型配置失败', user_id=user_ctx.user_id, error=str(e))
-            await event.reply(f"❌ 模型配置重载失败：{str(e)[:120]}")
+            await _reply_admin_command_result(
+                client,
+                event,
+                f"❌ 模型配置重载失败：{str(e)[:120]}",
+                user_ctx,
+                global_config,
+            )
     else:
-        await event.reply("未知命令。用法:\n`model list`\n`model select <id>`\n`model reload`")
+        await _reply_admin_command_result(
+            client,
+            event,
+            "未知命令。用法:\n`model list`\n`model select <id>`\n`model reload`",
+            user_ctx,
+            global_config,
+        )
 
 
-async def handle_apikey_command_multiuser(event, args, user_ctx: UserContext):
+async def handle_apikey_command_multiuser(client, event, args, user_ctx: UserContext, global_config: dict):
     """处理 apikey 命令：show/set/add/del/test。"""
     rt = user_ctx.state.runtime
     sub_cmd = (args[0].lower() if args else "show")
@@ -5223,26 +5540,36 @@ async def handle_apikey_command_multiuser(event, args, user_ctx: UserContext):
 
     if sub_cmd in ("show", "list", "ls"):
         if not keys:
-            await event.reply(
+            await _reply_admin_command_result(
+                client,
+                event,
                 "当前未配置任何 AI key。\n"
-                "请执行：`apikey set <新key>`"
+                "请执行：`apikey set <新key>`",
+                user_ctx,
+                global_config,
             )
             return
         lines = ["🔐 当前账号 AI key 列表（已脱敏）"]
         for idx, key in enumerate(keys, 1):
             lines.append(f"{idx}. `{_mask_api_key(key)}`")
         lines.append("\n用法：`apikey set <key>` / `apikey add <key>` / `apikey del <序号>` / `apikey test`")
-        await event.reply("\n".join(lines))
+        await _reply_admin_command_result(client, event, "\n".join(lines), user_ctx, global_config)
         return
 
     if sub_cmd in ("set", "add"):
         if len(args) < 2:
-            await event.reply(f"用法：`apikey {sub_cmd} <新key>`")
+            await _reply_admin_command_result(
+                client,
+                event,
+                f"用法：`apikey {sub_cmd} <新key>`",
+                user_ctx,
+                global_config,
+            )
             return
 
         new_key = str(args[1]).strip()
         if not new_key:
-            await event.reply("❌ key 不能为空")
+            await _reply_admin_command_result(client, event, "❌ key 不能为空", user_ctx, global_config)
             return
 
         if sub_cmd == "set":
@@ -5250,7 +5577,13 @@ async def handle_apikey_command_multiuser(event, args, user_ctx: UserContext):
         else:
             updated_keys = list(keys)
             if new_key in updated_keys:
-                await event.reply("⚠️ 该 key 已存在，无需重复添加")
+                await _reply_admin_command_result(
+                    client,
+                    event,
+                    "⚠️ 该 key 已存在，无需重复添加",
+                    user_ctx,
+                    global_config,
+                )
                 return
             updated_keys.append(new_key)
 
@@ -5263,28 +5596,50 @@ async def handle_apikey_command_multiuser(event, args, user_ctx: UserContext):
             user_ctx.save_state()
             model_mgr = user_ctx.get_model_manager()
             model_mgr.load_models()
-            await event.reply(
+            await _reply_admin_command_result(
+                client,
+                event,
                 f"✅ AI key 已更新并写入配置\n"
                 f"文件：`{os.path.basename(config_path)}`\n"
-                f"当前 key 数量：{len(updated_keys)}"
+                f"当前 key 数量：{len(updated_keys)}",
+                user_ctx,
+                global_config,
             )
         except Exception as e:
             log_event(logging.ERROR, 'apikey', '写入 key 失败', user_id=user_ctx.user_id, error=str(e))
-            await event.reply(f"❌ 更新失败：{str(e)[:160]}")
+            await _reply_admin_command_result(
+                client,
+                event,
+                f"❌ 更新失败：{str(e)[:160]}",
+                user_ctx,
+                global_config,
+            )
         return
 
     if sub_cmd in ("del", "rm", "remove"):
         if len(args) < 2:
-            await event.reply("用法：`apikey del <序号>`")
+            await _reply_admin_command_result(
+                client,
+                event,
+                "用法：`apikey del <序号>`",
+                user_ctx,
+                global_config,
+            )
             return
         try:
             idx = int(str(args[1]).strip())
         except ValueError:
-            await event.reply("❌ 序号必须是整数")
+            await _reply_admin_command_result(client, event, "❌ 序号必须是整数", user_ctx, global_config)
             return
 
         if idx < 1 or idx > len(keys):
-            await event.reply(f"❌ 序号超出范围，当前 key 数量：{len(keys)}")
+            await _reply_admin_command_result(
+                client,
+                event,
+                f"❌ 序号超出范围，当前 key 数量：{len(keys)}",
+                user_ctx,
+                global_config,
+            )
             return
 
         updated_keys = list(keys)
@@ -5297,14 +5652,24 @@ async def handle_apikey_command_multiuser(event, args, user_ctx: UserContext):
             if not updated_keys:
                 _mark_ai_key_issue(rt, "管理员删除了全部 key")
             user_ctx.save_state()
-            await event.reply(
+            await _reply_admin_command_result(
+                client,
+                event,
                 f"✅ 已删除第 {idx} 个 key 并写入配置\n"
                 f"文件：`{os.path.basename(config_path)}`\n"
-                f"剩余 key 数量：{len(updated_keys)}"
+                f"剩余 key 数量：{len(updated_keys)}",
+                user_ctx,
+                global_config,
             )
         except Exception as e:
             log_event(logging.ERROR, 'apikey', '删除 key 失败', user_id=user_ctx.user_id, error=str(e))
-            await event.reply(f"❌ 删除失败：{str(e)[:160]}")
+            await _reply_admin_command_result(
+                client,
+                event,
+                f"❌ 删除失败：{str(e)[:160]}",
+                user_ctx,
+                global_config,
+            )
         return
 
     if sub_cmd in ("test", "check"):
@@ -5314,32 +5679,50 @@ async def handle_apikey_command_multiuser(event, args, user_ctx: UserContext):
             if result.get("success"):
                 _clear_ai_key_issue(rt)
                 user_ctx.save_state()
-                await event.reply(
+                await _reply_admin_command_result(
+                    client,
+                    event,
                     f"✅ 模型测试成功\n"
                     f"模型：`{model_id}`\n"
-                    f"延迟：{result.get('latency', '-') }ms"
+                    f"延迟：{result.get('latency', '-') }ms",
+                    user_ctx,
+                    global_config,
                 )
             else:
                 err = str(result.get("error", "unknown"))
                 if _looks_like_ai_key_issue(err):
                     _mark_ai_key_issue(rt, err)
                     user_ctx.save_state()
-                await event.reply(
+                await _reply_admin_command_result(
+                    client,
+                    event,
                     f"❌ 模型测试失败\n"
                     f"模型：`{model_id}`\n"
-                    f"错误：{err[:180]}"
+                    f"错误：{err[:180]}",
+                    user_ctx,
+                    global_config,
                 )
         except Exception as e:
-            await event.reply(f"❌ 测试失败：{str(e)[:180]}")
+            await _reply_admin_command_result(
+                client,
+                event,
+                f"❌ 测试失败：{str(e)[:180]}",
+                user_ctx,
+                global_config,
+            )
         return
 
-    await event.reply(
+    await _reply_admin_command_result(
+        client,
+        event,
         "未知命令。用法：\n"
         "`apikey show`\n"
         "`apikey set <key>`\n"
         "`apikey add <key>`\n"
         "`apikey del <序号>`\n"
-        "`apikey test`"
+        "`apikey test`",
+        user_ctx,
+        global_config,
     )
 
 
@@ -5385,109 +5768,122 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
     try:
         # ========== help命令 ==========
         if cmd == "help":
-            mes = """**️ 命令列表 (Commands)**
+            admin_target = _resolve_admin_chat(user_ctx)
+            if len(my) >= 2 and str(my[1]).strip().lower() in {"all", "full", "more", "detail"}:
+                mes = """**命令列表（完整）**
 
-**基础控制（推荐）**
-- `st [预设名]` : 启动预设并进入可下注状态 (例: `st yc10`)
-- `pause` : 仅暂停当前账号押注（不影响其他账号）
-- `resume` : 恢复当前账号押注
+**基础控制**
+- `status` / `dashboard` : 刷新 admin 驾驶舱
+- `st [预设名]` : 启动预设并进入可下注状态
+- `pause` / `resume` : 暂停或恢复当前账号押注
 - `open/off` : 兼容旧命令（分别等同 `resume/pause`）
 
-**风控说明（重点）**
-- `fk` : 查看当前风控状态与账号默认模式
-- `fk 1 on|off` : 切换盘面风控（并写入当前账号默认）
-- `fk 2 on|off` : 切换入场风控（并写入当前账号默认）
-- `fk 3 on|off` : 切换连输风控（并写入当前账号默认）
-- `fp` : 查看 24 小时复盘总览
-- `fp brief` : 查看压缩复盘摘要
-- `fp gaps` : 查看链路缺口摘要
-- `fp action` : 查看人工动作建议
-- `fp 1` : 查看按盘面复盘
-- `fp 2` : 查看按档位复盘
-- `fp 3` : 查看按手位复盘
-- `fp 4` : 查看观望/阻断复盘
-- `fp 5` : 查看当前盘面证据
-- `fp 6` : 查看链路覆盖与缺失
-- `task` : 查看任务总览
-- `task tpl` : 查看任务模板
-- `task new <模板> [名称] [preset=yc10] [bets=12] [loss=20000]` : 按模板快速创建任务
-- `task list` : 查看任务列表
-- `task add ...` : 创建任务（手动/定时/盘面/混合）
-- `task run <id>` : 立即手动启动任务
-- `task pause|resume <id>` : 暂停/恢复任务
-- `task logs [id]` : 查看任务运行记录
-- `task stats [id]` : 查看任务统计
-- `pkg` : 查看任务包总览
-- `pkg tpl` : 查看任务包模板
-- `pkg new <模板> [名称] [preset=yc10] [bets=12] [loss=20000]` : 按模板快速创建任务包
-- `pkg list` / `pkg show <id>` : 查看任务包列表或详情
-- `pkg run <id>` / `pkg pause <id>` / `pkg resume <id>` : 启动、暂停、恢复任务包
-- `pkg logs [id]` / `pkg stats [id]` : 查看任务包日志与统计
-- `policy` : 查看当前策略版本
-- `policy list` / `policy show [vX]` : 查看策略版本列表或详情
-- `policy sync` : 根据当前复盘事实生成并激活新策略版本（单账户灰度）
-- `policy use <vX>` / `policy rollback` : 切换或回滚策略版本
-- `learn` : 查看受控自学习中心
-- `learn gen` / `learn list` / `learn show <id|cX>` : 生成、查看学习候选
-- `learn eval [id|cX]` : 对候选执行离线评估
-- `learn shadow` / `learn shadow <id|cX> on` / `learn shadow off` : 管理学习候选影子验证
-- `learn gray <id|cX> [当前账号名|ID]` / `learn promote <id|cX>` / `learn rollback` : 学习候选灰度、转正、回滚
-- `doctor` : 查看当前账号启动/运行自检摘要
-- `doctor fleet` : 查看多账号自检总览
-- `watch` / `watch <账号名|ID>` : 发送当前或指定账号值守摘要到当前值守通道
-- `watch fleet` : 发送多账号值守摘要到值守通道
-- `watch risk` / `watch task` / `watch funds` : 发送当前账号风控/任务/资金摘要
-- `watch learn [账号名|ID]` : 发送学习值守摘要到值守通道
-- `watch alerts` : 发送当前值守告警摘要到值守通道
-- `watch quiet [分钟|off]` : 临时静音主动值守播报（手动查询不受影响）
-- `fleet` / `users` : 查看多账号总览
-- `fleet task` : 查看多账号任务/任务包视图
-- `fleet policy` : 查看多账号策略灰度视图
-- `fleet show <账号名|ID>` : 查看单账号详情
-- `fleet gray <账号名|ID> baseline|latest` : 切换指定账号到基线或最新策略版本
-- 说明：风控会直接影响观望、限档、入场阻断与连输暂停，进而影响押注收益；脚本重启后按账号默认模式自动生效
+**值守与自检**
+- `doctor` / `doctor fleet` : 查看账号或多账号自检
+- `watch` / `watch <账号名|ID>` : 查询当前或指定账号值守摘要
+- `watch fleet` / `watch risk` / `watch task` / `watch funds`
+- `watch learn [账号名|ID]` / `watch alerts`
+- `watch quiet [分钟|off]` : 静音主动值守播报
 
-**参数设置**
-- `gf [金额]` : 设置本金 (例: `gf 1000000`)
-- `set [炸] [赢] [停] [盈停]` : 设置风控参数
-  (例: `set 5 1000000 3 5` -> 炸5次, 赢100w, 停3局, 盈停5局)
-- `warn [次数]` : 设置连输告警阈值 (例: `warn 2`)
-- `wlc [次数]` : `warn` 的简写命令
+**风控与复盘**
+- `fk` / `fk 1 on|off` / `fk 2 on|off` / `fk 3 on|off`
+- `fp` / `fp brief` / `fp gaps` / `fp action`
+- `fp 1` / `fp 2` / `fp 3` / `fp 4` / `fp 5` / `fp 6`
+- `replay [条数]` / `explain` / `stats` / `balance`
 
-**模型与策略**
-- `model [list|select|reload]` : 模型管理 (例: `model select 1`)
-- `apikey [show|set|add|del|test]` : 管理当前账号 AI key (`ak` 同义)
-- `ms [模式]` : 切换模式 (0:反投, 1:预测, 2:追投)
+**任务 / 任务包**
+- `task` / `task tpl` / `task list` / `task new <模板>` / `task add ...`
+- `task show <id>` / `task run <id>` / `task pause <id>` / `task resume <id>`
+- `task logs [id]` / `task stats [id]`
+- `pkg` / `pkg tpl` / `pkg list` / `pkg new <模板>`
+- `pkg show <id>` / `pkg run <id>` / `pkg pause <id>` / `pkg resume <id>`
+- `pkg logs [id]` / `pkg stats [id]`
 
-**测算功能**
-- `yc [预设名]` : 测算预设策略盈利 (例: `yc yc05`)
-- `yc [参数...]` : 自定义参数测算 (例: `yc 1 13 3 2.1 2.1 2.05 500`)
+**策略 / 学习**
+- `policy` / `policy list` / `policy show [vX]`
+- `policy sync` / `policy use <vX>` / `policy rollback`
+- `learn` / `learn gen` / `learn list` / `learn show <id|cX>`
+- `learn eval [id|cX]`
+- `learn shadow` / `learn shadow <id|cX> on` / `learn shadow off`
+- `learn gray <id|cX> [当前账号名|ID]`
+- `learn promote <id|cX>` / `learn rollback`
 
-**数据管理**
-- `res tj` : 重置统计数据
-- `res state` : 清空历史与状态
-- `res bet` : 重置押注策略
-- `replay [条数]` : 查看最近复盘重点（决策链路/输赢/金额，默认20条）
-- `explain` : 查看AI决策解释
-- `stats` : 查看连大、连小、连输统计
-- `balance` : 查询账户余额
+**参数 / 预设 / 模型**
+- `gf [金额]` / `set [炸] [赢] [停] [盈停]`
+- `warn [次数]` / `wlc [次数]`
+- `ys [名] ...` / `yss` / `yss dl [名]`
+- `model list|select|reload`
+- `apikey show|set|add|del|test`
+- `ms [0|1|2]`
+- `yc [预设名|参数...]`
+
+**版本 / 维护**
+- `ver` : 查看版本概览
+- `update [版本|提交]`
+- `reback [版本|提交]`
+- `restart`
 - `xx` : 清理配置群中“我发送的消息”
+- `res tj` / `res state` / `res bet`
 
-**发布更新**
-- `ver` : 查看版本概览（最近3个Tag + 最近3个Commit）
-- `update [版本|提交]` : 更新到指定版本（留空默认最新）
-- `reback [版本|提交]` : 回退到指定版本
-- `restart` : 重启当前进程
+**多账号**
+- `fleet` / `users`
+- `fleet task` / `fleet policy`
+- `fleet show <账号名|ID>`
+- `fleet gray <账号名|ID> baseline|latest`
 
-**预设管理**
-- `ys [名] ...` : 保存预设
-- `yss` : 查看所有预设
-- `yss dl [名]` : 删除预设
+说明：
+- 手动查询类命令统一回复到管理员 chat
+- 主动值守播报仍走值守通道
+- 默认管理员 chat：`"""
+                mes += f"{admin_target}`"
+            else:
+                mes = """**命令速览**
 
-**多用户管理**
-- `users` : 查看当前用户状态
-- `status` / `dashboard` : 刷新 admin 驾驶舱
-"""
+**先看状态**
+- `status` / `dashboard`
+- `watch`
+- `doctor`
+
+**常用控制**
+- `pause` / `resume`
+- `open` / `off`
+- `st <预设名>`
+
+**值守查询**
+- `watch risk`
+- `watch task`
+- `watch funds`
+- `watch learn`
+- `watch alerts`
+
+**任务与策略**
+- `task` / `task list`
+- `pkg` / `pkg list`
+- `policy` / `policy list`
+- `learn` / `learn list`
+
+**复盘与数据**
+- `fp brief` / `fp gaps` / `fp action`
+- `replay 3`
+- `explain`
+- `stats`
+- `balance`
+
+**模型与版本**
+- `model list` / `model select <id>` / `model reload`
+- `ver`
+
+**多账号**
+- `fleet`
+- `fleet task`
+- `fleet policy`
+- `fleet show <账号名|ID>`
+
+说明：
+- 命令回复统一回管理员 chat：`"""
+                mes += f"{admin_target}`\n"
+                mes += "- `watch` 手动查询现在回管理员 chat；主动播报仍走值守通道\n"
+                mes += "- 需要完整列表请发送：`help all`"
             log_event(logging.INFO, 'user_cmd', '显示帮助', user_id=user_ctx.user_id)
             message = await send_to_admin(client, mes, user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
@@ -5564,7 +5960,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         # pause/resume - 暂停/恢复押注
         if cmd in ("pause", "暂停"):
             if rt.get("manual_pause", False):
-                await send_to_admin(client, "⏸ 当前账号已是暂停状态", user_ctx, global_config)
+                await send_to_admin(client, _build_manual_pause_card(user_ctx, already_paused=True), user_ctx, global_config)
                 return
             await _clear_pause_countdown_notice(client, user_ctx)
             rt["switch"] = True
@@ -5574,8 +5970,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             rt["manual_pause"] = True
             _clear_lose_recovery_tracking(rt)
             user_ctx.save_state()
-            mes = "⏸ 已暂停当前账号押注"
+            mes = _build_manual_pause_card(user_ctx)
             await send_to_admin(client, mes, user_ctx, global_config)
+            await _refresh_admin_dashboard(client, user_ctx, global_config)
             log_event(logging.INFO, 'user_cmd', '暂停押注', user_id=user_ctx.user_id)
             return
         
@@ -5587,8 +5984,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             rt["mode_stop"] = True
             rt["manual_pause"] = False
             user_ctx.save_state()
-            mes = "▶️ 已恢复当前账号押注"
+            mes = _build_manual_resume_card(user_ctx)
             await send_to_admin(client, mes, user_ctx, global_config)
+            await _refresh_admin_dashboard(client, user_ctx, global_config)
             log_event(logging.INFO, 'user_cmd', '恢复押注', user_id=user_ctx.user_id)
             return
 
@@ -6055,18 +6453,14 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
         if cmd == "watch":
             if len(my) == 1:
-                await send_to_watch(client, tg_watch.build_watch_overview_text(user_ctx), user_ctx, global_config)
+                await _send_watch_query_result(client, event, tg_watch.build_watch_overview_text(user_ctx), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
-                    await _send_watch_command_ack(client, event, "👀 值守摘要已发送到值守通道")
                 return
 
             subcmd = str(my[1]).strip().lower()
             if subcmd == "fleet":
-                await send_to_watch(client, tg_watch.build_watch_fleet_text(user_ctx), user_ctx, global_config)
+                await _send_watch_query_result(client, event, tg_watch.build_watch_fleet_text(user_ctx), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
-                    await _send_watch_command_ack(client, event, "👀 多账号值守摘要已发送到值守通道")
                 return
             if subcmd == "risk":
                 ident = my[2] if len(my) >= 3 else ""
@@ -6074,20 +6468,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 if not target_ctx:
                     await send_to_admin(client, f"❌ 未找到账号 `{ident}`", user_ctx, global_config)
                     return
-                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
-                await send_to_watch(
-                    client,
-                    tg_watch.build_watch_risk_text(target_ctx),
-                    user_ctx,
-                    global_config,
-                    account_name_override=target_name,
-                )
+                await _send_watch_query_result(client, event, tg_watch.build_watch_risk_text(target_ctx), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
-                    ack = "🛡️ 风控值守摘要已发送到值守通道"
-                    if target_ctx is not user_ctx:
-                        ack = f"🛡️ {target_name} 风控值守摘要已发送到值守通道"
-                    await _send_watch_command_ack(client, event, ack)
                 return
             if subcmd == "task":
                 ident = my[2] if len(my) >= 3 else ""
@@ -6095,20 +6477,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 if not target_ctx:
                     await send_to_admin(client, f"❌ 未找到账号 `{ident}`", user_ctx, global_config)
                     return
-                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
-                await send_to_watch(
-                    client,
-                    tg_watch.build_watch_task_text(target_ctx),
-                    user_ctx,
-                    global_config,
-                    account_name_override=target_name,
-                )
+                await _send_watch_query_result(client, event, tg_watch.build_watch_task_text(target_ctx), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
-                    ack = "📦 任务值守摘要已发送到值守通道"
-                    if target_ctx is not user_ctx:
-                        ack = f"📦 {target_name} 任务值守摘要已发送到值守通道"
-                    await _send_watch_command_ack(client, event, ack)
                 return
             if subcmd == "funds":
                 ident = my[2] if len(my) >= 3 else ""
@@ -6116,20 +6486,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 if not target_ctx:
                     await send_to_admin(client, f"❌ 未找到账号 `{ident}`", user_ctx, global_config)
                     return
-                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
-                await send_to_watch(
-                    client,
-                    tg_watch.build_watch_funds_text(target_ctx),
-                    user_ctx,
-                    global_config,
-                    account_name_override=target_name,
-                )
+                await _send_watch_query_result(client, event, tg_watch.build_watch_funds_text(target_ctx), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
-                    ack = "💰 资金值守摘要已发送到值守通道"
-                    if target_ctx is not user_ctx:
-                        ack = f"💰 {target_name} 资金值守摘要已发送到值守通道"
-                    await _send_watch_command_ack(client, event, ack)
                 return
             if subcmd == "learn":
                 ident = my[2] if len(my) >= 3 else ""
@@ -6137,26 +6495,12 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 if not target_ctx:
                     await send_to_admin(client, f"❌ 未找到账号 `{ident}`", user_ctx, global_config)
                     return
-                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
-                await send_to_watch(
-                    client,
-                    tg_watch.build_watch_learn_text(target_ctx),
-                    user_ctx,
-                    global_config,
-                    account_name_override=target_name,
-                )
+                await _send_watch_query_result(client, event, tg_watch.build_watch_learn_text(target_ctx), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
-                    ack = "👀 学习值守摘要已发送到值守通道"
-                    if target_ctx is not user_ctx:
-                        ack = f"👀 {target_name} 学习值守摘要已发送到值守通道"
-                    await _send_watch_command_ack(client, event, ack)
                 return
             if subcmd == "alerts":
-                await send_to_watch(client, tg_watch.build_watch_alerts_text(user_ctx), user_ctx, global_config)
+                await _send_watch_query_result(client, event, tg_watch.build_watch_alerts_text(user_ctx), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
-                    await _send_watch_command_ack(client, event, "🚨 值守告警摘要已发送到值守通道")
                 return
             if subcmd == "quiet":
                 if len(my) == 2:
@@ -6197,17 +6541,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 if not target_ctx:
                     await send_to_admin(client, f"❌ 未找到账号 `{my[1]}`", user_ctx, global_config)
                     return
-                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
-                await send_to_watch(
-                    client,
-                    tg_watch.build_watch_overview_text(target_ctx),
-                    user_ctx,
-                    global_config,
-                    account_name_override=target_name,
-                )
+                await _send_watch_query_result(client, event, tg_watch.build_watch_overview_text(target_ctx), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
-                    await _send_watch_command_ack(client, event, f"👀 {target_name} 值守摘要已发送到值守通道")
                 return
 
             message = await send_to_admin(
@@ -6421,15 +6756,15 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         if cmd == "model":
             if len(my) == 2 and my[1].lower().startswith("v"):
                 mes = "当前算法固定为 V10，无需切换。请使用 `model select <id>` 切换模型。"
-                await event.reply(mes)
+                await _reply_admin_command_result(client, event, mes, user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
                 return
-            await handle_model_command_multiuser(event, my[1:], user_ctx, global_config)
+            await handle_model_command_multiuser(client, event, my[1:], user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
             return
 
         if cmd in ("apikey", "ak"):
-            await handle_apikey_command_multiuser(event, my[1:], user_ctx)
+            await handle_apikey_command_multiuser(client, event, my[1:], user_ctx, global_config)
             # 防止 key 在命令消息中长期可见
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 3))
             return

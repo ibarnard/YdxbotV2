@@ -194,6 +194,24 @@ def test_record_runtime_fault_deduplicates_and_doctor_shows_recent_fault(tmp_pat
     assert "最近异常" in doctor_text
     assert "send_watch" in doctor_text
     assert "x2" in doctor_text
+    assert "network down" in doctor_text
+    assert doctor_text.count("\n  ") >= 2
+
+
+def test_clear_runtime_faults_removes_matching_startup_entries(tmp_path):
+    clear_registered_user_contexts()
+    ctx = _make_user_context(tmp_path, "清理异常用户", 97031)
+    runtime_stability.record_runtime_fault(ctx, "startup", RuntimeError("dup key"), persist=True)
+    runtime_stability.record_runtime_fault(ctx, "startup_dashboard", RuntimeError("dashboard fail"), persist=True)
+    runtime_stability.record_runtime_fault(ctx, "send_watch", RuntimeError("network down"), persist=True)
+
+    result = runtime_stability.clear_runtime_faults(ctx, stage_prefixes=["startup"])
+
+    assert result["changed"] is True
+    assert result["removed"] == 2
+    remaining = runtime_stability.list_runtime_faults(ctx, limit=5)
+    assert len(remaining) == 1
+    assert remaining[0]["stage"] == "send_watch"
 
 
 def test_process_user_command_doctor_fleet_routes_summary(tmp_path, monkeypatch):

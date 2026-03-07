@@ -159,6 +159,18 @@ def _watch_mode_brief(user_ctx) -> str:
     return "正常"
 
 
+def _has_effective_fund_pause(rt: Dict[str, Any]) -> bool:
+    if not bool(rt.get("fund_pause_notified", False)):
+        return False
+    current_fund = int(rt.get("gambling_fund", 0) or 0)
+    current_bet = int(rt.get("bet_amount", 0) or 0)
+    initial_amount = int(rt.get("initial_amount", 0) or 0)
+    needed = max(current_bet, initial_amount, 0)
+    if needed <= 0:
+        return False
+    return current_fund < needed
+
+
 def record_watch_event(
     user_ctx,
     event_type: str,
@@ -304,7 +316,7 @@ def build_watch_risk_text(user_ctx) -> str:
         "",
         f"状态：{_status_text(rt)} | fk {_risk_bits(rt)} | 值守 {_watch_mode_brief(user_ctx)}",
         f"当前建议：{str(rt.get('current_fk1_action_text', '') or '未评估')} | 限档 {str(rt.get('current_fk1_tier_cap', '') or '-')}",
-        f"自动暂停：{int(rt.get('stop_count', 0) or 0)} | 手动暂停 {'是' if bool(rt.get('manual_pause', False)) else '否'} | 资金暂停 {'是' if bool(rt.get('fund_pause_notified', False)) else '否'}",
+        f"自动暂停：{int(rt.get('stop_count', 0) or 0)} | 手动暂停 {'是' if bool(rt.get('manual_pause', False)) else '否'} | 资金暂停 {'是' if _has_effective_fund_pause(rt) else '否'}",
         f"温度：{_temperature_text(str(temp.get('level', 'normal') or 'normal'))} | 24h 盈亏 {int(overview.get('pnl_total', 0) or 0):+,} | 回撤 {int(overview.get('max_drawdown', 0) or 0):,}",
         f"最近阻断：{str(rt.get('last_blocked_by', '') or '-')} | 影子验证 {'运行中' if bool(rt.get('shadow_probe_active', False)) else '无'}",
     ]
@@ -341,7 +353,7 @@ def build_watch_funds_text(user_ctx) -> str:
         f"总收益：{int(rt.get('earnings', 0) or 0):+,} | 本轮：{int(rt.get('period_profit', 0) or 0):+,}",
         f"盈利目标：{int(rt.get('profit', 0) or 0):,} | 盈停 {int(rt.get('profit_stop', 0) or 0)} 局",
         f"当前下注：{int(rt.get('bet_amount', 0) or 0):,} | 余额状态：{balance_status}",
-        f"资金暂停：{'是' if bool(rt.get('fund_pause_notified', False)) else '否'} | 值守 {_watch_mode_brief(user_ctx)}",
+        f"资金暂停：{'是' if _has_effective_fund_pause(rt) else '否'} | 值守 {_watch_mode_brief(user_ctx)}",
     ]
     return "\n".join(lines)
 
@@ -469,18 +481,23 @@ def _current_watch_alerts(user_ctx) -> List[Tuple[int, str]]:
 
     recent_fault = runtime_stability.get_recent_runtime_fault(user_ctx, max_age_sec=12 * 3600)
     if recent_fault and str(recent_fault.get("severity", "info") or "info") in {"warning", "error"}:
+        occurred_at = str(recent_fault.get("occurred_at", "") or "-")
+        stage = str(recent_fault.get("stage", "") or "runtime")
+        error_type = str(recent_fault.get("error_type", "") or "RuntimeError")
+        count = int(recent_fault.get("count", 1) or 1)
+        suffix = f" x{count}" if count > 1 else ""
+        message = runtime_stability._first_line(recent_fault.get("message", ""), 56)  # type: ignore[attr-defined]
         alerts.append(
             (
                 0,
                 (
-                    f"- {name} ({user_ctx.user_id}) | 运行异常 | "
-                    f"{str(recent_fault.get('stage', '') or 'runtime')} | "
-                    f"{runtime_stability.format_runtime_fault_brief(recent_fault)}"
+                    f"- {name} ({user_ctx.user_id}) | 运行异常 | {occurred_at} | {stage}\n"
+                    f"  {error_type}{suffix} | {message}"
                 ),
             )
         )
 
-    if bool(rt.get("fund_pause_notified", False)):
+    if _has_effective_fund_pause(rt):
         alerts.append(
             (
                 1,

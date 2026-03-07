@@ -511,7 +511,13 @@ def build_package_template_text() -> str:
 def build_package_overview_text(user_ctx) -> str:
     package = current_package(user_ctx)
     if not package:
-        return "🧰 任务包总览\n\n当前运行：无\n命令：`pkg tpl` / `pkg new <模板>` / `pkg list` / `pkg show <id>` / `pkg run <id>` / `pkg pause <id>` / `pkg resume <id>`"
+        return (
+            "🧰 任务包总览\n\n"
+            "当前运行：无\n"
+            "命令：`pkg tpl` / `pkg new <模板>` / `pkg list`\n"
+            "详情：`pkg show <id>` / `pkg logs [id]` / `pkg stats [id]`\n"
+            "控制：`pkg run <id>` / `pkg pause <id>` / `pkg resume <id>`"
+        )
     return (
         "🧰 任务包总览\n\n"
         f"当前运行：{package.get('name', '')}\n"

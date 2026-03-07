@@ -189,3 +189,20 @@ def test_run_health_check_skips_missing_legacy_files(monkeypatch, tmp_path):
     assert "zq.py" not in recorded["compile_args"]
     assert "main_multiuser.py" in recorded["compile_args"]
     assert "zq_multiuser.py" in recorded["compile_args"]
+
+
+def test_run_cmd_uses_utf8_replace_for_windows_git_output(monkeypatch, tmp_path):
+    captured = {}
+
+    def fake_run(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        return subprocess.CompletedProcess(args=args[0], returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(um.subprocess, "run", fake_run)
+
+    um._run_cmd(["git", "status"], tmp_path)
+
+    assert captured["kwargs"]["text"] is True
+    assert captured["kwargs"]["encoding"] == "utf-8"
+    assert captured["kwargs"]["errors"] == "replace"

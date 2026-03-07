@@ -783,6 +783,11 @@ flowchart TD
 
 理想状态下，它们可以是同一个地方，但系统设计上已经把它们拆开。
 
+当前实现补充说明：
+
+- 手动 `watch / watch fleet / watch risk / watch task / watch funds / watch learn / watch alerts` 查询，统一回复到 `admin_chat`
+- 只有主动值守播报、节流后的事件和独立提醒，才继续走 `watch chat / watch TG bot`
+
 ### 14.5 watch 独立配置
 当前 `notification.watch` 已经成为标准入口：
 

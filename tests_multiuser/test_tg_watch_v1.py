@@ -179,7 +179,7 @@ def test_build_watch_overview_text_includes_key_fields(tmp_path, monkeypatch):
     assert "最近决策：STABILITY / 82% / model" in text
 
 
-def test_process_user_command_watch_routes_summary_to_watch_channel(tmp_path, monkeypatch):
+def test_process_user_command_watch_routes_summary_to_admin_chat(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "8105"
     _write_json(
         user_dir / "config.json",
@@ -191,23 +191,16 @@ def test_process_user_command_watch_routes_summary_to_watch_channel(tmp_path, mo
     )
     ctx = UserContext(str(user_dir))
     sent = {}
-    acked = {}
 
-    async def fake_send_to_watch(client, message, user_ctx, global_config, parse_mode="markdown", title=None, desp=None):
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
         sent["message"] = message
-        return SimpleNamespace(chat_id=-9005, id=3)
-
-    async def fake_send_watch_ack(client, event, text):
-        acked["text"] = text
-        return SimpleNamespace(chat_id=event.chat_id, id=4)
+        return SimpleNamespace(chat_id=8105, id=3)
 
     def fake_create_task(coro):
         coro.close()
         return None
 
-    monkeypatch.setattr(zm, "send_to_watch", fake_send_to_watch)
-    monkeypatch.setattr(zm, "_send_watch_command_ack", fake_send_watch_ack)
-    monkeypatch.setattr(zm, "_watch_reply_visible_in_chat", lambda user_ctx, chat_id: False)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
     monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(tg_watch, "build_watch_overview_text", lambda user_ctx: "WATCH_BODY")
 
@@ -221,10 +214,9 @@ def test_process_user_command_watch_routes_summary_to_watch_channel(tmp_path, mo
     )
 
     assert sent["message"] == "WATCH_BODY"
-    assert acked["text"] == "👀 值守摘要已发送到值守通道"
 
 
-def test_process_user_command_watch_fleet_routes_fleet_summary(tmp_path, monkeypatch):
+def test_process_user_command_watch_fleet_routes_fleet_summary_to_admin_chat(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "8106"
     _write_json(
         user_dir / "config.json",
@@ -237,16 +229,15 @@ def test_process_user_command_watch_fleet_routes_fleet_summary(tmp_path, monkeyp
     ctx = UserContext(str(user_dir))
     sent = {}
 
-    async def fake_send_to_watch(client, message, user_ctx, global_config, parse_mode="markdown", title=None, desp=None):
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
         sent["message"] = message
-        return SimpleNamespace(chat_id=-9006, id=5)
+        return SimpleNamespace(chat_id=8106, id=5)
 
     def fake_create_task(coro):
         coro.close()
         return None
 
-    monkeypatch.setattr(zm, "send_to_watch", fake_send_to_watch)
-    monkeypatch.setattr(zm, "_watch_reply_visible_in_chat", lambda user_ctx, chat_id: True)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
     monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(tg_watch, "build_watch_fleet_text", lambda user_ctx: "WATCH_FLEET")
 
@@ -260,6 +251,31 @@ def test_process_user_command_watch_fleet_routes_fleet_summary(tmp_path, monkeyp
     )
 
     assert sent["message"] == "WATCH_FLEET"
+
+
+def test_build_watch_funds_text_ignores_stale_fund_pause_flag(tmp_path):
+    user_dir = tmp_path / "users" / "8106a"
+    _write_json(
+        user_dir / "config.json",
+        {
+            "account": {"name": "资金用户"},
+            "telegram": {"user_id": 81061},
+            "groups": {"admin_chat": 81061},
+        },
+    )
+    ctx = UserContext(str(user_dir))
+    rt = ctx.state.runtime
+    rt["fund_pause_notified"] = True
+    rt["gambling_fund"] = 100000
+    rt["account_balance"] = 100000
+    rt["bet_amount"] = 500
+    rt["initial_amount"] = 500
+
+    funds_text = tg_watch.build_watch_funds_text(ctx)
+    risk_text = tg_watch.build_watch_risk_text(ctx)
+
+    assert "资金暂停：否" in funds_text
+    assert "资金暂停 否" in risk_text
 
 
 def test_record_watch_event_throttles_same_fingerprint(tmp_path, monkeypatch):
@@ -417,6 +433,7 @@ def test_build_watch_alerts_text_combines_current_and_recent_alerts(tmp_path, mo
     rt["fund_pause_notified"] = True
     rt["gambling_fund"] = 1200
     rt["account_balance"] = 2300
+    rt["bet_amount"] = 2400
     rt["stop_count"] = 0
     rt["watch_alerts"] = [
         {
@@ -460,7 +477,7 @@ def test_build_watch_alerts_text_combines_current_and_recent_alerts(tmp_path, mo
     assert "模型预测超时 x2" in text
 
 
-def test_process_user_command_watch_alerts_routes_alert_summary(tmp_path, monkeypatch):
+def test_process_user_command_watch_alerts_routes_alert_summary_to_admin_chat(tmp_path, monkeypatch):
     user_dir = tmp_path / "users" / "8111"
     _write_json(
         user_dir / "config.json",
@@ -472,23 +489,15 @@ def test_process_user_command_watch_alerts_routes_alert_summary(tmp_path, monkey
     )
     ctx = UserContext(str(user_dir))
     sent = {}
-    acked = {}
-
-    async def fake_send_to_watch(client, message, user_ctx, global_config, parse_mode="markdown", title=None, desp=None):
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
         sent["message"] = message
-        return SimpleNamespace(chat_id=-9111, id=6)
-
-    async def fake_send_watch_ack(client, event, text):
-        acked["text"] = text
-        return None
+        return SimpleNamespace(chat_id=8111, id=6)
 
     def fake_create_task(coro):
         coro.close()
         return None
 
-    monkeypatch.setattr(zm, "send_to_watch", fake_send_to_watch)
-    monkeypatch.setattr(zm, "_send_watch_command_ack", fake_send_watch_ack)
-    monkeypatch.setattr(zm, "_watch_reply_visible_in_chat", lambda user_ctx, chat_id: False)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
     monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(tg_watch, "build_watch_alerts_text", lambda user_ctx: "WATCH_ALERTS")
 
@@ -502,4 +511,3 @@ def test_process_user_command_watch_alerts_routes_alert_summary(tmp_path, monkey
     )
 
     assert sent["message"] == "WATCH_ALERTS"
-    assert acked["text"] == "🚨 值守告警摘要已发送到值守通道"

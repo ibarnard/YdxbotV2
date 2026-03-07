@@ -162,7 +162,14 @@ class ModelManager:
             return key
         return str(api_keys)
 
-    async def call_model(self, model_id: str, messages: List[Dict[str, str]], **kwargs) -> Dict[str, Any]:
+    async def call_model(
+        self,
+        model_id: str,
+        messages: List[Dict[str, str]],
+        *,
+        allow_fallback: bool = True,
+        **kwargs,
+    ) -> Dict[str, Any]:
         """
         统一模型调用接口，支持自动降级
         返回格式: {"success": bool, "content": str, "error": str, "usage": dict}
@@ -180,24 +187,27 @@ class ModelManager:
         # 确定尝试顺序
         try_models = []
         
-        # 检查传入的 model_id 是否是配置的key（如"1"）
-        if target_model_id in fallback_chain:
-            # 是配置的key，按降级链处理
-            start_idx = fallback_chain.index(target_model_id)
-            try_models = fallback_chain[start_idx:]
-        else:
-            # 可能是真实的模型ID（如"iflow-rome-30ba3b"）
-            # 先尝试直接调用
+        if not allow_fallback:
             try_models = [target_model_id]
-            
-            # 如果该模型在降级链中，添加链中后续的模型作为备选
-            for idx_key in fallback_chain:
-                model_cfg = self.get_model(idx_key)
-                if model_cfg and str(model_cfg.get('model_id')) == target_model_id:
-                    # 找到了对应的配置key，添加链中后续的模型
-                    start_idx = fallback_chain.index(idx_key) + 1
-                    try_models.extend(fallback_chain[start_idx:])
-                    break
+        else:
+            # 检查传入的 model_id 是否是配置的key（如"1"）
+            if target_model_id in fallback_chain:
+                # 是配置的key，按降级链处理
+                start_idx = fallback_chain.index(target_model_id)
+                try_models = fallback_chain[start_idx:]
+            else:
+                # 可能是真实的模型ID（如"iflow-rome-30ba3b"）
+                # 先尝试直接调用
+                try_models = [target_model_id]
+
+                # 如果该模型在降级链中，添加链中后续的模型作为备选
+                for idx_key in fallback_chain:
+                    model_cfg = self.get_model(idx_key)
+                    if model_cfg and str(model_cfg.get('model_id')) == target_model_id:
+                        # 找到了对应的配置key，添加链中后续的模型
+                        start_idx = fallback_chain.index(idx_key) + 1
+                        try_models.extend(fallback_chain[start_idx:])
+                        break
             
         # 记录所有尝试的错误
         errors = []
@@ -432,11 +442,17 @@ class ModelManager:
             except Exception as e:
                 return {"success": False, "error": f"Google Connection Error: {str(e)}", "content": ""}
 
-    async def validate_model(self, model_id: str) -> Dict[str, Any]:
+    async def validate_model(self, model_id: str, *, allow_fallback: bool = True) -> Dict[str, Any]:
         """验证模型可用性，返回详细信息"""
         test_message = [{"role": "user", "content": "Hello, verify connection."}]
         start_time = time.time()
-        result = await self.call_model(model_id, test_message, temperature=0.1, max_tokens=10)
+        result = await self.call_model(
+            model_id,
+            test_message,
+            temperature=0.1,
+            max_tokens=10,
+            allow_fallback=allow_fallback,
+        )
         duration = (time.time() - start_time) * 1000
         result['latency'] = f"{duration:.0f}"
         return result

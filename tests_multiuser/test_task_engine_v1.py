@@ -95,6 +95,17 @@ def test_create_task_from_template_with_overrides(tmp_path):
     assert ctx.tasks[0]["max_loss"] == 30000
 
 
+def test_build_task_overview_text_wraps_command_hints(tmp_path):
+    ctx = _make_user_context(tmp_path, user_id=9310)
+
+    text = task_engine.build_task_overview_text(ctx)
+
+    assert "任务总数：0 | 已启用：0" in text
+    assert "命令：`task tpl` / `task new <模板>` / `task list`" in text
+    assert "详情：`task add ...` / `task show <id>` / `task run <id>`" in text
+    assert "控制：`task pause <id>` / `task resume <id>` / `task logs [id]` / `task stats [id]`" in text
+
+
 def test_prepare_task_for_round_starts_regime_task(tmp_path):
     ctx = _make_user_context(tmp_path, user_id=9302)
     rt = ctx.state.runtime

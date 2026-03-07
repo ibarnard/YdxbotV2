@@ -19,6 +19,10 @@
 - [Admin 驾驶舱与分层播报 V1 技术说明书](./admin-cockpit-v1-tech-spec.md)
 - [重构路线图](./refactor-roadmap.md)
 
+## 测试与待办
+- [v2.0.1 Beta 交互闭环测试报告（2026-03-08）](./v2.0.1-beta-interaction-test-report-20260308.md)
+- [v2.0.1 Beta 交互优化 To-Do（2026-03-08）](./v2.0.1-beta-interaction-todo-20260308.md)
+
 ## 使用建议
 - 换电脑后先看本文件，再看对应技术说明书。
 - 技术说明书和代码同版本提交，不依赖聊天记录。

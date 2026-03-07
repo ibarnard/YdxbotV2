@@ -172,6 +172,40 @@ def test_model_manager_call_model_immediately_falls_back_to_next_ranked_model():
     assert result["fallback_used"] is True
 
 
+def test_model_manager_validate_model_can_disable_fallback():
+    mgr = ModelManager()
+    mgr.apply_shared_config(
+        {
+            "ai": {
+                "enabled": True,
+                "api_keys": ["k1"],
+                "base_url": "https://apis.iflow.cn/v1",
+                "models": {
+                    "1": {"model_id": "model-1", "enabled": True},
+                    "2": {"model_id": "model-2", "enabled": True},
+                },
+                "fallback_chain": ["1", "2"],
+            }
+        }
+    )
+
+    calls = []
+
+    async def fake_iflow(config, messages, **kwargs):
+        calls.append(config["model_id"])
+        return {"success": False, "error": f"{config['model_id']} unavailable", "content": ""}
+
+    mgr._call_iflow = fake_iflow
+
+    result = asyncio.run(
+        mgr.validate_model("model-1", allow_fallback=False)
+    )
+
+    assert result["success"] is False
+    assert calls == ["model-1"]
+    assert "model-2" not in result["error"]
+
+
 def test_parse_analysis_result_insight_supports_skip_prediction():
     parsed = zm.parse_analysis_result_insight(
         '{"prediction":"SKIP","confidence":66,"reason":"证据冲突"}',

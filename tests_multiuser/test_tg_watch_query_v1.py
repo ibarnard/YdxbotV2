@@ -54,7 +54,7 @@ def test_build_watch_subviews_and_learn_details(tmp_path, monkeypatch):
     rt["period_profit"] = 3500
     rt["profit"] = 100000
     rt["profit_stop"] = 2
-    rt["bet_amount"] = 500
+    rt["bet_amount"] = 980000
     rt["balance_status"] = "success"
 
     monkeypatch.setattr(
@@ -151,12 +151,11 @@ def test_process_user_command_watch_target_and_subviews_use_override(tmp_path, m
         coro.close()
         return None
 
-    async def fake_send_to_watch(client, message, user_ctx, global_config, parse_mode="markdown", title=None, desp=None, account_name_override=None):
-        sent.append({"message": message, "override": account_name_override})
-        return SimpleNamespace(chat_id=-1, id=1)
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
+        sent.append({"message": message})
+        return SimpleNamespace(chat_id=1, id=1)
 
-    monkeypatch.setattr(zm, "send_to_watch", fake_send_to_watch)
-    monkeypatch.setattr(zm, "_watch_reply_visible_in_chat", lambda user_ctx, chat_id: True)
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
     monkeypatch.setattr(zm.asyncio, "create_task", fake_create_task)
     monkeypatch.setattr(tg_watch, "build_watch_risk_text", lambda user_ctx: f"RISK:{user_ctx.user_id}")
     monkeypatch.setattr(tg_watch, "build_watch_overview_text", lambda user_ctx: f"OVERVIEW:{user_ctx.user_id}")
@@ -179,9 +178,7 @@ def test_process_user_command_watch_target_and_subviews_use_override(tmp_path, m
     )
 
     assert sent[0]["message"] == f"RISK:{target.user_id}"
-    assert sent[0]["override"] == "target"
     assert sent[1]["message"] == f"OVERVIEW:{target.user_id}"
-    assert sent[1]["override"] == "target"
 
 
 def test_watch_quiet_commands_and_status(tmp_path):

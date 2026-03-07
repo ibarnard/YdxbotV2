@@ -7,11 +7,14 @@ main_multiuser.py - 多用户版本主程序
 
 import logging
 import asyncio
+import argparse
 import os
 import time
 import sys
 import errno
-from typing import Any, Dict, List
+import json
+from typing import Any, Dict, List, Optional
+import interaction_journal
 import runtime_stability
 from telethon import TelegramClient, events
 from logging.handlers import TimedRotatingFileHandler
@@ -44,6 +47,19 @@ logger = logging.getLogger('main_multiuser')
 logger.setLevel(logging.DEBUG)
 
 _MAIN_ACCOUNT_NAME_REGISTRY: Dict[str, str] = {}
+
+
+def _configure_console_output() -> None:
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
 
 
 def _sanitize_account_slug(text: str, fallback: str = "unknown") -> str:
@@ -325,6 +341,24 @@ def _get_allowed_sender_ids(user_ctx: UserContext) -> set:
     return result
 
 
+def _sender_allowed_for_user_command(user_ctx: UserContext, event, allowed_senders: set) -> bool:
+    if not allowed_senders:
+        return True
+
+    sender_id = getattr(event, "sender_id", None)
+    if sender_id is not None and str(sender_id) in allowed_senders:
+        return True
+
+    self_user_id = getattr(user_ctx, "user_id", None)
+    if self_user_id is not None and sender_id is not None and str(sender_id) == str(self_user_id):
+        return True
+
+    if bool(getattr(event, "out", False)):
+        return True
+
+    return False
+
+
 def register_handlers(client: TelegramClient, user_ctx: UserContext, global_config: dict):
     config = user_ctx.config
     state = user_ctx.state
@@ -342,6 +376,14 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
     async def bet_on_handler(event):
         log_event(logging.DEBUG, 'bet_on', '收到押注触发消息', 
                   user_id=user_ctx.user_id, msg_id=event.id)
+        interaction_journal.record_inbound(
+            user_ctx,
+            source="zq_group_bet_on",
+            message=(getattr(event, "raw_text", None) or "").strip(),
+            sender_id=getattr(event, "sender_id", None),
+            chat_id=getattr(event, "chat_id", None),
+            msg_id=getattr(event, "id", None),
+        )
         async with _get_user_event_lock(user_ctx):
             await zq_bet_on(client, event, user_ctx, global_config)
     
@@ -354,6 +396,14 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
     async def settle_handler(event):
         log_event(logging.DEBUG, 'settle', '收到结算消息',
                   user_id=user_ctx.user_id, msg_id=event.id)
+        interaction_journal.record_inbound(
+            user_ctx,
+            source="zq_group_settle",
+            message=(getattr(event, "raw_text", None) or "").strip(),
+            sender_id=getattr(event, "sender_id", None),
+            chat_id=getattr(event, "chat_id", None),
+            msg_id=getattr(event, "id", None),
+        )
         async with _get_user_event_lock(user_ctx):
             await zq_settle(client, event, user_ctx, global_config)
 
@@ -362,6 +412,14 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
         from_users=zq_bot_targets
     ))
     async def red_packet_handler(event):
+        interaction_journal.record_inbound(
+            user_ctx,
+            source="zq_group_misc",
+            message=(getattr(event, "raw_text", None) or "").strip(),
+            sender_id=getattr(event, "sender_id", None),
+            chat_id=getattr(event, "chat_id", None),
+            msg_id=getattr(event, "id", None),
+        )
         await zq_red_packet(client, event, user_ctx, global_config)
     
     @client.on(events.NewMessage(chats=admin_chat if admin_chat else []))
@@ -374,17 +432,27 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
         log_event(logging.DEBUG, 'user_cmd', '收到用户命令',
                   user_id=user_ctx.user_id, cmd=safe_cmd)
         allowed_senders = _get_allowed_sender_ids(user_ctx)
-        if allowed_senders:
-            sender_id = getattr(event, "sender_id", None)
-            if sender_id is None or str(sender_id) not in allowed_senders:
-                log_event(
-                    logging.WARNING,
-                    'user_cmd',
-                    '命令发送者不在白名单，已忽略',
-                    user_id=user_ctx.user_id,
-                    sender_id=sender_id,
-                )
-                return
+        sender_id = getattr(event, "sender_id", None)
+        chat_id = getattr(event, "chat_id", None)
+        allowed = _sender_allowed_for_user_command(user_ctx, event, allowed_senders)
+        interaction_journal.record_command(
+            user_ctx,
+            source="telegram_admin_chat",
+            command=safe_cmd,
+            accepted=allowed,
+            reason="" if allowed else "sender_not_allowed",
+            sender_id=sender_id,
+            chat_id=chat_id,
+        )
+        if not allowed:
+            log_event(
+                logging.WARNING,
+                'user_cmd',
+                '命令发送者不在白名单，已忽略',
+                user_id=user_ctx.user_id,
+                sender_id=sender_id,
+            )
+            return
         async with _get_user_event_lock(user_ctx):
             await zq_user(client, event, user_ctx, global_config)
 
@@ -414,9 +482,11 @@ async def check_models_for_user(client, user_ctx: UserContext):
         user_model_mgr = user_ctx.get_model_manager()
         user_model_mgr.load_models()
         models = user_model_mgr.list_models()
+        probe_pause_sec = 0.6
         
         report = f"🚀 **Bot 启动模型自检报告**\n\n"
         report += f"👤 **用户**: {user_ctx.config.name}\n\n"
+        report += "说明：启动自检按单模型串行探测，不触发 fallback 连锁测试\n\n"
         
         total_models = sum(len(ms) for ms in models.values())
         success_count = 0
@@ -424,13 +494,15 @@ async def check_models_for_user(client, user_ctx: UserContext):
         
         for provider, ms in models.items():
             report += f"📁 **{provider.upper()}**\n"
+            enabled_models = [m for m in ms if m.get('enabled', True)]
+            probe_index = 0
             for m in ms:
                 mid = m['model_id']
                 if not m.get('enabled', True):
                     report += f"⚪ `{mid}`: 已禁用\n"
                     continue
                 
-                res = await user_model_mgr.validate_model(mid)
+                res = await user_model_mgr.validate_model(mid, allow_fallback=False)
                 if res['success']:
                     status = "✅ 正常"
                     latency = res.get('latency', 'N/A')
@@ -441,6 +513,9 @@ async def check_models_for_user(client, user_ctx: UserContext):
                     failure_errors.append(str(res.get("error", "")))
                 
                 report += f"{status} `{mid}` ({latency}ms)\n"
+                if str(provider).lower() == "iflow" and probe_index < len(enabled_models) - 1:
+                    await asyncio.sleep(probe_pause_sec)
+                probe_index += 1
             report += "\n"
         
         report += f"📊 **汇总**: {success_count}/{total_models} 可用\n"
@@ -678,7 +753,22 @@ async def start_user(user_ctx: UserContext, global_config: dict):
                 )
                 try:
                     await client.send_message(admin_chat, mes)
+                    interaction_journal.record_message(
+                        user_ctx,
+                        channel="admin_chat",
+                        target=admin_chat,
+                        message=mes,
+                        ok=True,
+                    )
                 except Exception as e:
+                    interaction_journal.record_message(
+                        user_ctx,
+                        channel="admin_chat",
+                        target=admin_chat,
+                        message=mes,
+                        ok=False,
+                        error=str(e),
+                    )
                     log_event(
                         logging.ERROR,
                         'start',
@@ -691,7 +781,22 @@ async def start_user(user_ctx: UserContext, global_config: dict):
             try:
                 focus_msg = build_startup_focus_reminder(user_ctx)
                 await client.send_message(admin_chat, focus_msg)
+                interaction_journal.record_message(
+                    user_ctx,
+                    channel="admin_chat",
+                    target=admin_chat,
+                    message=focus_msg,
+                    ok=True,
+                )
             except Exception as e:
+                interaction_journal.record_message(
+                    user_ctx,
+                    channel="admin_chat",
+                    target=admin_chat,
+                    message=focus_msg if 'focus_msg' in locals() else "",
+                    ok=False,
+                    error=str(e),
+                )
                 runtime_stability.record_runtime_fault(
                     user_ctx,
                     "startup_focus_notice",
@@ -731,6 +836,40 @@ async def start_user(user_ctx: UserContext, global_config: dict):
                     user_id=user_ctx.user_id,
                     error=str(e),
                 )
+
+        if admin_chat:
+            try:
+                from zq_multiuser import _refresh_admin_dashboard
+
+                await _refresh_admin_dashboard(client, user_ctx, global_config)
+            except Exception as e:
+                runtime_stability.record_runtime_fault(
+                    user_ctx,
+                    "startup_dashboard",
+                    e,
+                    action="启动驾驶舱发送失败",
+                )
+                log_event(
+                    logging.ERROR,
+                    'start',
+                    '启动驾驶舱发送失败',
+                    user_id=user_ctx.user_id,
+                    error=str(e),
+                )
+
+        cleared_startup_faults = runtime_stability.clear_runtime_faults(
+            user_ctx,
+            stage_prefixes=["startup"],
+        )
+        if cleared_startup_faults.get("changed", False):
+            user_ctx.save_state()
+            log_event(
+                logging.INFO,
+                'start',
+                '启动成功后清理历史 startup 异常',
+                user_id=user_ctx.user_id,
+                removed=cleared_startup_faults.get("removed", 0),
+            )
         
         log_event(logging.INFO, 'start', '用户启动成功',
                   user_id=user_ctx.user_id, name=user_ctx.config.name, balance=balance)
@@ -752,7 +891,84 @@ async def start_user(user_ctx: UserContext, global_config: dict):
         return None
 
 
-async def main():
+def _user_identity_candidates(user_ctx: UserContext) -> List[str]:
+    candidates: List[str] = []
+    try:
+        candidates.append(str(getattr(user_ctx, "user_id", 0) or 0))
+    except Exception:
+        pass
+
+    user_dir = os.path.basename(os.path.normpath(str(getattr(user_ctx, "user_dir", "") or "")))
+    if user_dir:
+        candidates.append(user_dir)
+
+    account_name = str(getattr(getattr(user_ctx, "config", None), "name", "") or "").strip()
+    if account_name:
+        candidates.append(account_name)
+
+    normalized: List[str] = []
+    seen = set()
+    for item in candidates:
+        text = str(item or "").strip().lower()
+        if text and text not in seen:
+            normalized.append(text)
+            seen.add(text)
+    return normalized
+
+
+def _select_user_contexts(all_users: Dict[int, UserContext], selectors: Optional[List[str]]) -> Dict[int, UserContext]:
+    if not selectors:
+        return dict(all_users)
+
+    wanted = {str(item or "").strip().lower() for item in selectors if str(item or "").strip()}
+    if not wanted:
+        return dict(all_users)
+
+    selected: Dict[int, UserContext] = {}
+    for user_id, user_ctx in all_users.items():
+        identities = set(_user_identity_candidates(user_ctx))
+        if identities & wanted:
+            selected[user_id] = user_ctx
+    return selected
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="YdxbotV2 多账号入口")
+    parser.add_argument(
+        "--user",
+        "-u",
+        action="append",
+        dest="users",
+        help="只启动指定账号，可传账号目录名、账号名或 user_id；可重复传多个",
+    )
+    parser.add_argument(
+        "--list-users",
+        action="store_true",
+        help="列出当前可识别的账号并退出",
+    )
+    parser.add_argument(
+        "--doctor-only",
+        action="store_true",
+        help="仅执行 doctor 检查，不进入 Telegram 主循环",
+    )
+    parser.add_argument(
+        "--journal-tail",
+        type=int,
+        metavar="N",
+        help="输出每个账号最近 N 条交互 JSON 日志，不进入 Telegram 主循环",
+    )
+    parser.add_argument(
+        "--journal-stream",
+        choices=["all", "commands", "inbound", "outbound"],
+        default="all",
+        help="配合 --journal-tail 指定查看的交互日志流，默认 all",
+    )
+    return parser
+
+
+async def main(argv: Optional[List[str]] = None):
+    _configure_console_output()
+    args = _build_arg_parser().parse_args(argv)
     print("=" * 50)
     print("多用户 Telegram Bot 启动中...")
     print("=" * 50)
@@ -768,11 +984,56 @@ async def main():
     
     print(f"✅ 已加载 {user_count} 个用户配置")
     log_event(logging.INFO, 'main', '加载用户配置', count=user_count)
+
+    all_users = user_manager.get_all_users()
+
+    if args.list_users:
+        print("可用账号：")
+        for user_ctx in all_users.values():
+            account_name = str(user_ctx.config.name or "").strip() or "(未命名)"
+            user_dir = os.path.basename(os.path.normpath(user_ctx.user_dir))
+            print(f"- {account_name} | dir={user_dir} | user_id={user_ctx.user_id}")
+        return
+
+    selected_users = _select_user_contexts(all_users, args.users)
+    if not selected_users:
+        selectors = ", ".join(args.users or [])
+        print(f"❌ 未匹配到指定账号：{selectors}")
+        print("可先执行 `python main_multiuser.py --list-users` 查看可用账号。")
+        return
+
+    if args.users:
+        print(f"🎯 本次仅启动 {len(selected_users)} 个指定账号")
+        for user_ctx in selected_users.values():
+            user_dir = os.path.basename(os.path.normpath(user_ctx.user_dir))
+            print(f"   - {user_ctx.config.name} | dir={user_dir} | user_id={user_ctx.user_id}")
+
+    if args.doctor_only:
+        from runtime_stability import build_doctor_text
+
+        print("=" * 50)
+        print("Doctor 检查结果")
+        print("=" * 50)
+        for user_ctx in selected_users.values():
+            print(build_doctor_text(user_ctx))
+            print("-" * 50)
+        return
+
+    if args.journal_tail:
+        print("=" * 50)
+        print("交互日志")
+        print("=" * 50)
+        for user_ctx in selected_users.values():
+            print(f"[{user_ctx.config.name}]")
+            for entry in interaction_journal.read_recent_events(user_ctx, args.journal_tail, args.journal_stream):
+                print(json.dumps(entry, ensure_ascii=False, indent=2))
+            print("-" * 50)
+        return
     
     clients = []
     tasks = []
     
-    for user_id, user_ctx in user_manager.get_all_users().items():
+    for user_id, user_ctx in selected_users.items():
         print(f"🔄 正在启动用户: {user_ctx.config.name} (ID: {user_id})...")
         client = await start_user(user_ctx, user_manager.global_config)
         
@@ -800,8 +1061,23 @@ async def main():
                 continue
             try:
                 await user_ctx.client.send_message(admin_chat, message)
+                interaction_journal.record_message(
+                    user_ctx,
+                    channel="admin_chat",
+                    target=admin_chat,
+                    message=message,
+                    ok=True,
+                )
                 sent_admins.add(admin_chat)
             except Exception as e:
+                interaction_journal.record_message(
+                    user_ctx,
+                    channel="admin_chat",
+                    target=admin_chat,
+                    message=message,
+                    ok=False,
+                    error=str(e),
+                )
                 log_event(
                     logging.ERROR,
                     'release_check',
@@ -815,7 +1091,7 @@ async def main():
     try:
         await asyncio.gather(*tasks, return_exceptions=True)
     finally:
-        for user_ctx in user_manager.get_all_users().values():
+        for user_ctx in selected_users.values():
             user_ctx.save_state()
             _release_session_lock(user_ctx)
     
