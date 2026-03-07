@@ -14,6 +14,8 @@ from user_manager import get_registered_user_contexts
 WATCH_EVENT_STATE_KEY = "watch_event_state"
 WATCH_ALERTS_KEY = "watch_alerts"
 WATCH_ALERT_LIMIT = 30
+WATCH_QUIET_UNTIL_KEY = "watch_quiet_until"
+WATCH_QUIET_UNTIL_TS_KEY = "watch_quiet_until_ts"
 
 
 def _all_users(current_user_ctx) -> Dict[int, Any]:
@@ -21,6 +23,17 @@ def _all_users(current_user_ctx) -> Dict[int, Any]:
     if not users and current_user_ctx is not None:
         users[int(current_user_ctx.user_id)] = current_user_ctx
     return dict(sorted(users.items(), key=lambda item: item[0]))
+
+
+def _account_label(user_ctx) -> str:
+    return multi_account_orchestrator._account_name(user_ctx)  # type: ignore[attr-defined]
+
+
+def resolve_watch_target(current_user_ctx, ident: str = ""):
+    target = str(ident or "").strip()
+    if not target:
+        return current_user_ctx
+    return multi_account_orchestrator._match_user(current_user_ctx, target)  # type: ignore[attr-defined]
 
 
 def _status_text(rt: Dict[str, Any]) -> str:
@@ -92,6 +105,60 @@ def _now_ts() -> int:
     return int(datetime.now().timestamp())
 
 
+def _watch_quiet_defaults(rt: Dict[str, Any]) -> None:
+    rt[WATCH_QUIET_UNTIL_KEY] = ""
+    rt[WATCH_QUIET_UNTIL_TS_KEY] = 0
+
+
+def get_watch_quiet_status(user_ctx) -> Dict[str, Any]:
+    rt = user_ctx.state.runtime
+    now_ts = _now_ts()
+    until_ts = int(rt.get(WATCH_QUIET_UNTIL_TS_KEY, 0) or 0)
+    if until_ts <= now_ts:
+        if until_ts > 0 or str(rt.get(WATCH_QUIET_UNTIL_KEY, "") or ""):
+            _watch_quiet_defaults(rt)
+        return {"active": False, "until": "", "until_ts": 0, "remaining_min": 0}
+
+    remaining_min = max(1, (until_ts - now_ts + 59) // 60)
+    return {
+        "active": True,
+        "until": str(rt.get(WATCH_QUIET_UNTIL_KEY, "") or ""),
+        "until_ts": until_ts,
+        "remaining_min": remaining_min,
+    }
+
+
+def set_watch_quiet(user_ctx, minutes: int) -> Dict[str, Any]:
+    quiet_minutes = max(0, int(minutes or 0))
+    if quiet_minutes <= 0:
+        return clear_watch_quiet(user_ctx)
+
+    until_ts = _now_ts() + quiet_minutes * 60
+    until_text = datetime.fromtimestamp(until_ts).strftime("%Y-%m-%d %H:%M:%S")
+    rt = user_ctx.state.runtime
+    rt[WATCH_QUIET_UNTIL_KEY] = until_text
+    rt[WATCH_QUIET_UNTIL_TS_KEY] = until_ts
+    return {
+        "ok": True,
+        "active": True,
+        "until": until_text,
+        "remaining_min": quiet_minutes,
+        "message": f"🔕 值守主动播报已静音 {quiet_minutes} 分钟，至 {until_text}",
+    }
+
+
+def clear_watch_quiet(user_ctx) -> Dict[str, Any]:
+    _watch_quiet_defaults(user_ctx.state.runtime)
+    return {"ok": True, "active": False, "message": "🔔 值守主动播报已恢复"}
+
+
+def _watch_mode_brief(user_ctx) -> str:
+    quiet = get_watch_quiet_status(user_ctx)
+    if quiet.get("active", False):
+        return f"静音 {int(quiet.get('remaining_min', 0) or 0)}m"
+    return "正常"
+
+
 def record_watch_event(
     user_ctx,
     event_type: str,
@@ -101,6 +168,7 @@ def record_watch_event(
     fingerprint: str = "",
     throttle_sec: int = 300,
     meta: Dict[str, Any] | None = None,
+    suppress_notify: bool = False,
 ) -> Dict[str, Any]:
     rt = user_ctx.state.runtime
     event_key = str(event_type or "").strip() or "generic"
@@ -119,11 +187,12 @@ def record_watch_event(
     throttle = max(0, int(throttle_sec or 0))
     last_sent_ts = int(current.get("last_sent_ts", 0) or 0)
     last_fingerprint = str(current.get("fingerprint", "") or "")
-    should_notify = (
+    base_should_notify = (
         normalized_fingerprint != last_fingerprint
         or throttle == 0
         or (now_ts - last_sent_ts) >= throttle
     )
+    should_notify = base_should_notify and not bool(suppress_notify)
 
     state[event_key] = {
         "fingerprint": normalized_fingerprint,
@@ -176,7 +245,7 @@ def record_watch_event(
             entry["last_notified_at"] = now_text
 
     rt[WATCH_ALERTS_KEY] = alerts[-WATCH_ALERT_LIMIT:]
-    return {"should_notify": should_notify, "event": entry}
+    return {"should_notify": should_notify, "event": entry, "suppressed": bool(suppress_notify)}
 
 
 def list_watch_alerts(user_ctx, limit: int = 10) -> List[Dict[str, Any]]:
@@ -195,7 +264,7 @@ def build_watch_overview_text(user_ctx) -> str:
     lines = [
         "👀 值守摘要",
         "",
-        f"状态：{_status_text(rt)} | 模式 {_mode_text(rt)} | fk {_risk_bits(rt)}",
+        f"状态：{_status_text(rt)} | 模式 {_mode_text(rt)} | fk {_risk_bits(rt)} | 值守 {_watch_mode_brief(user_ctx)}",
         f"预设：{str(rt.get('current_preset_name', '') or '未设')} | 任务 {_task_brief(rt)} | 策略 {_policy_brief(user_ctx)}",
         f"学习：{_learning_brief(user_ctx)} | 当前建议 {str(rt.get('current_fk1_action_text', '') or '未评估')}",
         f"资金：{int(rt.get('gambling_fund', 0) or 0):,} | 余额：{int(rt.get('account_balance', 0) or 0):,} | 总收益：{int(rt.get('earnings', 0) or 0):+,}",
@@ -213,7 +282,66 @@ def build_watch_overview_text(user_ctx) -> str:
         ),
         f"最近决策：{_decision_brief(rt)}",
         "",
-        "命令：`watch fleet` / `watch learn`",
+        "命令：`watch risk` / `watch task` / `watch funds` / `watch learn`",
+    ]
+    return "\n".join(lines)
+
+
+def build_watch_account_text(current_user_ctx, ident: str) -> str:
+    target = resolve_watch_target(current_user_ctx, ident)
+    if not target:
+        return f"❌ 未找到账号 `{ident}`"
+    return build_watch_overview_text(target)
+
+
+def build_watch_risk_text(user_ctx) -> str:
+    rt = user_ctx.state.runtime
+    evidence = _build_watch_evidence(user_ctx)
+    overview = evidence.get("overview_24h", {}) if isinstance(evidence.get("overview_24h", {}), dict) else {}
+    temp = evidence.get("recent_temperature", {}) if isinstance(evidence.get("recent_temperature", {}), dict) else {}
+    lines = [
+        "🛡️ 值守风控",
+        "",
+        f"状态：{_status_text(rt)} | fk {_risk_bits(rt)} | 值守 {_watch_mode_brief(user_ctx)}",
+        f"当前建议：{str(rt.get('current_fk1_action_text', '') or '未评估')} | 限档 {str(rt.get('current_fk1_tier_cap', '') or '-')}",
+        f"自动暂停：{int(rt.get('stop_count', 0) or 0)} | 手动暂停 {'是' if bool(rt.get('manual_pause', False)) else '否'} | 资金暂停 {'是' if bool(rt.get('fund_pause_notified', False)) else '否'}",
+        f"温度：{_temperature_text(str(temp.get('level', 'normal') or 'normal'))} | 24h 盈亏 {int(overview.get('pnl_total', 0) or 0):+,} | 回撤 {int(overview.get('max_drawdown', 0) or 0):,}",
+        f"最近阻断：{str(rt.get('last_blocked_by', '') or '-')} | 影子验证 {'运行中' if bool(rt.get('shadow_probe_active', False)) else '无'}",
+    ]
+    return "\n".join(lines)
+
+
+def build_watch_task_text(user_ctx) -> str:
+    rt = user_ctx.state.runtime
+    lines = [
+        "📦 值守任务",
+        "",
+        f"预设：{str(rt.get('current_preset_name', '') or '未设')} | 值守 {_watch_mode_brief(user_ctx)}",
+        f"任务包：{str(rt.get('package_current_name', '') or '无')} | 状态 {str(rt.get('package_current_status', '') or '-')}",
+        f"任务：{str(rt.get('task_current_name', '') or '无')} | 进度 {int(rt.get('task_current_progress_bets', 0) or 0)}/{int(rt.get('task_current_target_bets', 0) or 0)}",
+        f"触发：{str(rt.get('task_current_trigger_mode', '') or '-')}",
+        f"最近动作：{str(rt.get('task_last_action', '') or '-')} | 原因 {str(rt.get('task_last_reason', '') or '-')}",
+        f"最近事件：{str(rt.get('task_last_event_at', '') or rt.get('package_last_event_at', '') or '-')}",
+    ]
+    return "\n".join(lines)
+
+
+def build_watch_funds_text(user_ctx) -> str:
+    rt = user_ctx.state.runtime
+    balance_status = {
+        "success": "正常",
+        "auth_failed": "Cookie 失效",
+        "network_error": "网络错误",
+        "unknown": "待刷新",
+    }.get(str(rt.get("balance_status", "unknown") or "unknown"), str(rt.get("balance_status", "unknown") or "unknown"))
+    lines = [
+        "💰 值守资金",
+        "",
+        f"菠菜资金：{int(rt.get('gambling_fund', 0) or 0):,} | 账户余额：{int(rt.get('account_balance', 0) or 0):,}",
+        f"总收益：{int(rt.get('earnings', 0) or 0):+,} | 本轮：{int(rt.get('period_profit', 0) or 0):+,}",
+        f"盈利目标：{int(rt.get('profit', 0) or 0):,} | 盈停 {int(rt.get('profit_stop', 0) or 0)} 局",
+        f"当前下注：{int(rt.get('bet_amount', 0) or 0):,} | 余额状态：{balance_status}",
+        f"资金暂停：{'是' if bool(rt.get('fund_pause_notified', False)) else '否'} | 值守 {_watch_mode_brief(user_ctx)}",
     ]
     return "\n".join(lines)
 
@@ -282,14 +410,14 @@ def build_watch_learn_text(user_ctx) -> str:
         "🧠 值守学习摘要",
         "",
         f"当前策略：{active_policy.get('policy_id', '')}@{active_policy.get('policy_version', '')} ({active_policy.get('policy_mode', '')})",
-        f"候选：{len(candidates)} | 最新 {latest.get('candidate_version', '-') or '-'} | 规则 {latest.get('rule_name', '-') or '-'}",
+        f"候选：{len(candidates)} | 最新 {latest.get('candidate_version', '-') or '-'} ({latest.get('candidate_id', '-') or '-'}) | 规则 {latest.get('rule_name', '-') or '-'}",
         f"最近评估：{latest.get('last_evaluation_status', '-') or '-'} / {latest.get('last_score_total', '-')}",
     ]
 
     if active_shadow:
         metrics = self_learning_engine._shadow_metrics(user_ctx, str(active_shadow.get("candidate_id", "") or ""))  # type: ignore[attr-defined]
         lines.append(
-            f"影子：{active_shadow.get('candidate_version', '-') or '-'} | "
+            f"影子：{active_shadow.get('candidate_version', '-') or '-'} ({active_shadow.get('candidate_id', '-') or '-'}) | "
             f"样本 {int(metrics.get('sample_size', 0) or 0)} | "
             f"Δ {int(metrics.get('delta_pnl', 0) or 0):+,} | "
             f"回撤改善 {int(metrics.get('delta_drawdown', 0) or 0):+,} | "
@@ -300,7 +428,7 @@ def build_watch_learn_text(user_ctx) -> str:
 
     if active_gray:
         lines.append(
-            f"灰度：{active_gray.get('candidate_version', '-') or '-'} | 策略 {active_gray.get('gray_policy_version', '-') or '-'}"
+            f"灰度：{active_gray.get('candidate_version', '-') or '-'} ({active_gray.get('candidate_id', '-') or '-'}) | 策略 {active_gray.get('gray_policy_version', '-') or '-'} | 目标 {active_gray.get('gray_target_user_name', '-') or '-'}"
         )
     else:
         lines.append("灰度：无")
@@ -380,6 +508,15 @@ def _current_watch_alerts(user_ctx) -> List[Tuple[int, str]]:
             (
                 3,
                 f"- {name} ({user_ctx.user_id}) | 学习灰度中 | {active_gray.get('candidate_version', '-') or '-'} -> {active_gray.get('gray_policy_version', '-') or '-'}",
+            )
+        )
+
+    quiet = get_watch_quiet_status(user_ctx)
+    if quiet.get("active", False):
+        alerts.append(
+            (
+                5,
+                f"- {name} ({user_ctx.user_id}) | 值守静音中 | 剩余 {int(quiet.get('remaining_min', 0) or 0)} 分钟 | 至 {quiet.get('until', '-')}",
             )
         )
 

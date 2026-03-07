@@ -317,6 +317,8 @@ def get_default_runtime() -> Dict[str, Any]:
         "learning_shadow_candidate_id": "",
         "learning_gray_candidate_id": "",
         "learning_last_summary": "",
+        "watch_quiet_until": "",
+        "watch_quiet_until_ts": 0,
         
         # 统计和仪表盘变量
         "total": 0,

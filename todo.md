@@ -80,10 +80,20 @@
   - J4 异常快照：统一 `runtime_faults / last_runtime_fault`
   - J5 文档、测试、回归
 
+### [x] K. Telegram 值守查询补强 V1
+- 说明书：[docs/tg-watch-query-v1-tech-spec.md](./docs/tg-watch-query-v1-tech-spec.md)
+- 当前实现：K1/K2/K3/K4/K5 全部完成
+- 交付：
+  - K1 子视图：`watch risk / watch task / watch funds`
+  - K2 点名查询：`watch <账号名|ID>`、`watch learn [账号名|ID]`
+  - K3 学习摘要补强：候选 ID、灰度目标账号
+  - K4 低噪声控制：`watch quiet [分钟|off]`
+  - K5 文档、测试、回归
+
 ---
 
 ## 4. 当前状态
-当前既定阶段 A 到 J 均已完成。
+当前既定阶段 A 到 K 均已完成。
 
 下一步不是继续补旧计划，而是等待新的阶段目标。
 
@@ -105,6 +115,7 @@ python -m pytest `
   tests_multiuser\test_multi_account_orchestrator_v1.py `
   tests_multiuser\test_self_learning_v1.py `
   tests_multiuser\test_tg_watch_v1.py `
+  tests_multiuser\test_tg_watch_query_v1.py `
   tests_multiuser\test_runtime_stability_v1.py `
   -q
 ```

@@ -1060,8 +1060,9 @@ async def send_to_watch(
     parse_mode: str = "markdown",
     title=None,
     desp=None,
+    account_name_override: str | None = None,
 ):
-    account_name = user_ctx.config.name.strip()
+    account_name = str(account_name_override or user_ctx.config.name).strip() or user_ctx.config.name.strip()
     account_prefix = f"【账号：{account_name}】"
     watch_message = _ensure_account_prefix(message, account_prefix)
     watch_desp = _ensure_account_prefix(desp if desp is not None else message, account_prefix)
@@ -1112,6 +1113,7 @@ async def _emit_watch_event(
     throttle_sec: int = 300,
     meta: Dict[str, Any] | None = None,
 ) -> bool:
+    quiet_status = tg_watch.get_watch_quiet_status(user_ctx)
     recorded = tg_watch.record_watch_event(
         user_ctx,
         event_type,
@@ -1120,6 +1122,7 @@ async def _emit_watch_event(
         fingerprint=fingerprint,
         throttle_sec=throttle_sec,
         meta=meta,
+        suppress_notify=bool(quiet_status.get("active", False)),
     )
     user_ctx.save_state()
     if not recorded.get("should_notify", False):
@@ -5199,10 +5202,12 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `learn gray <id|cX> [当前账号名|ID]` / `learn promote <id|cX>` / `learn rollback` : 学习候选灰度、转正、回滚
 - `doctor` : 查看当前账号启动/运行自检摘要
 - `doctor fleet` : 查看多账号自检总览
-- `watch` : 发送当前账号值守摘要到值守通道
+- `watch` / `watch <账号名|ID>` : 发送当前或指定账号值守摘要到当前值守通道
 - `watch fleet` : 发送多账号值守摘要到值守通道
-- `watch learn` : 发送学习值守摘要到值守通道
+- `watch risk` / `watch task` / `watch funds` : 发送当前账号风控/任务/资金摘要
+- `watch learn [账号名|ID]` : 发送学习值守摘要到值守通道
 - `watch alerts` : 发送当前值守告警摘要到值守通道
+- `watch quiet [分钟|off]` : 临时静音主动值守播报（手动查询不受影响）
 - `fleet` / `users` : 查看多账号总览
 - `fleet task` : 查看多账号任务/任务包视图
 - `fleet policy` : 查看多账号策略灰度视图
@@ -5822,17 +5827,146 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
                     await _send_watch_command_ack(client, event, "👀 多账号值守摘要已发送到值守通道")
                 return
-            if subcmd == "learn":
-                await send_to_watch(client, tg_watch.build_watch_learn_text(user_ctx), user_ctx, global_config)
+            if subcmd == "risk":
+                ident = my[2] if len(my) >= 3 else ""
+                target_ctx = tg_watch.resolve_watch_target(user_ctx, ident)
+                if not target_ctx:
+                    await send_to_admin(client, f"❌ 未找到账号 `{ident}`", user_ctx, global_config)
+                    return
+                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
+                await send_to_watch(
+                    client,
+                    tg_watch.build_watch_risk_text(target_ctx),
+                    user_ctx,
+                    global_config,
+                    account_name_override=target_name,
+                )
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
                 if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
-                    await _send_watch_command_ack(client, event, "👀 学习值守摘要已发送到值守通道")
+                    ack = "🛡️ 风控值守摘要已发送到值守通道"
+                    if target_ctx is not user_ctx:
+                        ack = f"🛡️ {target_name} 风控值守摘要已发送到值守通道"
+                    await _send_watch_command_ack(client, event, ack)
+                return
+            if subcmd == "task":
+                ident = my[2] if len(my) >= 3 else ""
+                target_ctx = tg_watch.resolve_watch_target(user_ctx, ident)
+                if not target_ctx:
+                    await send_to_admin(client, f"❌ 未找到账号 `{ident}`", user_ctx, global_config)
+                    return
+                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
+                await send_to_watch(
+                    client,
+                    tg_watch.build_watch_task_text(target_ctx),
+                    user_ctx,
+                    global_config,
+                    account_name_override=target_name,
+                )
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
+                    ack = "📦 任务值守摘要已发送到值守通道"
+                    if target_ctx is not user_ctx:
+                        ack = f"📦 {target_name} 任务值守摘要已发送到值守通道"
+                    await _send_watch_command_ack(client, event, ack)
+                return
+            if subcmd == "funds":
+                ident = my[2] if len(my) >= 3 else ""
+                target_ctx = tg_watch.resolve_watch_target(user_ctx, ident)
+                if not target_ctx:
+                    await send_to_admin(client, f"❌ 未找到账号 `{ident}`", user_ctx, global_config)
+                    return
+                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
+                await send_to_watch(
+                    client,
+                    tg_watch.build_watch_funds_text(target_ctx),
+                    user_ctx,
+                    global_config,
+                    account_name_override=target_name,
+                )
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
+                    ack = "💰 资金值守摘要已发送到值守通道"
+                    if target_ctx is not user_ctx:
+                        ack = f"💰 {target_name} 资金值守摘要已发送到值守通道"
+                    await _send_watch_command_ack(client, event, ack)
+                return
+            if subcmd == "learn":
+                ident = my[2] if len(my) >= 3 else ""
+                target_ctx = tg_watch.resolve_watch_target(user_ctx, ident)
+                if not target_ctx:
+                    await send_to_admin(client, f"❌ 未找到账号 `{ident}`", user_ctx, global_config)
+                    return
+                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
+                await send_to_watch(
+                    client,
+                    tg_watch.build_watch_learn_text(target_ctx),
+                    user_ctx,
+                    global_config,
+                    account_name_override=target_name,
+                )
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
+                    ack = "👀 学习值守摘要已发送到值守通道"
+                    if target_ctx is not user_ctx:
+                        ack = f"👀 {target_name} 学习值守摘要已发送到值守通道"
+                    await _send_watch_command_ack(client, event, ack)
                 return
             if subcmd == "alerts":
                 await send_to_watch(client, tg_watch.build_watch_alerts_text(user_ctx), user_ctx, global_config)
                 asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
                 if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
                     await _send_watch_command_ack(client, event, "🚨 值守告警摘要已发送到值守通道")
+                return
+            if subcmd == "quiet":
+                if len(my) == 2:
+                    quiet_status = tg_watch.get_watch_quiet_status(user_ctx)
+                    if quiet_status.get("active", False):
+                        mes = (
+                            "🔕 当前值守主动播报已静音\n"
+                            f"剩余：{int(quiet_status.get('remaining_min', 0) or 0)} 分钟\n"
+                            f"截止：{quiet_status.get('until', '-')}\n"
+                            "关闭：`watch quiet off`"
+                        )
+                    else:
+                        mes = "🔔 当前值守主动播报未静音\n用法：`watch quiet 30` / `watch quiet off`"
+                    await send_to_admin(client, mes, user_ctx, global_config)
+                    return
+                if len(my) == 3 and str(my[2]).strip().lower() == "off":
+                    result = tg_watch.clear_watch_quiet(user_ctx)
+                    user_ctx.save_state()
+                    await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                    return
+                if len(my) == 3:
+                    try:
+                        minutes = int(my[2])
+                        if minutes <= 0:
+                            raise ValueError
+                    except ValueError:
+                        await send_to_admin(client, "❌ 参数错误：分钟数必须是大于 0 的整数", user_ctx, global_config)
+                        return
+                    result = tg_watch.set_watch_quiet(user_ctx, minutes)
+                    user_ctx.save_state()
+                    await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                    return
+                await send_to_admin(client, "用法：`watch quiet [分钟|off]`", user_ctx, global_config)
+                return
+
+            if len(my) == 2:
+                target_ctx = tg_watch.resolve_watch_target(user_ctx, my[1])
+                if not target_ctx:
+                    await send_to_admin(client, f"❌ 未找到账号 `{my[1]}`", user_ctx, global_config)
+                    return
+                target_name = multi_account_orchestrator._account_name(target_ctx)  # type: ignore[attr-defined]
+                await send_to_watch(
+                    client,
+                    tg_watch.build_watch_overview_text(target_ctx),
+                    user_ctx,
+                    global_config,
+                    account_name_override=target_name,
+                )
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if not _watch_reply_visible_in_chat(user_ctx, event.chat_id):
+                    await _send_watch_command_ack(client, event, f"👀 {target_name} 值守摘要已发送到值守通道")
                 return
 
             message = await send_to_admin(
@@ -5841,9 +5975,15 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "❌ 参数格式错误\n"
                     "用法：\n"
                     "`watch`\n"
+                    "`watch <账号名|ID>`\n"
                     "`watch fleet`\n"
+                    "`watch risk [账号名|ID]`\n"
+                    "`watch task [账号名|ID]`\n"
+                    "`watch funds [账号名|ID]`\n"
                     "`watch learn`\n"
-                    "`watch alerts`"
+                    "`watch learn [账号名|ID]`\n"
+                    "`watch alerts`\n"
+                    "`watch quiet [分钟|off]`"
                 ),
                 user_ctx,
                 global_config,
