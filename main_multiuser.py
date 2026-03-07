@@ -13,6 +13,7 @@ import time
 import sys
 import errno
 import json
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 import interaction_journal
 import runtime_stability
@@ -359,6 +360,143 @@ def _sender_allowed_for_user_command(user_ctx: UserContext, event, allowed_sende
     return False
 
 
+def _safe_command_preview(raw_text: str) -> str:
+    text = str(raw_text or "").strip()
+    lower_text = text.lower()
+    if lower_text.startswith("apikey ") or lower_text.startswith("/apikey "):
+        return "apikey ***"
+    return text[:50]
+
+
+class _LocalProbeClient:
+    """Minimal client used to exercise admin commands without Telegram."""
+
+    def __init__(self):
+        self.sent_messages: List[Dict[str, Any]] = []
+        self.deleted_messages: List[Dict[str, Any]] = []
+
+    async def send_message(self, target, message, parse_mode=None):
+        message_id = len(self.sent_messages) + 1
+        record = {
+            "id": message_id,
+            "target": target,
+            "message": str(message or ""),
+            "parse_mode": parse_mode or "",
+        }
+        self.sent_messages.append(record)
+        return SimpleNamespace(chat_id=target, id=message_id, raw_text=record["message"])
+
+    async def delete_messages(self, chat_id, message_id):
+        self.deleted_messages.append({"chat_id": chat_id, "message_id": message_id})
+        return None
+
+    def iter_messages(self, chat_id, from_user=None, limit=None):
+        async def _empty_iter():
+            if False:
+                yield None
+            return
+
+        return _empty_iter()
+
+
+async def dispatch_admin_command(
+    client,
+    event,
+    user_ctx: UserContext,
+    global_config: dict,
+    *,
+    source: str = "telegram_admin_chat",
+) -> Dict[str, Any]:
+    raw_text = (getattr(event, "raw_text", None) or "").strip()
+    safe_cmd = _safe_command_preview(raw_text)
+    log_event(
+        logging.DEBUG,
+        'user_cmd',
+        '鏀跺埌鐢ㄦ埛鍛戒护',
+        user_id=user_ctx.user_id,
+        cmd=safe_cmd,
+    )
+    allowed_senders = _get_allowed_sender_ids(user_ctx)
+    sender_id = getattr(event, "sender_id", None)
+    chat_id = getattr(event, "chat_id", None)
+    allowed = _sender_allowed_for_user_command(user_ctx, event, allowed_senders)
+    interaction_journal.record_command(
+        user_ctx,
+        source=source,
+        command=safe_cmd,
+        accepted=allowed,
+        reason="" if allowed else "sender_not_allowed",
+        sender_id=sender_id,
+        chat_id=chat_id,
+    )
+    if not allowed:
+        log_event(
+            logging.WARNING,
+            'user_cmd',
+            '鍛戒护鍙戦€佽€呬笉鍦ㄧ櫧鍚嶅崟锛屽凡蹇界暐',
+            user_id=user_ctx.user_id,
+            sender_id=sender_id,
+        )
+        return {
+            "accepted": False,
+            "reason": "sender_not_allowed",
+            "command": safe_cmd,
+            "sender_id": sender_id,
+            "chat_id": chat_id,
+        }
+
+    async with _get_user_event_lock(user_ctx):
+        await zq_user(client, event, user_ctx, global_config)
+    return {
+        "accepted": True,
+        "reason": "",
+        "command": safe_cmd,
+        "sender_id": sender_id,
+        "chat_id": chat_id,
+    }
+
+
+async def inject_admin_command(
+    user_ctx: UserContext,
+    global_config: dict,
+    command: str,
+    *,
+    sender_id: Any = None,
+    chat_id: Any = None,
+    source: str = "local_admin_probe",
+    client=None,
+) -> Dict[str, Any]:
+    probe_client = client or _LocalProbeClient()
+    resolved_chat_id = chat_id if chat_id not in (None, "") else _resolve_admin_chat(user_ctx)
+    if resolved_chat_id in (None, ""):
+        resolved_chat_id = 0
+
+    if sender_id in (None, ""):
+        allowed_senders = _get_allowed_sender_ids(user_ctx)
+        sender_id = next(iter(allowed_senders), resolved_chat_id)
+        if isinstance(sender_id, str) and sender_id.lstrip("-").isdigit():
+            sender_id = int(sender_id)
+
+    event = SimpleNamespace(
+        raw_text=str(command or ""),
+        chat_id=resolved_chat_id,
+        id=int(time.time() * 1000),
+        sender_id=sender_id,
+        out=False,
+    )
+    result = await dispatch_admin_command(
+        probe_client,
+        event,
+        user_ctx,
+        global_config,
+        source=source,
+    )
+    if isinstance(probe_client, _LocalProbeClient):
+        result["outbound_messages"] = list(probe_client.sent_messages)
+        result["deleted_messages"] = list(probe_client.deleted_messages)
+    return result
+
+
 def register_handlers(client: TelegramClient, user_ctx: UserContext, global_config: dict):
     config = user_ctx.config
     state = user_ctx.state
@@ -424,6 +562,7 @@ def register_handlers(client: TelegramClient, user_ctx: UserContext, global_conf
     
     @client.on(events.NewMessage(chats=admin_chat if admin_chat else []))
     async def user_handler(event):
+        return await dispatch_admin_command(client, event, user_ctx, global_config)
         raw_text = (event.raw_text or "").strip()
         safe_cmd = raw_text[:50]
         lower_text = raw_text.lower()
@@ -963,6 +1102,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default="all",
         help="配合 --journal-tail 指定查看的交互日志流，默认 all",
     )
+    parser.add_argument(
+        "--inject-command",
+        action="append",
+        dest="inject_commands",
+        help="Inject one admin command locally without Telegram; repeat to run multiple commands.",
+    )
+    parser.add_argument(
+        "--inject-sender",
+        help="Optional sender_id used by --inject-command; defaults to admin_chat or first allowed sender.",
+    )
+    parser.add_argument(
+        "--inject-chat",
+        help="Optional chat_id used by --inject-command; defaults to admin_chat.",
+    )
     return parser
 
 
@@ -1030,6 +1183,24 @@ async def main(argv: Optional[List[str]] = None):
             print("-" * 50)
         return
     
+    if args.inject_commands:
+        print("=" * 50)
+        print("Local Admin Probe")
+        print("=" * 50)
+        for user_ctx in selected_users.values():
+            print(f"[{user_ctx.config.name}]")
+            for command in args.inject_commands:
+                result = await inject_admin_command(
+                    user_ctx,
+                    user_manager.global_config,
+                    command,
+                    sender_id=args.inject_sender,
+                    chat_id=args.inject_chat,
+                )
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+            print("-" * 50)
+        return
+
     clients = []
     tasks = []
     

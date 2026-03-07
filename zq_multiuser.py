@@ -940,7 +940,50 @@ def apply_account_risk_default_mode(rt: Dict[str, Any]) -> Dict[str, bool]:
 
 
 def _build_risk_state_text(rt: Dict[str, Any], include_usage: bool = True) -> str:
-    return risk_control.build_fk_state_text(rt, include_usage=include_usage)
+    modes = risk_control.normalize_fk_switches(rt, apply_default=False)
+    default_modes = {
+        "fk1_default_enabled": bool(rt.get("fk1_default_enabled", modes["fk1_enabled"])),
+        "fk2_default_enabled": bool(rt.get("fk2_default_enabled", modes["fk2_enabled"])),
+        "fk3_default_enabled": bool(rt.get("fk3_default_enabled", modes["fk3_enabled"])),
+    }
+    lines = [
+        "\U0001f6dd \u5f53\u524d\u98ce\u63a7\u5f00\u5173\uff08\u8d26\u53f7\u9ed8\u8ba4\u6a21\u5f0f\uff09",
+        f"- fk1 \u76d8\u9762\u98ce\u63a7\uff1a{'ON' if modes['fk1_enabled'] else 'OFF'}\uff08\u9ed8\u8ba4\uff1a{'ON' if default_modes['fk1_default_enabled'] else 'OFF'}\uff09",
+        f"- fk2 \u5165\u573a\u98ce\u63a7\uff1a{'ON' if modes['fk2_enabled'] else 'OFF'}\uff08\u9ed8\u8ba4\uff1a{'ON' if default_modes['fk2_default_enabled'] else 'OFF'}\uff09",
+        f"- fk3 \u8fde\u8f93\u98ce\u63a7\uff1a{'ON' if modes['fk3_enabled'] else 'OFF'}\uff08\u9ed8\u8ba4\uff1a{'ON' if default_modes['fk3_default_enabled'] else 'OFF'}\uff09",
+        "- \u8d44\u91d1\u98ce\u63a7\uff1a\u5e38\u5f00",
+    ]
+    if include_usage:
+        lines.extend(
+            [
+                "",
+                "\u8bf4\u660e\uff1a\u811a\u672c\u91cd\u542f\u540e\u4f1a\u6309\u8d26\u53f7\u9ed8\u8ba4\u6a21\u5f0f\u6062\u590d\u3002",
+                "\u7528\u6cd5\uff1a`fk` / `fk 1 on|off` / `fk 2 on|off` / `fk 3 on|off`",
+            ]
+        )
+    return "\n".join(lines)
+    modes = risk_control.normalize_fk_switches(rt, apply_default=False)
+    default_modes = {
+        "fk1_default_enabled": bool(rt.get("fk1_default_enabled", modes["fk1_enabled"])),
+        "fk2_default_enabled": bool(rt.get("fk2_default_enabled", modes["fk2_enabled"])),
+        "fk3_default_enabled": bool(rt.get("fk3_default_enabled", modes["fk3_enabled"])),
+    }
+    lines = [
+        "🛝 当前风控开关（账号默认模式）",
+        f"- fk1 盘面风控：{'ON' if modes['fk1_enabled'] else 'OFF'}（默认：{'ON' if default_modes['fk1_default_enabled'] else 'OFF'}）",
+        f"- fk2 入场风控：{'ON' if modes['fk2_enabled'] else 'OFF'}（默认：{'ON' if default_modes['fk2_default_enabled'] else 'OFF'}）",
+        f"- fk3 连输风控：{'ON' if modes['fk3_enabled'] else 'OFF'}（默认：{'ON' if default_modes['fk3_default_enabled'] else 'OFF'}）",
+        "- 资金风控：常开",
+    ]
+    if include_usage:
+        lines.extend(
+            [
+                "",
+                "说明：脚本重启后会按账号默认模式恢复。",
+                "用法：`fk` / `fk 1 on|off` / `fk 2 on|off` / `fk 3 on|off`",
+            ]
+        )
+    return "\n".join(lines)
 def build_startup_focus_reminder(user_ctx: UserContext) -> str:
     """启动重点设置提醒：风控开关 + 预设 + 入口命令。"""
     rt = user_ctx.state.runtime
@@ -4682,6 +4725,24 @@ def _build_status_context_brief(user_ctx: UserContext) -> str:
         pending_sequence = _safe_int(pending_hand.get("sequence", rt.get("bet_sequence_count", 0)), 0)
         pending_direction = _render_direction_label(pending_hand.get("direction", "-"))
         pending_amount = format_number(pending_hand.get("amount", 0) or 0)
+        return f"\u5f53\u524d\u6709\u5f85\u7ed3\u7b97\u6302\u5355 | \u7b2c {pending_sequence} \u624b | {pending_direction} | {pending_amount}"
+    return "\u5f53\u524d\u7a7a\u4ed3\uff0c\u7b49\u5f85\u4e0b\u4e00\u6b21\u6709\u6548\u76d8\u53e3\u4fe1\u53f7"
+    state = user_ctx.state
+    rt = state.runtime
+    pending_hand = _dashboard_pending_hand(state, rt)
+    if pending_hand:
+        pending_sequence = _safe_int(pending_hand.get("sequence", rt.get("bet_sequence_count", 0)), 0)
+        pending_direction = _render_direction_label(pending_hand.get("direction", "-"))
+        pending_amount = format_number(pending_hand.get("amount", 0) or 0)
+        return f"当前有待结算挂单 | 第 {pending_sequence} 手 | {pending_direction} | {pending_amount}"
+    return "当前空仓，等待下一次有效盘口信号"
+    state = user_ctx.state
+    rt = state.runtime
+    pending_hand = _dashboard_pending_hand(state, rt)
+    if pending_hand:
+        pending_sequence = _safe_int(pending_hand.get("sequence", rt.get("bet_sequence_count", 0)), 0)
+        pending_direction = _render_direction_label(pending_hand.get("direction", "-"))
+        pending_amount = format_number(pending_hand.get("amount", 0) or 0)
         return f"有待结算挂单 | 第 {pending_sequence} 手 | {pending_direction} | {pending_amount}"
     return "当前空仓，等待下一次有效盘口信号"
 
@@ -4697,6 +4758,42 @@ def _build_transition_card(
     signal_text: str = "",
     extra_lines: Optional[List[str]] = None,
 ) -> str:
+    lines_fixed = [
+        title,
+        f"\u8d26\u53f7\uff1a{user_ctx.config.name.strip()} | \u811a\u672c {get_bet_status_text(user_ctx.state.runtime)}",
+        f"\u52a8\u4f5c\uff1a{action}",
+        f"\u5f53\u524d\uff1a{current_text or _build_status_context_brief(user_ctx)}",
+        f"\u7b56\u7565\uff1a{_build_strategy_brief(user_ctx)}",
+    ]
+    if reason:
+        lines_fixed.append(f"\u539f\u56e0\uff1a{_compact_multiline_text(reason, max_len=120)}")
+    if signal_text:
+        lines_fixed.append(f"\u4fe1\u53f7\uff1a{_compact_multiline_text(signal_text, max_len=120)}")
+    for line in extra_lines or []:
+        clean = _compact_multiline_text(line, max_len=120)
+        if clean:
+            lines_fixed.append(clean)
+    if hint:
+        lines_fixed.append(f"\u4e0b\u4e00\u6b65\uff1a{_compact_multiline_text(hint, max_len=120)}")
+    return "\n".join(lines_fixed)
+    lines = [
+        title,
+        f"账号：{user_ctx.config.name.strip()} | 脚本 {get_bet_status_text(user_ctx.state.runtime)}",
+        f"动作：{action}",
+        f"当前：{current_text or _build_status_context_brief(user_ctx)}",
+        f"策略：{_build_strategy_brief(user_ctx)}",
+    ]
+    if reason:
+        lines.append(f"原因：{_compact_multiline_text(reason, max_len=120)}")
+    if signal_text:
+        lines.append(f"信号：{_compact_multiline_text(signal_text, max_len=120)}")
+    for line in extra_lines or []:
+        clean = _compact_multiline_text(line, max_len=120)
+        if clean:
+            lines.append(clean)
+    if hint:
+        lines.append(f"下一步：{_compact_multiline_text(hint, max_len=120)}")
+    return "\n".join(lines)
     lines = [
         title,
         f"账号：{user_ctx.config.name.strip()} | 脚本 {get_bet_status_text(user_ctx.state.runtime)}",
@@ -4797,6 +4894,36 @@ def _build_manual_pause_card(user_ctx: UserContext, *, already_paused: bool = Fa
     if already_paused:
         return _build_transition_card(
             user_ctx,
+            title="\u23f8\ufe0f \u72b6\u6001\u5361",
+            action="\u5f53\u524d\u5df2\u7ecf\u662f\u624b\u52a8\u6682\u505c",
+            reason="\u91cd\u590d\u6536\u5230 pause \u547d\u4ee4",
+            hint="\u6062\u590d\u8bf7\u53d1\u9001 `resume`",
+        )
+    return _build_transition_card(
+        user_ctx,
+        title="\u23f8\ufe0f \u72b6\u6001\u5361",
+        action="\u624b\u52a8\u6682\u505c\u5f53\u524d\u8d26\u53f7",
+        reason="\u7ba1\u7406\u5458\u547d\u4ee4 `pause`",
+        hint="\u6682\u505c\u540e\u4e0d\u518d\u53d1\u8d77\u65b0\u4e0b\u6ce8\uff0c\u5df2\u4e0b\u6ce8\u6302\u5355\u4ecd\u6309\u6b63\u5e38\u7ed3\u7b97\u63a8\u8fdb",
+    )
+    if already_paused:
+        return _build_transition_card(
+            user_ctx,
+            title="⏸ 状态卡",
+            action="当前已经是手动暂停",
+            reason="重复收到 pause 命令",
+            hint="恢复请发送 `resume`",
+        )
+    return _build_transition_card(
+        user_ctx,
+        title="⏸ 状态卡",
+        action="手动暂停当前账号",
+        reason="管理员命令 `pause`",
+        hint="暂停后不会再发起新下注，已下注挂单仍按正常结算推进",
+    )
+    if already_paused:
+        return _build_transition_card(
+            user_ctx,
             title="⏸️ 状态卡",
             action="当前已是手动暂停",
             reason="重复收到 pause 命令",
@@ -4812,6 +4939,20 @@ def _build_manual_pause_card(user_ctx: UserContext, *, already_paused: bool = Fa
 
 
 def _build_manual_resume_card(user_ctx: UserContext) -> str:
+    return _build_transition_card(
+        user_ctx,
+        title="\u25b6\ufe0f \u72b6\u6001\u5361",
+        action="\u6062\u590d\u5f53\u524d\u8d26\u53f7\u4e0b\u6ce8",
+        reason="\u7ba1\u7406\u5458\u547d\u4ee4 `resume`",
+        hint="\u6062\u590d\u540e\u7b49\u5f85\u4e0b\u4e00\u6b21\u6709\u6548\u76d8\u53e3\u4fe1\u53f7\u518d\u53d1\u8d77\u771f\u5b9e\u4e0b\u5355",
+    )
+    return _build_transition_card(
+        user_ctx,
+        title="▶ 状态卡",
+        action="恢复当前账号下注",
+        reason="管理员命令 `resume`",
+        hint="恢复后等待下一次有效盘口信号再发起真实下单",
+    )
     return _build_transition_card(
         user_ctx,
         title="▶️ 状态卡",

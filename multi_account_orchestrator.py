@@ -8,6 +8,12 @@ import self_learning_engine
 from user_manager import get_registered_user_contexts
 
 
+def _status_text_v2(rt: Dict[str, Any]) -> str:
+    from zq_multiuser import get_bet_status_text
+
+    return get_bet_status_text(rt)
+
+
 def _all_users(current_user_ctx) -> Dict[int, Any]:
     users = get_registered_user_contexts()
     if not users and current_user_ctx is not None:
@@ -111,7 +117,7 @@ def build_fleet_overview_text(current_user_ctx) -> str:
         win_rate = (wins / total * 100.0) if total else 0.0
         fk_bits = f"{int(risk_modes['fk1_enabled'])}{int(risk_modes['fk2_enabled'])}{int(risk_modes['fk3_enabled'])}"
         lines.append(
-            f"- {_account_name(user_ctx)} ({user_ctx.user_id}) | {_status_text(rt)} | "
+            f"- {_account_name(user_ctx)} ({user_ctx.user_id}) | {_status_text_v2(rt)} | "
             f"预设 {str(rt.get('current_preset_name', '') or '未设')} | "
             f"任务 {_task_brief(rt)} | 策略 {_policy_brief(user_ctx)} | 学习 {_learning_brief(user_ctx)} | "
             f"胜率 {win_rate:.1f}% | 盈利 {int(rt.get('earnings', 0) or 0):+,} | "
@@ -170,7 +176,7 @@ def build_fleet_account_text(current_user_ctx, ident: str) -> str:
     return (
         "🧾 账号详情\n\n"
         f"账号：{_account_name(target)} ({target.user_id})\n"
-        f"状态：{_status_text(rt)}\n"
+        f"状态：{_status_text_v2(rt)}\n"
         f"预设：{str(rt.get('current_preset_name', '') or '未设')}\n"
         f"任务包：{str(rt.get('package_current_name', '') or '无')}\n"
         f"任务：{str(rt.get('task_current_name', '') or '无')}\n"

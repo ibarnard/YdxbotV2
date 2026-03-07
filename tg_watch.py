@@ -18,6 +18,12 @@ WATCH_QUIET_UNTIL_KEY = "watch_quiet_until"
 WATCH_QUIET_UNTIL_TS_KEY = "watch_quiet_until_ts"
 
 
+def _status_text_v2(rt: Dict[str, Any]) -> str:
+    from zq_multiuser import get_bet_status_text
+
+    return get_bet_status_text(rt)
+
+
 def _all_users(current_user_ctx) -> Dict[int, Any]:
     users = get_registered_user_contexts()
     if not users and current_user_ctx is not None:
@@ -143,11 +149,47 @@ def set_watch_quiet(user_ctx, minutes: int) -> Dict[str, Any]:
         "active": True,
         "until": until_text,
         "remaining_min": quiet_minutes,
+        "message": f"\U0001f503 \u503c\u5b88\u4e3b\u52a8\u64ad\u62a5\u5df2\u9759\u97f3 {quiet_minutes} \u5206\u949f\uff0c\u81f3 {until_text}",
+    }
+    quiet_minutes = max(0, int(minutes or 0))
+    if quiet_minutes <= 0:
+        return clear_watch_quiet(user_ctx)
+
+    until_ts = _now_ts() + quiet_minutes * 60
+    until_text = datetime.fromtimestamp(until_ts).strftime("%Y-%m-%d %H:%M:%S")
+    rt = user_ctx.state.runtime
+    rt[WATCH_QUIET_UNTIL_KEY] = until_text
+    rt[WATCH_QUIET_UNTIL_TS_KEY] = until_ts
+    return {
+        "ok": True,
+        "active": True,
+        "until": until_text,
+        "remaining_min": quiet_minutes,
+        "message": f"🔃 值守主动播报已静音 {quiet_minutes} 分钟，至 {until_text}",
+    }
+    quiet_minutes = max(0, int(minutes or 0))
+    if quiet_minutes <= 0:
+        return clear_watch_quiet(user_ctx)
+
+    until_ts = _now_ts() + quiet_minutes * 60
+    until_text = datetime.fromtimestamp(until_ts).strftime("%Y-%m-%d %H:%M:%S")
+    rt = user_ctx.state.runtime
+    rt[WATCH_QUIET_UNTIL_KEY] = until_text
+    rt[WATCH_QUIET_UNTIL_TS_KEY] = until_ts
+    return {
+        "ok": True,
+        "active": True,
+        "until": until_text,
+        "remaining_min": quiet_minutes,
         "message": f"🔕 值守主动播报已静音 {quiet_minutes} 分钟，至 {until_text}",
     }
 
 
 def clear_watch_quiet(user_ctx) -> Dict[str, Any]:
+    _watch_quiet_defaults(user_ctx.state.runtime)
+    return {"ok": True, "active": False, "message": "\U0001f502 \u503c\u5b88\u4e3b\u52a8\u64ad\u62a5\u5df2\u6062\u590d"}
+    _watch_quiet_defaults(user_ctx.state.runtime)
+    return {"ok": True, "active": False, "message": "🔂 值守主动播报已恢复"}
     _watch_quiet_defaults(user_ctx.state.runtime)
     return {"ok": True, "active": False, "message": "🔔 值守主动播报已恢复"}
 
@@ -276,7 +318,7 @@ def build_watch_overview_text(user_ctx) -> str:
     lines = [
         "👀 值守摘要",
         "",
-        f"状态：{_status_text(rt)} | 模式 {_mode_text(rt)} | fk {_risk_bits(rt)} | 值守 {_watch_mode_brief(user_ctx)}",
+        f"状态：{_status_text_v2(rt)} | 模式 {_mode_text(rt)} | fk {_risk_bits(rt)} | 值守 {_watch_mode_brief(user_ctx)}",
         f"预设：{str(rt.get('current_preset_name', '') or '未设')} | 任务 {_task_brief(rt)} | 策略 {_policy_brief(user_ctx)}",
         f"学习：{_learning_brief(user_ctx)} | 当前建议 {str(rt.get('current_fk1_action_text', '') or '未评估')}",
         f"资金：{int(rt.get('gambling_fund', 0) or 0):,} | 余额：{int(rt.get('account_balance', 0) or 0):,} | 总收益：{int(rt.get('earnings', 0) or 0):+,}",
@@ -311,10 +353,42 @@ def build_watch_risk_text(user_ctx) -> str:
     evidence = _build_watch_evidence(user_ctx)
     overview = evidence.get("overview_24h", {}) if isinstance(evidence.get("overview_24h", {}), dict) else {}
     temp = evidence.get("recent_temperature", {}) if isinstance(evidence.get("recent_temperature", {}), dict) else {}
+    advice_text = str(rt.get("current_fk1_action_text", "") or "\u672a\u8bc4\u4f30")
+    manual_pause_text = "\u662f" if bool(rt.get("manual_pause", False)) else "\u5426"
+    fund_pause_text = "\u662f" if _has_effective_fund_pause(rt) else "\u5426"
+    shadow_status_text = "\u8fd0\u884c\u4e2d" if bool(rt.get("shadow_probe_active", False)) else "\u65e0"
+    lines = [
+        "\U0001f6dd \u503c\u5b88\u98ce\u63a7",
+        "",
+        f"\u72b6\u6001\uff1a{_status_text_v2(rt)} | fk {_risk_bits(rt)} | \u503c\u5b88 {_watch_mode_brief(user_ctx)}",
+        f"\u5f53\u524d\u5efa\u8bae\uff1a{advice_text} | \u9650\u6863 {str(rt.get('current_fk1_tier_cap', '') or '-')}",
+        f"\u81ea\u52a8\u6682\u505c\uff1a{int(rt.get('stop_count', 0) or 0)} | \u624b\u52a8\u6682\u505c {manual_pause_text} | \u8d44\u91d1\u6682\u505c {fund_pause_text}",
+        f"\u6e29\u5ea6\uff1a{_temperature_text(str(temp.get('level', 'normal') or 'normal'))} | 24h \u76c8\u4e8f {int(overview.get('pnl_total', 0) or 0):+,} | \u56de\u64a4 {int(overview.get('max_drawdown', 0) or 0):,}",
+        f"\u6700\u8fd1\u963b\u65ad\uff1a{str(rt.get('last_blocked_by', '') or '-')} | \u5f71\u5b50\u9a8c\u8bc1 {shadow_status_text}",
+    ]
+    return "\n".join(lines)
+    rt = user_ctx.state.runtime
+    evidence = _build_watch_evidence(user_ctx)
+    overview = evidence.get("overview_24h", {}) if isinstance(evidence.get("overview_24h", {}), dict) else {}
+    temp = evidence.get("recent_temperature", {}) if isinstance(evidence.get("recent_temperature", {}), dict) else {}
+    lines = [
+        "🛝 值守风控",
+        "",
+        f"状态：{_status_text_v2(rt)} | fk {_risk_bits(rt)} | 值守 {_watch_mode_brief(user_ctx)}",
+        f"当前建议：{str(rt.get('current_fk1_action_text', '') or '未评估')} | 限档 {str(rt.get('current_fk1_tier_cap', '') or '-')}",
+        f"自动暂停：{int(rt.get('stop_count', 0) or 0)} | 手动暂停 {'是' if bool(rt.get('manual_pause', False)) else '否'} | 资金暂停 {'是' if _has_effective_fund_pause(rt) else '否'}",
+        f"温度：{_temperature_text(str(temp.get('level', 'normal') or 'normal'))} | 24h 盈亏 {int(overview.get('pnl_total', 0) or 0):+,} | 回撤 {int(overview.get('max_drawdown', 0) or 0):,}",
+        f"最近阻断：{str(rt.get('last_blocked_by', '') or '-')} | 影子验证 {'运行中' if bool(rt.get('shadow_probe_active', False)) else '无'}",
+    ]
+    return "\n".join(lines)
+    rt = user_ctx.state.runtime
+    evidence = _build_watch_evidence(user_ctx)
+    overview = evidence.get("overview_24h", {}) if isinstance(evidence.get("overview_24h", {}), dict) else {}
+    temp = evidence.get("recent_temperature", {}) if isinstance(evidence.get("recent_temperature", {}), dict) else {}
     lines = [
         "🛡️ 值守风控",
         "",
-        f"状态：{_status_text(rt)} | fk {_risk_bits(rt)} | 值守 {_watch_mode_brief(user_ctx)}",
+        f"状态：{_status_text_v2(rt)} | fk {_risk_bits(rt)} | 值守 {_watch_mode_brief(user_ctx)}",
         f"当前建议：{str(rt.get('current_fk1_action_text', '') or '未评估')} | 限档 {str(rt.get('current_fk1_tier_cap', '') or '-')}",
         f"自动暂停：{int(rt.get('stop_count', 0) or 0)} | 手动暂停 {'是' if bool(rt.get('manual_pause', False)) else '否'} | 资金暂停 {'是' if _has_effective_fund_pause(rt) else '否'}",
         f"温度：{_temperature_text(str(temp.get('level', 'normal') or 'normal'))} | 24h 盈亏 {int(overview.get('pnl_total', 0) or 0):+,} | 回撤 {int(overview.get('max_drawdown', 0) or 0):,}",
@@ -324,6 +398,33 @@ def build_watch_risk_text(user_ctx) -> str:
 
 
 def build_watch_task_text(user_ctx) -> str:
+    rt = user_ctx.state.runtime
+    preset_text = str(rt.get("current_preset_name", "") or "\u672a\u8bbe")
+    package_name = str(rt.get("package_current_name", "") or "\u65e0")
+    task_name = str(rt.get("task_current_name", "") or "\u65e0")
+    lines = [
+        "\U0001f4dd \u503c\u5b88\u4efb\u52a1",
+        "",
+        f"\u9884\u8bbe\uff1a{preset_text} | \u503c\u5b88 {_watch_mode_brief(user_ctx)}",
+        f"\u4efb\u52a1\u5305\uff1a{package_name} | \u72b6\u6001 {str(rt.get('package_current_status', '') or '-')}",
+        f"\u4efb\u52a1\uff1a{task_name} | \u8fdb\u5ea6 {int(rt.get('task_current_progress_bets', 0) or 0)}/{int(rt.get('task_current_target_bets', 0) or 0)}",
+        f"\u89e6\u53d1\uff1a{str(rt.get('task_current_trigger_mode', '') or '-')}",
+        f"\u6700\u8fd1\u52a8\u4f5c\uff1a{str(rt.get('task_last_action', '') or '-')} | \u539f\u56e0 {str(rt.get('task_last_reason', '') or '-')}",
+        f"\u6700\u8fd1\u4e8b\u4ef6\uff1a{str(rt.get('task_last_event_at', '') or rt.get('package_last_event_at', '') or '-')}",
+    ]
+    return "\n".join(lines)
+    rt = user_ctx.state.runtime
+    lines = [
+        "📝 值守任务",
+        "",
+        f"预设：{str(rt.get('current_preset_name', '') or '未设')} | 值守 {_watch_mode_brief(user_ctx)}",
+        f"任务包：{str(rt.get('package_current_name', '') or '无')} | 状态 {str(rt.get('package_current_status', '') or '-')}",
+        f"任务：{str(rt.get('task_current_name', '') or '无')} | 进度 {int(rt.get('task_current_progress_bets', 0) or 0)}/{int(rt.get('task_current_target_bets', 0) or 0)}",
+        f"触发：{str(rt.get('task_current_trigger_mode', '') or '-')}",
+        f"最近动作：{str(rt.get('task_last_action', '') or '-')} | 原因 {str(rt.get('task_last_reason', '') or '-')}",
+        f"最近事件：{str(rt.get('task_last_event_at', '') or rt.get('package_last_event_at', '') or '-')}",
+    ]
+    return "\n".join(lines)
     rt = user_ctx.state.runtime
     lines = [
         "📦 值守任务",
@@ -339,6 +440,41 @@ def build_watch_task_text(user_ctx) -> str:
 
 
 def build_watch_funds_text(user_ctx) -> str:
+    rt = user_ctx.state.runtime
+    balance_status = {
+        "success": "\u6b63\u5e38",
+        "auth_failed": "Cookie \u5931\u6548",
+        "network_error": "\u7f51\u7edc\u9519\u8bef",
+        "unknown": "\u5f85\u5237\u65b0",
+    }.get(str(rt.get("balance_status", "unknown") or "unknown"), str(rt.get("balance_status", "unknown") or "unknown"))
+    fund_pause_text = "\u662f" if _has_effective_fund_pause(rt) else "\u5426"
+    lines = [
+        "\U0001f4b5 \u503c\u5b88\u8d44\u91d1",
+        "",
+        f"\u83e0\u83dc\u8d44\u91d1\uff1a{int(rt.get('gambling_fund', 0) or 0):,} | \u8d26\u6237\u4f59\u989d\uff1a{int(rt.get('account_balance', 0) or 0):,}",
+        f"\u603b\u6536\u76ca\uff1a{int(rt.get('earnings', 0) or 0):+,} | \u672c\u8f6e\uff1a{int(rt.get('period_profit', 0) or 0):+,}",
+        f"\u76c8\u5229\u76ee\u6807\uff1a{int(rt.get('profit', 0) or 0):,} | \u76c8\u505c {int(rt.get('profit_stop', 0) or 0)} \u5c40",
+        f"\u5f53\u524d\u4e0b\u6ce8\uff1a{int(rt.get('bet_amount', 0) or 0):,} | \u4f59\u989d\u72b6\u6001\uff1a{balance_status}",
+        f"\u8d44\u91d1\u6682\u505c\uff1a{fund_pause_text} | \u503c\u5b88 {_watch_mode_brief(user_ctx)}",
+    ]
+    return "\n".join(lines)
+    rt = user_ctx.state.runtime
+    balance_status = {
+        "success": "正常",
+        "auth_failed": "Cookie 失效",
+        "network_error": "网络错误",
+        "unknown": "待刷新",
+    }.get(str(rt.get("balance_status", "unknown") or "unknown"), str(rt.get("balance_status", "unknown") or "unknown"))
+    lines = [
+        "💵 值守资金",
+        "",
+        f"菠菜资金：{int(rt.get('gambling_fund', 0) or 0):,} | 账户余额：{int(rt.get('account_balance', 0) or 0):,}",
+        f"总收益：{int(rt.get('earnings', 0) or 0):+,} | 本轮：{int(rt.get('period_profit', 0) or 0):+,}",
+        f"盈利目标：{int(rt.get('profit', 0) or 0):,} | 盈停 {int(rt.get('profit_stop', 0) or 0)} 局",
+        f"当前下注：{int(rt.get('bet_amount', 0) or 0):,} | 余额状态：{balance_status}",
+        f"资金暂停：{'是' if _has_effective_fund_pause(rt) else '否'} | 值守 {_watch_mode_brief(user_ctx)}",
+    ]
+    return "\n".join(lines)
     rt = user_ctx.state.runtime
     balance_status = {
         "success": "正常",
@@ -363,7 +499,7 @@ def _fleet_priority(user_ctx, evidence: Dict[str, Any]) -> Tuple[int, int]:
     overview = evidence.get("overview_24h", {}) if isinstance(evidence.get("overview_24h", {}), dict) else {}
     temp = evidence.get("recent_temperature", {}) if isinstance(evidence.get("recent_temperature", {}), dict) else {}
     score = 0
-    if _status_text(rt) != "运行中":
+    if _status_text_v2(rt) != "运行中":
         score += 2
     if int(overview.get("pnl_total", 0) or 0) < 0:
         score += 1
@@ -388,7 +524,7 @@ def build_watch_fleet_text(current_user_ctx) -> str:
                 _fleet_priority(user_ctx, evidence),
                 (
                     f"- {multi_account_orchestrator._account_name(user_ctx)} ({user_ctx.user_id}) | "  # type: ignore[attr-defined]
-                    f"{_status_text(rt)} | 任务 {_task_brief(rt)} | 策略 {_policy_brief(user_ctx)} | 学习 {_learning_brief(user_ctx)} | "
+            f"{_status_text_v2(rt)} | 任务 {_task_brief(rt)} | 策略 {_policy_brief(user_ctx)} | 学习 {_learning_brief(user_ctx)} | "
                     f"24h {int(overview.get('pnl_total', 0) or 0):+,}/{int(overview.get('max_drawdown', 0) or 0):,} | "
                     f"温度 {_temperature_text(str(temp.get('level', 'normal') or 'normal'))}"
                 ),
@@ -402,6 +538,84 @@ def build_watch_fleet_text(current_user_ctx) -> str:
 
 
 def build_watch_learn_text(user_ctx) -> str:
+    center = self_learning_engine.load_learning_center(user_ctx)
+    candidates = self_learning_engine._sorted_candidates(center)  # type: ignore[attr-defined]
+    latest = candidates[-1] if candidates else {}
+    active_shadow = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("active_shadow_candidate_id", "") or ""),
+    )
+    active_gray = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("active_gray_candidate_id", "") or ""),
+    )
+    promoted = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("promoted_candidate_id", "") or ""),
+    )
+    active_policy = policy_engine.build_policy_prompt_context(user_ctx)
+    lines = [
+        "\U0001f9e0 \u503c\u5b88\u5b66\u4e60\u6458\u8981",
+        "",
+        f"\u5f53\u524d\u7b56\u7565\uff1a{active_policy.get('policy_id', '')}@{active_policy.get('policy_version', '')} ({active_policy.get('policy_mode', '')})",
+        f"\u5019\u9009\uff1a{len(candidates)} | \u6700\u65b0 {latest.get('candidate_version', '-') or '-'} ({latest.get('candidate_id', '-') or '-'}) | \u89c4\u5219 {latest.get('rule_name', '-') or '-'}",
+        f"\u6700\u8fd1\u8bc4\u4f30\uff1a{latest.get('last_evaluation_status', '-') or '-'} / {latest.get('last_score_total', '-')}",
+    ]
+    if active_shadow:
+        metrics = self_learning_engine._shadow_metrics(user_ctx, str(active_shadow.get("candidate_id", "") or ""))  # type: ignore[attr-defined]
+        lines.append(
+            f"\u5f71\u5b50\uff1a{active_shadow.get('candidate_version', '-') or '-'} ({active_shadow.get('candidate_id', '-') or '-'}) | \u6837\u672c {int(metrics.get('sample_size', 0) or 0)} | \u0394\u6536\u76ca {int(metrics.get('delta_pnl', 0) or 0):+,} | \u56de\u64a4\u6539\u5584 {int(metrics.get('delta_drawdown', 0) or 0):+,} | {self_learning_engine._shadow_status_text(str(metrics.get('status', self_learning_engine.LEARNING_SHADOW_WATCH) or self_learning_engine.LEARNING_SHADOW_WATCH))}"  # type: ignore[attr-defined]
+        )
+    else:
+        lines.append("\u5f71\u5b50\uff1a\u65e0")
+    if active_gray:
+        lines.append(
+            f"\u7070\u5ea6\uff1a{active_gray.get('candidate_version', '-') or '-'} ({active_gray.get('candidate_id', '-') or '-'}) | \u7b56\u7565 {active_gray.get('gray_policy_version', '-') or '-'} | \u76ee\u6807 {active_gray.get('gray_target_user_name', '-') or '-'}"
+        )
+    else:
+        lines.append("\u7070\u5ea6\uff1a\u65e0")
+    lines.append(f"\u6700\u8fd1\u8f6c\u6b63\uff1a{promoted.get('candidate_version', '-') if promoted else '-'} | \u6700\u8fd1\u4e8b\u4ef6 {center.get('last_promotion_event_at', '') or '-'}")
+    lines.append("\u64cd\u4f5c\uff1a`learn shadow` / `learn gray` / `learn promote` / `learn rollback`")
+    return "\n".join(lines)
+    center = self_learning_engine.load_learning_center(user_ctx)
+    candidates = self_learning_engine._sorted_candidates(center)  # type: ignore[attr-defined]
+    latest = candidates[-1] if candidates else {}
+    active_shadow = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("active_shadow_candidate_id", "") or ""),
+    )
+    active_gray = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("active_gray_candidate_id", "") or ""),
+    )
+    promoted = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("promoted_candidate_id", "") or ""),
+    )
+    active_policy = policy_engine.build_policy_prompt_context(user_ctx)
+    lines = [
+        "🧥 值守学习摘要",
+        "",
+        f"当前策略：{active_policy.get('policy_id', '')}@{active_policy.get('policy_version', '')} ({active_policy.get('policy_mode', '')})",
+        f"候选：{len(candidates)} | 最新 {latest.get('candidate_version', '-') or '-'} ({latest.get('candidate_id', '-') or '-'}) | 规则 {latest.get('rule_name', '-') or '-'}",
+        f"最近评估：{latest.get('last_evaluation_status', '-') or '-'} / {latest.get('last_score_total', '-')}",
+    ]
+    if active_shadow:
+        metrics = self_learning_engine._shadow_metrics(user_ctx, str(active_shadow.get("candidate_id", "") or ""))  # type: ignore[attr-defined]
+        lines.append(
+            f"影子：{active_shadow.get('candidate_version', '-') or '-'} ({active_shadow.get('candidate_id', '-') or '-'}) | 样本 {int(metrics.get('sample_size', 0) or 0)} | Δ收益 {int(metrics.get('delta_pnl', 0) or 0):+,} | 回撤改善 {int(metrics.get('delta_drawdown', 0) or 0):+,} | {self_learning_engine._shadow_status_text(str(metrics.get('status', self_learning_engine.LEARNING_SHADOW_WATCH) or self_learning_engine.LEARNING_SHADOW_WATCH))}"  # type: ignore[attr-defined]
+        )
+    else:
+        lines.append("影子：无")
+    if active_gray:
+        lines.append(
+            f"灰度：{active_gray.get('candidate_version', '-') or '-'} ({active_gray.get('candidate_id', '-') or '-'}) | 策略 {active_gray.get('gray_policy_version', '-') or '-'} | 目标 {active_gray.get('gray_target_user_name', '-') or '-'}"
+        )
+    else:
+        lines.append("灰度：无")
+    lines.append(f"最近转正：{promoted.get('candidate_version', '-') if promoted else '-'} | 最近事件 {center.get('last_promotion_event_at', '') or '-'}")
+    lines.append("操作：`learn shadow` / `learn gray` / `learn promote` / `learn rollback`")
+    return "\n".join(lines)
     center = self_learning_engine.load_learning_center(user_ctx)
     candidates = self_learning_engine._sorted_candidates(center)  # type: ignore[attr-defined]
     latest = candidates[-1] if candidates else {}
