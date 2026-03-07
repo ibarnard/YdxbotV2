@@ -422,6 +422,23 @@ class UserContext:
         if admin_chat not in (None, ""):
             notification_cfg["admin_chat"] = admin_chat
             groups_cfg["admin_chat"] = admin_chat
+
+        # 规范化：值守播报目标统一归类到 notification.watch；兼容旧 notification.watch_chat / watch_tg_bot。
+        watch_cfg = notification_cfg.get("watch", {}) if isinstance(notification_cfg.get("watch", {}), dict) else {}
+        watch_admin_chat = watch_cfg.get("admin_chat")
+        if watch_admin_chat in (None, ""):
+            watch_admin_chat = notification_cfg.get("watch_chat")
+        if watch_admin_chat not in (None, ""):
+            watch_cfg["admin_chat"] = watch_admin_chat
+
+        watch_tg_bot = watch_cfg.get("tg_bot", {}) if isinstance(watch_cfg.get("tg_bot", {}), dict) else {}
+        if not watch_tg_bot:
+            legacy_watch_tg_bot = notification_cfg.get("watch_tg_bot", {})
+            if isinstance(legacy_watch_tg_bot, dict):
+                watch_tg_bot = legacy_watch_tg_bot
+        if watch_tg_bot:
+            watch_cfg["tg_bot"] = dict(watch_tg_bot)
+        notification_cfg["watch"] = watch_cfg
         
         # 从配置中读取user_id，如果没有则使用目录名的哈希值
         self.user_id = telegram_cfg.get("user_id", 0)

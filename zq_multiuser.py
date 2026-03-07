@@ -849,19 +849,51 @@ def _iter_targets(target):
     return [target]
 
 
+def _coerce_chat_target(target):
+    if isinstance(target, str):
+        text = target.strip()
+        if text.lstrip("-").isdigit():
+            try:
+                return int(text)
+            except Exception:
+                return target
+    return target
+
+
 def _resolve_admin_chat(user_ctx: UserContext):
     notification = user_ctx.config.notification if isinstance(user_ctx.config.notification, dict) else {}
     admin_chat = notification.get("admin_chat")
     if admin_chat in (None, ""):
         admin_chat = user_ctx.config.groups.get("admin_chat")
-    if isinstance(admin_chat, str):
-        text = admin_chat.strip()
-        if text.lstrip("-").isdigit():
-            try:
-                return int(text)
-            except Exception:
-                return admin_chat
-    return admin_chat
+    return _coerce_chat_target(admin_chat)
+
+
+def _resolve_watch_chat(user_ctx: UserContext):
+    notification = user_ctx.config.notification if isinstance(user_ctx.config.notification, dict) else {}
+    watch_cfg = notification.get("watch", {}) if isinstance(notification.get("watch", {}), dict) else {}
+    watch_chat = watch_cfg.get("admin_chat")
+    if watch_chat in (None, ""):
+        watch_chat = notification.get("watch_chat")
+    if watch_chat in (None, ""):
+        watch_chat = notification.get("admin_chat")
+    if watch_chat in (None, ""):
+        watch_chat = user_ctx.config.groups.get("admin_chat")
+    return _coerce_chat_target(watch_chat)
+
+
+def _resolve_watch_tg_bot(user_ctx: UserContext) -> dict:
+    notification = user_ctx.config.notification if isinstance(user_ctx.config.notification, dict) else {}
+    watch_cfg = notification.get("watch", {}) if isinstance(notification.get("watch", {}), dict) else {}
+    watch_tg_bot = watch_cfg.get("tg_bot", {}) if isinstance(watch_cfg.get("tg_bot", {}), dict) else {}
+    if not watch_tg_bot:
+        legacy_watch_tg_bot = notification.get("watch_tg_bot", {})
+        if isinstance(legacy_watch_tg_bot, dict):
+            watch_tg_bot = legacy_watch_tg_bot
+    if not watch_tg_bot:
+        base_tg_bot = notification.get("tg_bot", {})
+        if isinstance(base_tg_bot, dict):
+            watch_tg_bot = dict(base_tg_bot)
+    return watch_tg_bot if isinstance(watch_tg_bot, dict) else {}
 
 
 async def _post_form_async(url: str, payload: dict, timeout: int = 5):
@@ -872,6 +904,26 @@ async def _post_form_async(url: str, payload: dict, timeout: int = 5):
 async def _post_json_async(url: str, payload: dict, timeout: int = 5):
     """在异步上下文中安全发送 json 请求，避免阻塞事件循环。"""
     return await asyncio.to_thread(requests.post, url, json=payload, timeout=timeout)
+
+
+async def _send_tg_bot_notification(
+    tg_bot_cfg: dict,
+    text: str,
+    user_ctx: UserContext,
+    log_event_name: str,
+):
+    if not isinstance(tg_bot_cfg, dict) or not tg_bot_cfg.get("enable"):
+        return
+
+    bot_token = tg_bot_cfg.get("bot_token")
+    chat_id = tg_bot_cfg.get("chat_id")
+    if bot_token and chat_id:
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text}
+        try:
+            await _post_json_async(url, payload, timeout=5)
+        except Exception as e:
+            log_event(logging.ERROR, 'send_msg', log_event_name, user_id=user_ctx.user_id, data=str(e))
 
 
 async def send_message_v2(
@@ -925,16 +977,7 @@ async def send_message_v2(
                 log_event(logging.ERROR, 'send_msg', 'IYUU通知失败', user_id=user_ctx.user_id, data=str(e))
 
         tg_bot_cfg = user_ctx.config.notification.get("tg_bot", {})
-        if tg_bot_cfg.get("enable"):
-            try:
-                bot_token = tg_bot_cfg.get("bot_token")
-                chat_id = tg_bot_cfg.get("chat_id")
-                if bot_token and chat_id:
-                    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-                    payload = {"chat_id": chat_id, "text": priority_message}
-                    await _post_json_async(url, payload, timeout=5)
-            except Exception as e:
-                log_event(logging.ERROR, 'send_msg', 'TG Bot通知失败', user_id=user_ctx.user_id, data=str(e))
+        await _send_tg_bot_notification(tg_bot_cfg, priority_message, user_ctx, 'TG Bot通知失败')
 
     return sent_message
 
@@ -986,18 +1029,39 @@ async def send_message(
                 await _post_form_async(iyuu_url, payload, timeout=5)
     if to in ("priority", "tgbot"):
         tg_bot_cfg = user_ctx.config.notification.get("tg_bot", {})
-        if tg_bot_cfg.get("enable"):
-            bot_token = tg_bot_cfg.get("bot_token")
-            chat_id = tg_bot_cfg.get("chat_id")
-            if bot_token and chat_id:
-                url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
-                payload = {"chat_id": chat_id, "text": priority_message}
-                await _post_json_async(url, payload, timeout=5)
+        await _send_tg_bot_notification(tg_bot_cfg, priority_message, user_ctx, 'TG Bot通知失败')
     return None
 
 
 async def send_to_admin(client, message: str, user_ctx: UserContext, global_config: dict):
     return await send_message_v2(client, "info", message, user_ctx, global_config)
+
+
+async def send_to_watch(
+    client,
+    message: str,
+    user_ctx: UserContext,
+    global_config: dict,
+    parse_mode: str = "markdown",
+    title=None,
+    desp=None,
+):
+    account_name = user_ctx.config.name.strip()
+    account_prefix = f"【账号：{account_name}】"
+    watch_message = _ensure_account_prefix(message, account_prefix)
+    watch_desp = _ensure_account_prefix(desp if desp is not None else message, account_prefix)
+    sent_message = None
+
+    try:
+        watch_chat = _resolve_watch_chat(user_ctx)
+        if watch_chat:
+            sent_message = await client.send_message(watch_chat, watch_message, parse_mode=parse_mode)
+    except Exception as e:
+        log_event(logging.ERROR, 'send_msg', '发送值守播报失败', user_id=user_ctx.user_id, data=str(e))
+
+    watch_tg_bot_cfg = _resolve_watch_tg_bot(user_ctx)
+    await _send_tg_bot_notification(watch_tg_bot_cfg, watch_desp, user_ctx, 'TG Watch通知失败')
+    return sent_message
 
 
 async def _send_transient_admin_notice(
