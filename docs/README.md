@@ -13,6 +13,7 @@
 - [执行稳定性与启动自检 V1 技术说明书](./runtime-stability-v1-tech-spec.md)
 - [Telegram 值守查询补强 V1 技术说明书](./tg-watch-query-v1-tech-spec.md)
 - [复盘摘要与人工决策支撑 V1 技术说明书](./review-action-v1-tech-spec.md)
+- [Admin 驾驶舱与分层播报 V1 技术说明书](./admin-cockpit-v1-tech-spec.md)
 - [重构路线图](./refactor-roadmap.md)
 
 ## 使用建议

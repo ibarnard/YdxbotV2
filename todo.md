@@ -97,10 +97,16 @@
   - L4 管理入口短文本输出：适合管理员聊天入口和手机查看
   - L5 文档、测试、回归
 
+### [ ] M. Admin 驾驶舱与分层播报 V1
+- 说明书：[docs/admin-cockpit-v1-tech-spec.md](./docs/admin-cockpit-v1-tech-spec.md)
+- 当前计划：M1 语义建模与聚合器、M2 驾驶舱、M3 手卡、M4 局/轮/日汇总卡、M5 告警中心
+- 当前进度：已起步 M1/M2，admin 驾驶舱已接入 `status / dashboard`，并在下单/结算后自动刷新
+
 ---
 
 ## 4. 当前状态
 当前既定阶段 A 到 L 均已完成。
+当前阶段已切到 `M. Admin 驾驶舱与分层播报 V1`，并已开始第一批代码实现。
 
 这套基线已经可以视为初步的 `v0.1.1`：
 - 单账号/多账号执行与观察闭环已成型
@@ -128,6 +134,7 @@ python -m pytest `
   tests_multiuser\test_tg_watch_query_v1.py `
   tests_multiuser\test_runtime_stability_v1.py `
   tests_multiuser\test_review_action_v1.py `
+  tests_multiuser\test_admin_cockpit_v1.py `
   -q
 ```
 

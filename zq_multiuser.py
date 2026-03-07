@@ -632,69 +632,229 @@ def get_software_version_text() -> str:
         return "unknown"
 
 
-# 仪表盘格式化 - 与master版本保持一致
+def _format_amount_wan(value: Any) -> str:
+    try:
+        return f"{int(value) / 10000:.2f} 万"
+    except Exception:
+        return "0.00 万"
+
+
+def _format_dashboard_results(history: list, window: int = 40) -> str:
+    recent = []
+    for item in list(history or [])[-window:][::-1]:
+        try:
+            recent.append("✅" if int(item) == 1 else "❌")
+        except Exception:
+            continue
+    if not recent:
+        return "暂无历史"
+    return os.linesep.join(
+        " ".join(recent[index:index + 10])
+        for index in range(0, len(recent), 10)
+    )
+
+
+def _dashboard_balance_text(rt: Dict[str, Any]) -> str:
+    balance_status = str(rt.get("balance_status", "unknown") or "unknown")
+    account_balance = _safe_int(rt.get("account_balance", 0), 0)
+    if balance_status == "auth_failed":
+        return "⚠️ Cookie 失效"
+    if balance_status == "network_error":
+        return "⚠️ 网络错误"
+    if balance_status == "unknown" and account_balance <= 0:
+        return "⏳ 获取中..."
+    return _format_amount_wan(account_balance)
+
+
+def _dashboard_temperature_text(level: str) -> str:
+    return {
+        "normal": "正常",
+        "cold": "偏冷",
+        "very_cold": "很冷",
+    }.get(str(level or "normal"), "正常")
+
+
+def _dashboard_pending_hand(state, rt: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    pending_bet_id = str(rt.get("pending_bet_id", "") or "").strip()
+    for entry in reversed(list(getattr(state, "bet_sequence_log", []) or [])):
+        if pending_bet_id and str(entry.get("bet_id", "") or "") == pending_bet_id:
+            return entry
+        if not pending_bet_id and str(entry.get("status", "") or "") == "placed":
+            return entry
+    return None
+
+
+def _dashboard_last_settled_hand(state) -> Optional[Dict[str, Any]]:
+    for entry in reversed(list(getattr(state, "bet_sequence_log", []) or [])):
+        if str(entry.get("status", "") or "") == "settled":
+            return entry
+    return None
+
+
+def _dashboard_learning_focus_text(user_ctx: UserContext) -> str:
+    try:
+        center = self_learning_engine.load_learning_center(user_ctx)
+        active_gray = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+            center,
+            str(center.get("active_gray_candidate_id", "") or ""),
+        )
+        active_shadow = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+            center,
+            str(center.get("active_shadow_candidate_id", "") or ""),
+        )
+        promoted = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+            center,
+            str(center.get("promoted_candidate_id", "") or ""),
+        )
+        if active_gray:
+            return f"gray {active_gray.get('candidate_version', '-') or '-'}"
+        if active_shadow:
+            return f"shadow {active_shadow.get('candidate_version', '-') or '-'}"
+        if promoted:
+            return f"promoted {promoted.get('candidate_version', '-') or '-'}"
+    except Exception:
+        pass
+    return "无"
+
+
+# 仪表盘格式化 - admin 驾驶舱 V1
 def format_dashboard(user_ctx: UserContext) -> str:
-    """生成并返回仪表盘信息 - 与master版本format_dashboard一致"""
+    """生成 admin_chat 驾驶舱文本。"""
     state = user_ctx.state
     rt = state.runtime
-    
-    # 显示近期40次结果（由近及远）
-    reversed_data = ["✅" if x == 1 else "❌" for x in state.history[-40:][::-1]]
-    mes = f"""📊 **近期 40 次结果**（由近及远）\n✅：大（1）  ❌：小（0）\n{os.linesep.join(
-        " ".join(map(str, reversed_data[i:i + 10])) 
-        for i in range(0, len(reversed_data), 10)
-    )}\n\n———————————————\n🎯 **策略设定**\n"""
-    mes += f"🔢 **软件版本：{get_software_version_text()}**\n"
-    mes += f"🤖 **模型 API：{rt.get('current_model_id', 'unknown')}**\n"
-    mes += f"{policy_engine.build_policy_focus_text(user_ctx)}\n"
-    preset_name = rt.get("current_preset_name", "none")
+    snapshot: Dict[str, Any] = {}
+    overview_24h: Dict[str, Any] = {}
+    similar_cases: Dict[str, Any] = {}
+
+    try:
+        snapshot = history_analysis.build_current_analysis_snapshot(user_ctx)
+        similar_cases = snapshot.get("similar_cases", {}) if isinstance(snapshot.get("similar_cases", {}), dict) else {}
+    except Exception:
+        snapshot = {}
+        similar_cases = {}
+
+    try:
+        evidence = history_analysis.build_policy_evidence_package(user_ctx, analysis_snapshot=snapshot)
+        if isinstance(evidence.get("overview_24h", {}), dict):
+            overview_24h = evidence.get("overview_24h", {})
+    except Exception:
+        overview_24h = {}
+
+    history = list(getattr(state, "history", []) or [])
+    streak_len, streak_side = _get_current_streak(history)
+    tail_text = f"连{streak_side}{streak_len}" if streak_len > 0 else "-"
+    pending_hand = _dashboard_pending_hand(state, rt)
+    last_settled_hand = _dashboard_last_settled_hand(state)
+    current_package_name = str(rt.get("package_current_name", "") or "")
+    current_task_name = str(rt.get("task_current_name", "") or "")
+    current_task_progress = _safe_int(rt.get("task_current_progress_bets", 0), 0)
+    current_task_target = _safe_int(rt.get("task_current_target_bets", 0), 0)
+    current_task_trigger_mode = str(rt.get("task_current_trigger_mode", "") or "-")
+    mode_text = {0: "反投", 1: "预测", 2: "追投"}.get(_safe_int(rt.get("mode", 1), 1), "未知")
+    status_text = get_bet_status_text(rt)
+    balance_text = _dashboard_balance_text(rt)
+    display_fund = max(0, _safe_int(rt.get("gambling_fund", 0), 0))
+    policy_version = str(rt.get("policy_active_version", "") or "-")
+    policy_mode = str(rt.get("policy_active_mode", "baseline") or "baseline")
+    current_preset_name = str(rt.get("current_preset_name", "none") or "none")
     preset_params = (
         f"{rt.get('continuous', 1)} {rt.get('lose_stop', 13)} "
         f"{rt.get('lose_once', 3.0)} {rt.get('lose_twice', 2.1)} "
         f"{rt.get('lose_three', 2.05)} {rt.get('lose_four', 2.0)} {rt.get('initial_amount', 500)}"
     )
-    mes += f"📋 **预设名称：{preset_name}**\n"
-    current_package_name = str(rt.get("package_current_name", "") or "")
-    if current_package_name:
-        mes += f"🧰 **当前任务包：{current_package_name}**\n"
-    current_task_name = str(rt.get("task_current_name", "") or "")
-    if current_task_name:
-        mes += (
-            f"📦 **当前任务：{current_task_name}**\n"
-            f"🧭 **任务进度：{rt.get('task_current_progress_bets', 0)} / {rt.get('task_current_target_bets', 0)}**\n"
+    dynamic_base_tier = str(rt.get("current_dynamic_base_tier", "") or current_preset_name)
+    dynamic_tier = str(rt.get("current_dynamic_tier", "") or current_preset_name)
+    learning_text = _dashboard_learning_focus_text(user_ctx)
+    current_round_no = _safe_int(rt.get("current_round", snapshot.get("current_round_no", 0)), 0)
+    current_round_key = str(rt.get("current_round_key", "") or snapshot.get("round_key", "") or "-")
+    regime_label = str(snapshot.get("regime_label", history_analysis.REGIME_RANGE) or history_analysis.REGIME_RANGE)
+    temperature_text = _dashboard_temperature_text(str(snapshot.get("recent_temperature", {}).get("level", "normal") or "normal"))
+    current_action_text = str(rt.get("current_fk1_action_text", "") or "未评估")
+    current_tier_cap = str(rt.get("current_fk1_tier_cap", "") or "-")
+    lose_count = _safe_int(rt.get("lose_count", 0), 0)
+    pending_text = f"空仓 | 当前序列 {_safe_int(rt.get('bet_sequence_count', 0), 0)} | round_key {current_round_key}"
+    if pending_hand:
+        pending_direction = {"big": "大", "small": "小"}.get(str(pending_hand.get("direction", "") or ""), "-")
+        pending_amount = format_number(pending_hand.get("amount", 0) or 0)
+        pending_text = (
+            f"待结算 | 第 {_safe_int(pending_hand.get('sequence', rt.get('bet_sequence_count', 0)), 0)} 手 | "
+            f"{pending_direction} | {pending_amount} | {pending_hand.get('bet_id', '-') or '-'}"
         )
-    else:
-        mes += "📦 **当前任务：无**\n"
-    mes += f"🤖 **预设参数：{preset_params}**\n"
-    mes += f"💰 **初始金额：{rt.get('initial_amount', 500)}**\n⏹ **押注 {rt.get('lose_stop', 13)} 次停止**\n"
-    mes += f"💥 **炸 {rt.get('explode', 5)} 次，暂停 {rt.get('stop', 3)} 局**\n📚 **押注倍率：{rt.get('lose_once', 3.0)} / {rt.get('lose_twice', 2.1)} / {rt.get('lose_three', 2.05)} / {rt.get('lose_four', 2.0)}**\n\n"
-    
-    # 余额显示逻辑 - 与master一致
-    balance_status = rt.get('balance_status', 'ok')
-    account_balance = rt.get('account_balance', 0)
-    
-    if balance_status == "auth_failed":
-        balance_str = "⚠️ Cookie 失效"
-    elif balance_status == "network_error":
-        balance_str = "⚠️ 网络错误"
-    elif account_balance == 0 and balance_status == "unknown":
-        balance_str = "⏳ 获取中..."
-    else:
-        balance_str = f"{account_balance / 10000:.2f} 万"
-        
-    mes += f"💰 **账户余额：{balance_str}**\n"
-    # 防止资金显示为负数
-    display_fund = max(0, rt.get('gambling_fund', 0))
-    mes += f"💰 **菠菜余额：{display_fund / 10000:.2f} 万**\n📈 **盈利目标：{rt.get('profit', 1000000) / 10000:.2f} 万，暂停 {rt.get('profit_stop', 5)} 局**\n"
-    mes += f"📈 **本轮盈利：{rt.get('period_profit', 0) / 10000:.2f} 万**\n📈 **总盈利：{rt.get('earnings', 0) / 10000:.2f} 万**\n\n"
-    
-    win_total = rt.get('win_total', 0)
-    total = rt.get('total', 0)
-    if win_total > 0 or total > 0:
-        win_rate = (win_total / total * 100) if total > 0 else 0.00
-        mes += f"🎯 **押注次数：{total}**\n🏆 **胜率：{win_rate:.2f}%**\n💰 **收益：{format_number(rt.get('earnings', 0))}**"
-    
-    return mes
+
+    last_settled_text = "暂无"
+    if last_settled_hand:
+        settle_profit = _safe_int(last_settled_hand.get("profit", 0), 0)
+        last_result = "赢" if settle_profit > 0 else ("输" if settle_profit < 0 else "平")
+        last_direction = {"big": "大", "small": "小"}.get(str(last_settled_hand.get("direction", "") or ""), "-")
+        last_settled_text = (
+            f"{last_result} {settle_profit:+,} | 第 {_safe_int(last_settled_hand.get('sequence', 0), 0)} 手 | "
+            f"{last_direction} | {last_settled_hand.get('settled_at', '-') or '-'}"
+        )
+
+    current_episode_text = (
+        f"任务局 | {current_task_progress}/{current_task_target} 手 | 盈亏 {_safe_int(rt.get('period_profit', 0), 0):+,} | 连输 {lose_count}"
+        if current_task_name
+        else f"连投局 | 第 {_safe_int(rt.get('bet_sequence_count', 0), 0)} 手 | 盈亏 {_safe_int(rt.get('period_profit', 0), 0):+,} | 连输 {lose_count}"
+    )
+    overall_total = _safe_int(rt.get("total", 0), 0)
+    overall_win_total = _safe_int(rt.get("win_total", 0), 0)
+    overall_wr = (overall_win_total / overall_total * 100) if overall_total > 0 else 0.0
+    current_run_text = (
+        f"{current_package_name or '无任务包'} / {current_task_name} | {current_task_progress}/{current_task_target} 手 | {current_task_trigger_mode}"
+        if current_task_name
+        else f"人工轮 | 已下注 {overall_total} 手 | 胜率 {overall_wr:.1f}% | 最近 {str(rt.get('task_last_action', '') or '无')}"
+    )
+
+    risk_modes = _normalize_risk_switches(rt, apply_default=False)
+    win_rate_24h = float(overview_24h.get("win_rate", 0.0) or 0.0) * 100
+    lines = [
+        "📍 Admin 驾驶舱",
+        (
+            f"账号：{user_ctx.config.name.strip()} | 刷新：{datetime.now().strftime('%H:%M:%S')} | "
+            f"版本：{get_software_version_text()}"
+        ),
+        f"脚本：{status_text} | 模式：{mode_text} | 模型：{rt.get('current_model_id', 'unknown')}",
+        f"🔢 **软件版本：{get_software_version_text()}**",
+        f"🚦 **当前押注状态：{status_text}**",
+        f"📋 **预设名称：{current_preset_name}**",
+        f"🤖 **预设参数：{preset_params}**",
+        "",
+        "📊 近 40 盘结果（由近及远）",
+        _format_dashboard_results(history),
+        "",
+        f"盘面：第 {current_round_no} 盘 | {regime_label} | 温度 {temperature_text} | 尾部 {tail_text}",
+        f"判断：{current_action_text} | 限档 {current_tier_cap} | 相似样本 {_safe_int(similar_cases.get('similar_count', 0), 0)}",
+        f"手况：{pending_text}",
+        f"上手：{last_settled_text}",
+        f"局面：{current_episode_text}",
+        f"轮次：{current_run_text}",
+        (
+            f"策略：{current_preset_name} -> {dynamic_tier} | policy {policy_version} ({policy_mode}) | "
+            f"learn {learning_text}"
+        ),
+        (
+            f"参数：首注 {format_number(rt.get('initial_amount', 500) or 500)} | "
+            f"连投上限 {rt.get('lose_stop', 13)} | 炸 {rt.get('explode', 5)} 停 {rt.get('stop', 3)} | "
+            f"倍率 {rt.get('lose_once', 3.0)}/{rt.get('lose_twice', 2.1)}/{rt.get('lose_three', 2.05)}/{rt.get('lose_four', 2.0)}"
+        ),
+        (
+            f"资金：账户 {balance_text} | 菠菜 {_format_amount_wan(display_fund)} | "
+            f"本轮 {_format_amount_wan(rt.get('period_profit', 0))} | 总 {_format_amount_wan(rt.get('earnings', 0))}"
+        ),
+        (
+            f"24h：样本 {_safe_int(overview_24h.get('settled_count', 0), 0)} | "
+            f"胜率 {win_rate_24h:.1f}% | 盈亏 {_safe_int(overview_24h.get('pnl_total', 0), 0):+,} | "
+            f"回撤 {_safe_int(overview_24h.get('max_drawdown', 0), 0):,} | "
+            f"观望 {_safe_int(overview_24h.get('observe_count', 0), 0)} | 阻断 {_safe_int(overview_24h.get('blocked_count', 0), 0)}"
+        ),
+        (
+            f"风控：fk1 {_risk_switch_label(risk_modes['fk1_enabled'])} / "
+            f"fk2 {_risk_switch_label(risk_modes['fk2_enabled'])} / "
+            f"fk3 {_risk_switch_label(risk_modes['fk3_enabled'])} | 当前连输 {lose_count}"
+        ),
+        f"轮廓：dynamic {dynamic_base_tier}->{dynamic_tier} | round_key {current_round_key}",
+    ]
+    return "\n".join(lines)
 
 
 def get_bet_status_text(rt: Dict[str, Any]) -> str:
@@ -703,6 +863,30 @@ def get_bet_status_text(rt: Dict[str, Any]) -> str:
         return "手动暂停"
     if not rt.get("switch", True):
         return "已关闭"
+
+    pause_active = bool(rt.get("pause_countdown_active", False))
+    stop_count = max(0, int(rt.get("stop_count", 0) or 0))
+    if pause_active or stop_count > 0:
+        total_rounds = max(0, int(rt.get("pause_countdown_total_rounds", 0) or 0))
+        last_remaining = int(rt.get("pause_countdown_last_remaining", -1) or -1)
+        reason = str(rt.get("pause_countdown_reason", "") or "").strip()
+
+        remaining_rounds = 0
+        if total_rounds > 0 and 0 < last_remaining <= total_rounds:
+            remaining_rounds = last_remaining
+        elif total_rounds > 0 and stop_count > 0:
+            remaining_rounds = total_rounds if stop_count > total_rounds else stop_count
+        elif stop_count > 0:
+            remaining_rounds = max(0, stop_count - 1)
+
+        if remaining_rounds > 0 and reason:
+            return f"自动暂停（剩{remaining_rounds}局，{reason}）"
+        if remaining_rounds > 0:
+            return f"自动暂停（剩{remaining_rounds}局）"
+        if reason:
+            return f"自动暂停（{reason}）"
+        return "自动暂停"
+
     if rt.get("bet_on", False):
         return "运行中"
     return "已暂停"
@@ -1050,6 +1234,17 @@ async def send_message(
 
 async def send_to_admin(client, message: str, user_ctx: UserContext, global_config: dict):
     return await send_message_v2(client, "info", message, user_ctx, global_config)
+
+
+async def _refresh_admin_dashboard(client, user_ctx: UserContext, global_config: dict):
+    try:
+        if hasattr(user_ctx, "dashboard_message") and user_ctx.dashboard_message:
+            await cleanup_message(client, user_ctx.dashboard_message)
+    except Exception:
+        pass
+    dashboard = format_dashboard(user_ctx)
+    user_ctx.dashboard_message = await send_to_admin(client, dashboard, user_ctx, global_config)
+    return user_ctx.dashboard_message
 
 
 async def send_to_watch(
@@ -2568,6 +2763,7 @@ async def process_bet_on(client, event, user_ctx: UserContext, global_config: di
         asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
         if message:
             asyncio.create_task(delete_later(client, message.chat_id, message.id, 100))
+        await _refresh_admin_dashboard(client, user_ctx, global_config)
 
         # 仅在“暂停后首次真正下单”时发送恢复说明，避免倒计时结束后反复刷“恢复押注”。
         if rt.get("pause_resume_pending", False):
@@ -4866,9 +5062,8 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
             )
         
         # 发送仪表盘
-        dashboard = format_dashboard(user_ctx)
         log_event(logging.INFO, 'settle', '发送仪表盘', user_id=user_ctx.user_id)
-        user_ctx.dashboard_message = await send_to_admin(client, dashboard, user_ctx, global_config)
+        await _refresh_admin_dashboard(client, user_ctx, global_config)
         
         # 保存状态
         user_ctx.save_state()
@@ -5257,7 +5452,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 
 **多用户管理**
 - `users` : 查看当前用户状态
-- `status` : 查看仪表盘
+- `status` / `dashboard` : 刷新 admin 驾驶舱
 """
             log_event(logging.INFO, 'user_cmd', '显示帮助', user_id=user_ctx.user_id)
             message = await send_to_admin(client, mes, user_ctx, global_config)
@@ -6100,13 +6295,10 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 asyncio.create_task(delete_later(client, message.chat_id, message.id, 30))
             return
         
-        # status - 查看仪表盘 - 与master一致
-        if cmd == "status":
-            dashboard = format_dashboard(user_ctx)
-            message = await send_to_admin(client, dashboard, user_ctx, global_config)
+        # status/dashboard - 刷新 admin 驾驶舱
+        if cmd in {"status", "dashboard"}:
+            await _refresh_admin_dashboard(client, user_ctx, global_config)
             asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
-            if message:
-                asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
             return
         
         # ========== 参数设置命令 ==========
