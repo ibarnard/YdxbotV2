@@ -1,5 +1,8 @@
 # 文档索引
 
+## 总览主线
+- [重构系统总技术说明书（v0.1.1）](./system-technical-manual-v0.1.1.md)
+
 ## 当前阶段
 - [风控-历史资产-动态押注 V1 技术说明书](./risk-history-dynamic-v1-tech-spec.md)
 - [任务系统 V1 技术说明书](./task-system-v1-tech-spec.md)
