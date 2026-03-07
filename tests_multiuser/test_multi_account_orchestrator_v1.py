@@ -4,6 +4,7 @@ from pathlib import Path
 
 import multi_account_orchestrator
 import policy_engine
+import self_learning_engine
 import zq_multiuser as zm
 from user_manager import UserContext, clear_registered_user_contexts
 
@@ -47,14 +48,45 @@ def test_build_fleet_overview_and_policy_switch(tmp_path):
     _prepare_account(master, "yc10", task_name="巡航A")
     _prepare_account(xu, "yc5", package_name="稳健包")
     policy_engine.sync_policy_from_evidence(xu)
+    self_learning_engine._write_learning_center(
+        xu,
+        {
+            "version": 1,
+            "learning_id": f"learn_{xu.user_id}",
+            "sequence": 1,
+            "last_generated_at": "2026-03-07 10:00:00",
+            "last_generated_candidate_id": "lc_9602_001",
+            "last_shadow_recorded_at": "2026-03-07 10:10:00",
+            "last_promotion_event_at": "2026-03-07 10:20:00",
+            "active_shadow_candidate_id": "",
+            "active_gray_candidate_id": "lc_9602_001",
+            "promoted_candidate_id": "",
+            "candidates": [
+                {
+                    "candidate_id": "lc_9602_001",
+                    "candidate_version": "c1",
+                    "candidate_no": 1,
+                    "status": self_learning_engine.LEARNING_STATUS_GRAY,
+                    "created_at": "2026-03-07 10:00:00",
+                    "updated_at": "2026-03-07 10:20:00",
+                    "rule_name": "高档位收紧",
+                    "summary": "候选-高档收紧",
+                }
+            ],
+        },
+    )
 
     overview = multi_account_orchestrator.build_fleet_overview_text(master)
     policy_text = multi_account_orchestrator.build_fleet_policy_text(master)
+    account_text = multi_account_orchestrator.build_fleet_account_text(master, "xu")
 
     assert "master (9601)" in overview
     assert "xu (9602)" in overview
     assert "策略" in overview
+    assert "学习 gray c1" in overview
     assert "灰度" in policy_text
+    assert "学习 gray c1" in policy_text
+    assert "学习：gray c1" in account_text
 
     result = multi_account_orchestrator.switch_account_policy_mode(master, "xu", "baseline")
     assert result["ok"] is True

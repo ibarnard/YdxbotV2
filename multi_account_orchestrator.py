@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 import policy_engine
 import risk_control
+import self_learning_engine
 from user_manager import get_registered_user_contexts
 
 
@@ -49,6 +50,30 @@ def _task_brief(rt: Dict[str, Any]) -> str:
     return "无"
 
 
+def _learning_brief(user_ctx) -> str:
+    center = self_learning_engine.load_learning_center(user_ctx)
+    active_gray = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("active_gray_candidate_id", "") or ""),
+    )
+    if active_gray:
+        return f"gray {active_gray.get('candidate_version', '-')}"
+    active_shadow = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("active_shadow_candidate_id", "") or ""),
+    )
+    if active_shadow:
+        return f"shadow {active_shadow.get('candidate_version', '-')}"
+    promoted = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("promoted_candidate_id", "") or ""),
+    )
+    if promoted:
+        return f"promoted {promoted.get('candidate_version', '-')}"
+    count = len(self_learning_engine._sorted_candidates(center))  # type: ignore[attr-defined]
+    return f"{count} 候选" if count else "无"
+
+
 def _match_user(current_user_ctx, ident: str) -> Optional[Any]:
     users = _all_users(current_user_ctx)
     target = str(ident or "").strip().lower()
@@ -88,7 +113,7 @@ def build_fleet_overview_text(current_user_ctx) -> str:
         lines.append(
             f"- {_account_name(user_ctx)} ({user_ctx.user_id}) | {_status_text(rt)} | "
             f"预设 {str(rt.get('current_preset_name', '') or '未设')} | "
-            f"任务 {_task_brief(rt)} | 策略 {_policy_brief(user_ctx)} | "
+            f"任务 {_task_brief(rt)} | 策略 {_policy_brief(user_ctx)} | 学习 {_learning_brief(user_ctx)} | "
             f"胜率 {win_rate:.1f}% | 盈利 {int(rt.get('earnings', 0) or 0):+,} | "
             f"fk {fk_bits}"
         )
@@ -130,6 +155,7 @@ def build_fleet_policy_text(current_user_ctx) -> str:
             f"- {_account_name(user_ctx)} ({user_ctx.user_id}) | "
             f"{active.get('policy_version', 'v1')} | {mode_text} | "
             f"上个版本 {store.get('previous_version', '') or '-'} | "
+            f"学习 {_learning_brief(user_ctx)} | "
             f"{str(active.get('summary', '') or '')}"
         )
     return "\n".join(lines)
@@ -149,6 +175,7 @@ def build_fleet_account_text(current_user_ctx, ident: str) -> str:
         f"任务包：{str(rt.get('package_current_name', '') or '无')}\n"
         f"任务：{str(rt.get('task_current_name', '') or '无')}\n"
         f"策略：{_policy_brief(target)}\n"
+        f"学习：{_learning_brief(target)}\n"
         f"模型：{str(rt.get('current_model_id', 'unknown') or 'unknown')}\n"
         f"资金：{int(rt.get('gambling_fund', 0) or 0):+,}\n"
         f"余额：{int(rt.get('account_balance', 0) or 0):+,}\n"
