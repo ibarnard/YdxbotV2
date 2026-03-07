@@ -2,13 +2,11 @@
 
 ## 1. 文件定位
 这份 `todo.md` 只负责一件事：
-
 - 记录当前分支已经完成了哪些阶段
 - 说明当前阶段推进到了哪里
 - 指向对应的技术说明书
 
 它不是长期路线图。长期规划看：
-
 - [docs/refactor-roadmap.md](./docs/refactor-roadmap.md)
 
 ---
@@ -21,14 +19,13 @@
 ---
 
 ## 3. 已完成阶段
-
 ### [x] A. 风控-历史资产-动态押注 V1
 - 说明书：[docs/risk-history-dynamic-v1-tech-spec.md](./docs/risk-history-dynamic-v1-tech-spec.md)
 - 交付：`fk1 / fk2 / fk3`、每账号 `analytics.db`、`fp 1~6`、动态档位决策器、动态押注接入主流程
 
 ### [x] B. 任务系统 V1
 - 说明书：[docs/task-system-v1-tech-spec.md](./docs/task-system-v1-tech-spec.md)
-- 交付：`tasks.json`、任务状态机、任务接管下注主流程、任务日志/统计、`task` 命令族
+- 交付：`tasks.json`、任务状态机、任务接管下注主流程、任务日志/统计、`task` 命令面
 
 ### [x] C. 任务模板与快速创建 V1
 - 说明书：[docs/task-template-v1-tech-spec.md](./docs/task-template-v1-tech-spec.md)
@@ -36,7 +33,7 @@
 
 ### [x] D. 任务包 V1
 - 说明书：[docs/task-package-v1-tech-spec.md](./docs/task-package-v1-tech-spec.md)
-- 交付：`task_packages.json`、任务包状态机、`pkg` 命令、包级运行/日志/统计、主流程接入
+- 交付：`task_packages.json`、任务包状态机、`pkg` 命令、包级运行日志/统计、主流程接入
 
 ### [x] E. 模板参数可覆盖 V1
 - 说明书：[docs/task-template-overrides-v1-tech-spec.md](./docs/task-template-overrides-v1-tech-spec.md)
@@ -64,7 +61,7 @@
 - 说明书：[docs/tg-watch-v1-tech-spec.md](./docs/tg-watch-v1-tech-spec.md)
 - 当前实现：I1/I2/I3/I4/I5 全部完成
 - 交付：
-  - I1 指定值守目标：`notification.watch`、旧字段归一化、专用 `send_to_watch`
+  - I1 指定值守目标：`notification.watch`、旧字段归一、专用 `send_to_watch`
   - I2 值守摘要命令：`watch / watch fleet / watch learn`
   - I3 主动播报：任务切换、任务接管、资金暂停/恢复、模型超时、学习阶段变更
   - I4 告警摘要：`watch alerts`、当前风险 + 最近播报
@@ -90,14 +87,27 @@
   - K4 低噪声控制：`watch quiet [分钟|off]`
   - K5 文档、测试、回归
 
+### [x] L. 复盘摘要与人工决策支撑 V1
+- 说明书：[docs/review-action-v1-tech-spec.md](./docs/review-action-v1-tech-spec.md)
+- 当前实现：L1/L2/L3/L4/L5 全部完成
+- 交付：
+  - L1 压缩复盘摘要：`fp brief`
+  - L2 链路缺口摘要：`fp gaps`
+  - L3 人工动作建议：`fp action`
+  - L4 管理入口短文本输出：适合管理员聊天入口和手机查看
+  - L5 文档、测试、回归
+
 ---
 
 ## 4. 当前状态
-当前既定阶段 A 到 K 均已完成。
+当前既定阶段 A 到 L 均已完成。
 
-下一步不是继续补旧计划，而是等待新的阶段目标。
+这套基线已经可以视为初步的 `v0.1.1`：
+- 单账号/多账号执行与观察闭环已成型
+- 策略版本、自学习、灰度/转正/回滚链路已成型
+- TG 值守与手动复盘摘要入口已成型
 
-如需继续推进，先在 [docs/refactor-roadmap.md](./docs/refactor-roadmap.md) 里补一个新的阶段定义，再进入实现。
+后续如果继续推进，先在 [docs/refactor-roadmap.md](./docs/refactor-roadmap.md) 里定义新的阶段目标，再进入实现。
 
 ---
 
@@ -117,6 +127,7 @@ python -m pytest `
   tests_multiuser\test_tg_watch_v1.py `
   tests_multiuser\test_tg_watch_query_v1.py `
   tests_multiuser\test_runtime_stability_v1.py `
+  tests_multiuser\test_review_action_v1.py `
   -q
 ```
 
@@ -126,7 +137,6 @@ python -m pytest `
 
 ## 6. 更新规则
 后续每次推进，按这个顺序更新：
-
 1. 先改代码
 2. 再补测试
 3. 再补文档

@@ -1,4 +1,4 @@
-﻿# 文档索引
+# 文档索引
 
 ## 当前阶段
 - [风控-历史资产-动态押注 V1 技术说明书](./risk-history-dynamic-v1-tech-spec.md)
@@ -12,6 +12,7 @@
 - [Telegram 值守播报 V1 技术说明书](./tg-watch-v1-tech-spec.md)
 - [执行稳定性与启动自检 V1 技术说明书](./runtime-stability-v1-tech-spec.md)
 - [Telegram 值守查询补强 V1 技术说明书](./tg-watch-query-v1-tech-spec.md)
+- [复盘摘要与人工决策支撑 V1 技术说明书](./review-action-v1-tech-spec.md)
 - [重构路线图](./refactor-roadmap.md)
 
 ## 使用建议

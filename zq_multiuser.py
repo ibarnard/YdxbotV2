@@ -5170,6 +5170,9 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `fk 2 on|off` : 切换入场风控（并写入当前账号默认）
 - `fk 3 on|off` : 切换连输风控（并写入当前账号默认）
 - `fp` : 查看 24 小时复盘总览
+- `fp brief` : 查看压缩复盘摘要
+- `fp gaps` : 查看链路缺口摘要
+- `fp action` : 查看人工动作建议
 - `fp 1` : 查看按盘面复盘
 - `fp 2` : 查看按档位复盘
 - `fp 3` : 查看按手位复盘
@@ -5446,6 +5449,15 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
             if len(my) == 1:
                 await send_to_admin(client, history_analysis.build_fp_overview(user_ctx), user_ctx, global_config)
                 return
+            if len(my) == 2 and str(my[1]).strip().lower() in {"brief", "summary"}:
+                await send_to_admin(client, history_analysis.build_fp_brief(user_ctx), user_ctx, global_config)
+                return
+            if len(my) == 2 and str(my[1]).strip().lower() == "gaps":
+                await send_to_admin(client, history_analysis.build_fp_gap_brief(user_ctx), user_ctx, global_config)
+                return
+            if len(my) == 2 and str(my[1]).strip().lower() == "action":
+                await send_to_admin(client, history_analysis.build_fp_action_report(user_ctx), user_ctx, global_config)
+                return
             if len(my) == 2 and str(my[1]).strip() == "1":
                 await send_to_admin(client, history_analysis.build_fp_regime_report(user_ctx), user_ctx, global_config)
                 return
@@ -5466,7 +5478,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 return
             await send_to_admin(
                 client,
-                "❌ 参数格式错误\n用法：`fp` / `fp 1` / `fp 2` / `fp 3` / `fp 4` / `fp 5` / `fp 6`",
+                "❌ 参数格式错误\n用法：`fp` / `fp brief` / `fp gaps` / `fp action` / `fp 1` / `fp 2` / `fp 3` / `fp 4` / `fp 5` / `fp 6`",
                 user_ctx,
                 global_config,
             )

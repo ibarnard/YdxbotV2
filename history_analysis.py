@@ -1337,6 +1337,298 @@ def build_fp_linkage_report(user_ctx) -> str:
     return "\n".join(lines)
 
 
+def _linkage_gap_stats(analytics: Dict[str, Any]) -> Dict[str, Any]:
+    rounds_by_key = analytics.get("rounds_by_key", {})
+    decisions_by_key = analytics.get("decisions_by_key", {})
+    executions_by_key = analytics.get("executions_by_key", {})
+    settlements_by_key = analytics.get("settlements_by_key", {})
+    risks_by_round = analytics.get("risks_by_round", {})
+    regimes_by_key = analytics.get("regimes_by_key", {})
+
+    round_keys = set(rounds_by_key.keys())
+    decision_keys = set(decisions_by_key.keys())
+    execution_keys = set(executions_by_key.keys())
+    settlement_keys = set(settlements_by_key.keys())
+    regime_keys = set(regimes_by_key.keys())
+
+    bet_execution_keys = {
+        key
+        for key, row in executions_by_key.items()
+        if str(row.get("action_type", "") or "") == "bet"
+    }
+    observe_execution_keys = {
+        key
+        for key, row in executions_by_key.items()
+        if str(row.get("action_type", "") or "") == "observe"
+    }
+    blocked_execution_keys = {
+        key
+        for key, row in executions_by_key.items()
+        if str(row.get("action_type", "") or "") == "blocked"
+    }
+    risk_round_keys = {
+        key
+        for key, rows in risks_by_round.items()
+        if rows
+    }
+    strategy_risk_keys = {
+        key
+        for key, rows in risks_by_round.items()
+        if any(str(row.get("layer_code", "") or "") == "strategy" for row in rows)
+    }
+
+    missing_decision = sorted(round_keys - decision_keys)
+    missing_execution = sorted(decision_keys - execution_keys)
+    missing_settlement = sorted(bet_execution_keys - settlement_keys)
+    settlement_without_bet = sorted(settlement_keys - bet_execution_keys)
+    blocked_without_risk = sorted(blocked_execution_keys - risk_round_keys)
+    observe_without_strategy = sorted(observe_execution_keys - strategy_risk_keys)
+
+    return {
+        "round_total": len(round_keys),
+        "regime_total": len(regime_keys),
+        "decision_total": len(decision_keys),
+        "execution_total": len(execution_keys),
+        "bet_total": len(bet_execution_keys),
+        "settlement_total": len(settlement_keys),
+        "missing_decision": missing_decision,
+        "missing_execution": missing_execution,
+        "missing_settlement": missing_settlement,
+        "settlement_without_bet": settlement_without_bet,
+        "blocked_without_risk": blocked_without_risk,
+        "observe_without_strategy": observe_without_strategy,
+    }
+
+
+def _tier_group_review(analytics: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    bet_rows = [row for row in analytics.get("executions", []) if str(row.get("action_type", "") or "") == "bet"]
+    settlements_by_key = analytics.get("settlements_by_key", {})
+    stats: Dict[str, Dict[str, Any]] = {
+        "low": {"count": 0, "settled_count": 0, "wins": 0, "pnl_total": 0},
+        "mid": {"count": 0, "settled_count": 0, "wins": 0, "pnl_total": 0},
+        "high": {"count": 0, "settled_count": 0, "wins": 0, "pnl_total": 0},
+    }
+    for execution in bet_rows:
+        preset_name = str(execution.get("preset_name", "") or "").strip().lower()
+        if not preset_name:
+            preset_name = _infer_preset_name({}, _safe_int_value(execution.get("bet_amount", 0), 0))
+        group = _tier_group(preset_name)
+        stats[group]["count"] += 1
+        settlement = settlements_by_key.get(str(execution.get("round_key", "") or ""))
+        if not settlement:
+            continue
+        stats[group]["settled_count"] += 1
+        stats[group]["wins"] += int(settlement.get("is_win", 0) or 0)
+        stats[group]["pnl_total"] += int(settlement.get("profit", 0) or 0)
+
+    for item in stats.values():
+        settled_count = int(item.get("settled_count", 0) or 0)
+        item["win_rate"] = round((int(item.get("wins", 0) or 0) / settled_count), 4) if settled_count else 0.0
+        item["avg_pnl"] = round((int(item.get("pnl_total", 0) or 0) / settled_count), 2) if settled_count else 0.0
+    return stats
+
+
+def _review_learning_status(user_ctx) -> Dict[str, Any]:
+    import self_learning_engine
+
+    center = self_learning_engine.load_learning_center(user_ctx)
+    active_gray = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("active_gray_candidate_id", "") or ""),
+    )
+    active_shadow = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("active_shadow_candidate_id", "") or ""),
+    )
+    promoted = self_learning_engine._find_candidate_strict(  # type: ignore[attr-defined]
+        center,
+        str(center.get("promoted_candidate_id", "") or ""),
+    )
+    return {
+        "center": center,
+        "active_gray": active_gray,
+        "active_shadow": active_shadow,
+        "promoted": promoted,
+    }
+
+
+def build_fp_brief(user_ctx) -> str:
+    import policy_engine
+
+    snapshot = build_current_analysis_snapshot(user_ctx)
+    evidence = build_policy_evidence_package(user_ctx, analysis_snapshot=snapshot)
+    overview = evidence.get("overview_24h", {}) if isinstance(evidence.get("overview_24h", {}), dict) else {}
+    similar = snapshot.get("similar_cases", {}) if isinstance(snapshot.get("similar_cases", {}), dict) else {}
+    analytics = _recent_analytics_context(user_ctx, hours=24)
+    gaps = _linkage_gap_stats(analytics)
+    policy_ctx = policy_engine.build_policy_prompt_context(user_ctx, analysis_snapshot=snapshot)
+    learning_status = _review_learning_status(user_ctx)
+    temperature_text = {
+        "normal": "正常",
+        "cold": "偏冷",
+        "very_cold": "很冷",
+    }.get(str(snapshot.get("recent_temperature", {}).get("level", "normal") or "normal"), "正常")
+    evidence_strength = {
+        "strong": "强证据",
+        "weak": "弱证据",
+        "insufficient": "样本不足",
+    }.get(str(similar.get("evidence_strength", "insufficient") or "insufficient"), "样本不足")
+    learning_text = "无"
+    if learning_status.get("active_gray"):
+        learning_text = f"gray {learning_status['active_gray'].get('candidate_version', '-')}"
+    elif learning_status.get("active_shadow"):
+        learning_text = f"shadow {learning_status['active_shadow'].get('candidate_version', '-')}"
+    elif learning_status.get("promoted"):
+        learning_text = f"promoted {learning_status['promoted'].get('candidate_version', '-')}"
+    lines = [
+        "🧾 复盘摘要（24h）",
+        "",
+        f"当前盘面：{snapshot.get('regime_label', REGIME_RANGE)} | 温度 {temperature_text}",
+        f"当前策略：{policy_ctx.get('policy_version', '-') or '-'} ({policy_ctx.get('policy_mode', '-') or '-'}) | 学习 {learning_text}",
+        (
+            f"24h：样本 {int(overview.get('settled_count', 0) or 0)} | "
+            f"胜率 {_format_pct(float(overview.get('win_rate', 0.0) or 0.0))} | "
+            f"盈亏 {_format_signed_int(int(overview.get('pnl_total', 0) or 0))} | "
+            f"回撤 {int(overview.get('max_drawdown', 0) or 0):,}"
+        ),
+        (
+            f"风控：观望 {int(overview.get('observe_count', 0) or 0)} | "
+            f"阻断 {int(overview.get('blocked_count', 0) or 0)} | "
+            f"相似 {int(similar.get('similar_count', 0) or 0)} | "
+            f"证据 {evidence_strength}"
+        ),
+        (
+            f"链路：决策 {gaps['decision_total']}/{gaps['round_total']} | "
+            f"执行 {gaps['execution_total']}/{gaps['decision_total'] or 0} | "
+            f"结算 {gaps['settlement_total']}/{gaps['bet_total'] or 0}"
+        ),
+        f"当前建议：{str(user_ctx.state.runtime.get('current_fk1_action_text', '') or '未评估')}",
+        "",
+        "深入：`fp gaps` / `fp action` / `fp 5` / `fp 6`",
+    ]
+    return "\n".join(lines)
+
+
+def build_fp_gap_brief(user_ctx) -> str:
+    analytics = _recent_analytics_context(user_ctx, hours=24)
+    gaps = _linkage_gap_stats(analytics)
+    if (
+        gaps["round_total"] <= 0
+        and gaps["decision_total"] <= 0
+        and gaps["execution_total"] <= 0
+        and gaps["settlement_total"] <= 0
+    ):
+        return "🧩 复盘缺口\n\n暂无 24 小时结构化链路数据"
+
+    items = [
+        ("有盘面无决策", gaps["missing_decision"]),
+        ("有决策无执行", gaps["missing_execution"]),
+        ("有下注无结算", gaps["missing_settlement"]),
+        ("有结算无下注", gaps["settlement_without_bet"]),
+        ("有阻断无风控记录", gaps["blocked_without_risk"]),
+        ("有观望无策略记录", gaps["observe_without_strategy"]),
+    ]
+    lines = [
+        "🧩 复盘缺口",
+        "",
+        (
+            f"覆盖：盘面 {gaps['regime_total']}/{gaps['round_total']} | "
+            f"决策 {gaps['decision_total']}/{gaps['round_total']} | "
+            f"执行 {gaps['execution_total']}/{gaps['decision_total'] or 0} | "
+            f"结算 {gaps['settlement_total']}/{gaps['bet_total'] or 0}"
+        ),
+    ]
+
+    non_zero = [(title, values) for title, values in items if values]
+    if not non_zero:
+        lines.extend(["", "- 当前没有明显链路缺口"])
+        return "\n".join(lines)
+
+    lines.append("")
+    for title, values in sorted(non_zero, key=lambda item: len(item[1]), reverse=True)[:5]:
+        lines.append(f"- {title}：{len(values)} | 样例 {_sample_round_keys(values)}")
+    return "\n".join(lines)
+
+
+def build_fp_action_report(user_ctx) -> str:
+    import policy_engine
+
+    snapshot = build_current_analysis_snapshot(user_ctx)
+    evidence = build_policy_evidence_package(user_ctx, analysis_snapshot=snapshot)
+    overview = evidence.get("overview_24h", {}) if isinstance(evidence.get("overview_24h", {}), dict) else {}
+    analytics = _recent_analytics_context(user_ctx, hours=24)
+    gaps = _linkage_gap_stats(analytics)
+    tier_groups = _tier_group_review(analytics)
+    learning_status = _review_learning_status(user_ctx)
+    policy_ctx = policy_engine.build_policy_prompt_context(user_ctx, analysis_snapshot=snapshot)
+    similar = snapshot.get("similar_cases", {}) if isinstance(snapshot.get("similar_cases", {}), dict) else {}
+    temperature_level = str(snapshot.get("recent_temperature", {}).get("level", "normal") or "normal")
+
+    suggestions: List[str] = []
+    if gaps["missing_decision"] or gaps["missing_execution"] or gaps["missing_settlement"]:
+        suggestions.append(
+            "先修链路再动策略：当前存在决策/执行/结算缺口，优先看 `fp gaps` 和 `fp 6`，不要直接根据这批样本做策略或学习结论。"
+        )
+
+    settled_count = int(overview.get("settled_count", 0) or 0)
+    if settled_count < 12:
+        suggestions.append(
+            f"样本仍偏少：24h 已结算仅 {settled_count} 笔，暂不建议直接 `policy sync`、`learn promote` 或做大幅手动调参。"
+        )
+
+    high_stats = tier_groups.get("high", {})
+    if int(high_stats.get("settled_count", 0) or 0) >= 4 and (
+        float(high_stats.get("win_rate", 0.0) or 0.0) <= 0.45
+        or float(high_stats.get("avg_pnl", 0.0) or 0.0) < 0
+    ):
+        suggestions.append(
+            "高档位承压：最近高档实盘表现偏弱，建议先复查 `fp 2`，确认是否继续使用 yc50+，必要时回到中低档任务。"
+        )
+
+    recommended_cap = str(similar.get("recommended_tier_cap", "") or "")
+    if recommended_cap in {"low", "mid", "observe"} and (
+        int(overview.get("pnl_total", 0) or 0) < 0 or temperature_level in {"cold", "very_cold"}
+    ):
+        human_cap = {"low": "低档", "mid": "中档", "observe": "观望"}.get(recommended_cap, recommended_cap)
+        suggestions.append(
+            f"当前盘面历史建议偏保守：相似样本更偏向 {human_cap}，建议优先按 `fp 5` 核对证据，再决定是否继续放大下注档位。"
+        )
+
+    active_gray = learning_status.get("active_gray")
+    if active_gray and (
+        int(overview.get("pnl_total", 0) or 0) < 0 or temperature_level in {"cold", "very_cold"}
+    ):
+        suggestions.append(
+            f"灰度候选在承压：当前仍有灰度 {active_gray.get('candidate_version', '-') or '-'}，建议结合 `watch learn` 和 `learn rollback` 做人工复核。"
+        )
+
+    observe_count = int(overview.get("observe_count", 0) or 0)
+    blocked_count = int(overview.get("blocked_count", 0) or 0)
+    if observe_count >= 6 and observe_count > blocked_count * 2:
+        suggestions.append(
+            "观望占比偏高：近期更多是策略主动观望而不是风控阻断，建议对照 `replay` / `explain` 看是否需要手动复查 prompt 或策略摘要。"
+        )
+
+    if not suggestions:
+        suggestions.append("当前没有明显需要立刻调整的项，建议保持当前策略和任务，继续积累样本后再看 `fp brief` / `fp action`。")
+
+    lines = [
+        "🧭 人工动作建议",
+        "",
+        f"当前策略：{policy_ctx.get('policy_version', '-') or '-'} ({policy_ctx.get('policy_mode', '-') or '-'})",
+        (
+            f"24h：样本 {settled_count} | "
+            f"盈亏 {_format_signed_int(int(overview.get('pnl_total', 0) or 0))} | "
+            f"回撤 {int(overview.get('max_drawdown', 0) or 0):,} | "
+            f"温度 { {'normal': '正常', 'cold': '偏冷', 'very_cold': '很冷'}.get(temperature_level, '正常') }"
+        ),
+        "",
+    ]
+    for idx, item in enumerate(suggestions[:5], 1):
+        lines.append(f"{idx}. {item}")
+    return "\n".join(lines)
+
+
 def _analytics_db_path(user_ctx) -> str:
     return os.path.join(user_ctx.user_dir, "analytics.db")
 
