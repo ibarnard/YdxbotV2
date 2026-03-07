@@ -487,3 +487,118 @@ def test_process_user_command_learn_shadow(tmp_path, monkeypatch):
     assert any("已开启影子验证" in text for text in sent_messages)
     assert any("学习候选影子验证" in text for text in sent_messages)
     assert any("已关闭影子验证" in text for text in sent_messages)
+
+
+def _prepare_candidate_for_h5(ctx, monkeypatch):
+    _seed_learning_eval_analytics(ctx)
+    monkeypatch.setattr(
+        self_learning_engine.policy_engine,
+        "build_policy_prompt_context",
+        lambda user_ctx, analysis_snapshot=None: _sample_policy_context(),
+    )
+    generated = self_learning_engine.generate_candidates_from_evidence(ctx)
+    assert generated["created_count"] >= 1
+
+    center = self_learning_engine.load_learning_center(ctx)
+    center["candidates"][0]["status"] = self_learning_engine.LEARNING_STATUS_EVALUATED
+    center["candidates"][0]["last_evaluation_status"] = self_learning_engine.LEARNING_EVAL_WATCH
+    center["candidates"][0]["last_score_total"] = 56.0
+    self_learning_engine._write_learning_center(ctx, center)
+
+    activated = self_learning_engine.activate_candidate_shadow(ctx, "c1")
+    assert activated["ok"] is True
+    recorded = self_learning_engine.record_active_shadow_round(ctx, "rk_eval_1", 1, "大")
+    assert recorded["recorded"] is True
+    deactivated = self_learning_engine.deactivate_candidate_shadow(ctx)
+    assert deactivated["ok"] is True
+
+
+def test_learning_gray_promote_and_rollback(tmp_path, monkeypatch):
+    ctx = _make_user_context(tmp_path, user_id=9808)
+    _prepare_candidate_for_h5(ctx, monkeypatch)
+
+    gray = self_learning_engine.gray_candidate(ctx, "c1")
+    assert gray["ok"] is True
+    assert ctx.state.runtime["policy_active_mode"] == "gray"
+    gray_version = ctx.state.runtime["policy_active_version"]
+    assert gray_version != "v1"
+
+    center_after_gray = self_learning_engine.load_learning_center(ctx)
+    candidate_after_gray = center_after_gray["candidates"][0]
+    assert center_after_gray["active_gray_candidate_id"] == candidate_after_gray["candidate_id"]
+    assert candidate_after_gray["status"] == self_learning_engine.LEARNING_STATUS_GRAY
+    assert candidate_after_gray["gray_policy_version"] == gray_version
+
+    promote = self_learning_engine.promote_candidate(ctx, "c1")
+    assert promote["ok"] is True
+    promoted_version = ctx.state.runtime["policy_active_version"]
+    assert ctx.state.runtime["policy_active_mode"] == "baseline"
+    assert promoted_version != gray_version
+
+    center_after_promote = self_learning_engine.load_learning_center(ctx)
+    candidate_after_promote = center_after_promote["candidates"][0]
+    assert center_after_promote["active_gray_candidate_id"] == ""
+    assert center_after_promote["promoted_candidate_id"] == candidate_after_promote["candidate_id"]
+    assert candidate_after_promote["status"] == self_learning_engine.LEARNING_STATUS_PROMOTED
+    assert candidate_after_promote["promoted_policy_version"] == promoted_version
+
+    rollback = self_learning_engine.rollback_candidate(ctx)
+    assert rollback["ok"] is True
+    assert ctx.state.runtime["policy_active_version"] == "v1"
+
+    center_after_rollback = self_learning_engine.load_learning_center(ctx)
+    candidate_after_rollback = center_after_rollback["candidates"][0]
+    assert center_after_rollback["promoted_candidate_id"] == ""
+    assert candidate_after_rollback["status"] == self_learning_engine.LEARNING_STATUS_ROLLED_BACK
+    assert candidate_after_rollback["rolled_back_to_version"] == "v1"
+
+    db_path = Path(ctx.user_dir) / "analytics.db"
+    assert _table_count(db_path, "learning_promotions") >= 3
+    row = _table_row(
+        db_path,
+        "SELECT event_type, target_policy_version FROM learning_promotions ORDER BY created_at DESC LIMIT 1",
+    )
+    assert row["event_type"] == "rollback"
+    assert row["target_policy_version"] == "v1"
+
+
+def test_process_user_command_learn_gray_promote_and_rollback(tmp_path, monkeypatch):
+    ctx = _make_user_context(tmp_path, user_id=9809)
+    _prepare_candidate_for_h5(ctx, monkeypatch)
+
+    sent_messages = []
+
+    async def fake_send_to_admin(client, message, user_ctx, global_config):
+        sent_messages.append(message)
+        return None
+
+    monkeypatch.setattr(zm, "send_to_admin", fake_send_to_admin)
+
+    asyncio.run(
+        zm.process_user_command(
+            None,
+            type("E", (), {"raw_text": "learn gray c1", "chat_id": 1, "id": 1})(),
+            ctx,
+            {},
+        )
+    )
+    asyncio.run(
+        zm.process_user_command(
+            None,
+            type("E", (), {"raw_text": "learn promote c1", "chat_id": 1, "id": 2})(),
+            ctx,
+            {},
+        )
+    )
+    asyncio.run(
+        zm.process_user_command(
+            None,
+            type("E", (), {"raw_text": "learn rollback", "chat_id": 1, "id": 3})(),
+            ctx,
+            {},
+        )
+    )
+
+    assert any("已启动学习候选灰度" in text for text in sent_messages)
+    assert any("已转正学习候选" in text for text in sent_messages)
+    assert any("已回滚学习候选" in text for text in sent_messages)

@@ -144,8 +144,8 @@
 ## 8. 当前之后的顺序
 当前默认顺序：
 
-### [ ] H. 受控自学习 V1
-状态：进行中（H1/H2/H3/H4 已完成，H5 待实现）
+### [x] H. 受控自学习 V1
+状态：已完成（H1/H2/H3/H4/H5 已完成）
 
 对应文档：
 - [docs/controlled-self-learning-v1-tech-spec.md](D:/OneDrive/06Code/YdxbotV2/docs/controlled-self-learning-v1-tech-spec.md)
@@ -165,9 +165,9 @@
   - 在线候选影子对比
   - `learn shadow`
   - `learn shadow <id|cX> on|off`
-- [ ] H5 灰度与转正
-  - `learn gray`
-  - `learn promote`
+- [x] H5 灰度与转正
+  - `learn gray <id|cX> [当前账号名|ID]`
+  - `learn promote <id|cX>`
   - `learn rollback`
 
 设计结论：
@@ -180,7 +180,7 @@
 ## 9. 当前之后的顺序
 当前默认顺序：
 
-1. H5 灰度与转正
+1. `H` 阶段已完成，等待下一阶段新需求或新路线图项
 
 详细拆解、时间预估、风险、确认点，请看：
 - [docs/refactor-roadmap.md](D:/OneDrive/06Code/YdxbotV2/docs/refactor-roadmap.md)

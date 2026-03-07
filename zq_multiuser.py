@@ -4916,7 +4916,7 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `learn gen` / `learn list` / `learn show <id|cX>` : 生成、查看学习候选
 - `learn eval [id|cX]` : 对候选执行离线评估
 - `learn shadow` / `learn shadow <id|cX> on` / `learn shadow off` : 管理学习候选影子验证
-- `learn gray` / `learn promote` / `learn rollback` : 受控自学习后续阶段入口
+- `learn gray <id|cX> [当前账号名|ID]` / `learn promote <id|cX>` / `learn rollback` : 学习候选灰度、转正、回滚
 - `fleet` / `users` : 查看多账号总览
 - `fleet task` : 查看多账号任务/任务包视图
 - `fleet policy` : 查看多账号策略灰度视图
@@ -5442,8 +5442,23 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     return
                 await send_to_admin(client, self_learning_engine.build_learning_shadow_text(user_ctx, ident), user_ctx, global_config)
                 return
-            if subcmd in {"gray", "promote", "rollback"}:
-                await send_to_admin(client, self_learning_engine.build_learning_pending_text(subcmd), user_ctx, global_config)
+            if subcmd == "gray":
+                ident = my[2] if len(my) >= 3 else ""
+                target = my[3] if len(my) >= 4 else ""
+                result = self_learning_engine.gray_candidate(user_ctx, ident, target)
+                user_ctx.save_state()
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "promote":
+                ident = my[2] if len(my) >= 3 else ""
+                result = self_learning_engine.promote_candidate(user_ctx, ident)
+                user_ctx.save_state()
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
+                return
+            if subcmd == "rollback":
+                result = self_learning_engine.rollback_candidate(user_ctx)
+                user_ctx.save_state()
+                await send_to_admin(client, str(result.get("message", "")), user_ctx, global_config)
                 return
 
             await send_to_admin(
@@ -5459,8 +5474,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                     "`learn shadow`\n"
                     "`learn shadow <id|cX> on`\n"
                     "`learn shadow off`\n"
-                    "`learn gray`\n"
-                    "`learn promote`\n"
+                    "`learn gray <id|cX> [当前账号名|ID]`\n"
+                    "`learn promote <id|cX>`\n"
                     "`learn rollback`"
                 ),
                 user_ctx,

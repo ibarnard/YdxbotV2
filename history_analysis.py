@@ -1905,6 +1905,32 @@ def record_learning_shadow(user_ctx, shadow: Dict[str, Any]) -> None:
     )
 
 
+def record_learning_promotion(user_ctx, promotion: Dict[str, Any]) -> None:
+    _write_analytics(
+        user_ctx,
+        [
+            (
+                """
+                INSERT OR REPLACE INTO learning_promotions (
+                    promotion_id, candidate_id, candidate_version, event_type, target_policy_version,
+                    reason, payload_json, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    str(promotion.get("promotion_id", "") or ""),
+                    str(promotion.get("candidate_id", "") or ""),
+                    str(promotion.get("candidate_version", "") or ""),
+                    str(promotion.get("event_type", "") or ""),
+                    str(promotion.get("target_policy_version", "") or ""),
+                    str(promotion.get("reason", "") or ""),
+                    _json_text(promotion.get("payload", {})),
+                    str(promotion.get("created_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")) or ""),
+                ),
+            ),
+        ],
+    )
+
+
 def record_risk_action(
     user_ctx,
     *,

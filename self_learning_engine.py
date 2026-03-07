@@ -10,6 +10,7 @@ from typing import Any, Dict, List, Optional
 import history_analysis
 import policy_engine
 import risk_control
+from user_manager import get_registered_user_contexts
 
 
 LEARNING_CENTER_VERSION = 1
@@ -48,6 +49,7 @@ def _default_learning_center(user_ctx) -> Dict[str, Any]:
         "last_generated_at": "",
         "last_generated_candidate_id": "",
         "last_shadow_recorded_at": "",
+        "last_promotion_event_at": "",
         "active_shadow_candidate_id": "",
         "active_gray_candidate_id": "",
         "promoted_candidate_id": "",
@@ -81,6 +83,7 @@ def _update_runtime_learning_snapshot(user_ctx, center: Dict[str, Any]) -> None:
     rt["learning_last_generated_at"] = str(center.get("last_generated_at", "") or "")
     rt["learning_last_candidate_id"] = str(center.get("last_generated_candidate_id", "") or "")
     rt["learning_last_shadow_at"] = str(center.get("last_shadow_recorded_at", "") or "")
+    rt["learning_last_promotion_at"] = str(center.get("last_promotion_event_at", "") or "")
     rt["learning_shadow_candidate_id"] = str(center.get("active_shadow_candidate_id", "") or "")
     rt["learning_gray_candidate_id"] = str(center.get("active_gray_candidate_id", "") or "")
     rt["learning_last_summary"] = str(latest.get("summary", "") or "")
@@ -111,6 +114,7 @@ def load_learning_center(user_ctx) -> Dict[str, Any]:
         "last_generated_at": str(payload.get("last_generated_at", "") or ""),
         "last_generated_candidate_id": str(payload.get("last_generated_candidate_id", "") or ""),
         "last_shadow_recorded_at": str(payload.get("last_shadow_recorded_at", "") or ""),
+        "last_promotion_event_at": str(payload.get("last_promotion_event_at", "") or ""),
         "active_shadow_candidate_id": str(payload.get("active_shadow_candidate_id", "") or ""),
         "active_gray_candidate_id": str(payload.get("active_gray_candidate_id", "") or ""),
         "promoted_candidate_id": str(payload.get("promoted_candidate_id", "") or ""),
@@ -133,6 +137,13 @@ def _find_candidate(center: Dict[str, Any], ident: str = "") -> Optional[Dict[st
         if str(item.get("candidate_version", "") or "").strip().lower() == target:
             return item
     return None
+
+
+def _find_candidate_strict(center: Dict[str, Any], ident: str = "") -> Optional[Dict[str, Any]]:
+    target = str(ident or "").strip()
+    if not target:
+        return None
+    return _find_candidate(center, target)
 
 
 def _find_candidate_index(center: Dict[str, Any], ident: str = "") -> int:
@@ -467,8 +478,8 @@ def _build_generation_message(candidates: List[Dict[str, Any]]) -> str:
     lines.extend(
         [
             "",
-            "说明：当前已完成 H1/H2/H3/H4（候选中心 / 规则生成 / 离线评估 / 影子验证）。",
-            "后续阶段：`learn gray` / `learn promote` / `learn rollback`",
+            "说明：当前已完成 H1/H2/H3/H4/H5（候选中心 / 规则生成 / 离线评估 / 影子验证 / 灰度转正回滚）。",
+            "命令：`learn eval` / `learn shadow` / `learn gray` / `learn promote` / `learn rollback`",
         ]
     )
     return "\n".join(lines)
@@ -1208,7 +1219,7 @@ def record_active_shadow_round(
     result_type: Any = "",
 ) -> Dict[str, Any]:
     center = load_learning_center(user_ctx)
-    candidate = _find_candidate(center, str(center.get("active_shadow_candidate_id", "") or ""))
+    candidate = _find_candidate_strict(center, str(center.get("active_shadow_candidate_id", "") or ""))
     if not candidate:
         if str(center.get("active_shadow_candidate_id", "") or ""):
             center["active_shadow_candidate_id"] = ""
@@ -1341,6 +1352,404 @@ def record_active_shadow_round(
     }
 
 
+def _dedupe_lines(lines: List[str]) -> List[str]:
+    deduped: List[str] = []
+    for line in lines:
+        text = str(line or "").strip()
+        if text and text not in deduped:
+            deduped.append(text)
+    return deduped
+
+
+def _resolve_gray_target_user(user_ctx, target: str = "") -> Dict[str, Any]:
+    target_text = str(target or "").strip()
+    current_name = str(getattr(getattr(user_ctx, "config", None), "name", "") or "")
+    current_id = str(getattr(user_ctx, "user_id", "") or "")
+    if not target_text or target_text.lower() in {current_name.lower(), current_id.lower()}:
+        return {"ok": True, "user_ctx": user_ctx}
+
+    for candidate_ctx in get_registered_user_contexts().values():
+        if not candidate_ctx:
+            continue
+        candidate_name = str(getattr(getattr(candidate_ctx, "config", None), "name", "") or "")
+        candidate_id = str(getattr(candidate_ctx, "user_id", "") or "")
+        if target_text.lower() not in {candidate_name.lower(), candidate_id.lower()}:
+            continue
+        if str(candidate_id) == current_id:
+            return {"ok": True, "user_ctx": user_ctx}
+        return {
+            "ok": False,
+            "message": "❌ H5 只允许当前账号单账户灰度，不支持把候选直接下发到其他账号",
+        }
+    return {"ok": False, "message": f"❌ 未找到目标账号 `{target_text}`"}
+
+
+def _ensure_candidate_policy_version(
+    user_ctx,
+    candidate: Dict[str, Any],
+    *,
+    activation_mode: str,
+    policy_field: str,
+    summary_prefix: str,
+    based_on_version: str = "",
+) -> Dict[str, Any]:
+    store = policy_engine.load_policy_store(user_ctx)
+    existing_version = str(candidate.get(policy_field, "") or "")
+    if existing_version:
+        existing = policy_engine._find_policy_version(store, existing_version)
+        if existing:
+            return {"ok": True, "created": False, "policy": existing}
+
+    policies = policy_engine._sorted_policies(store)
+    base_version = str(
+        based_on_version
+        or candidate.get("gray_base_policy_version", "")
+        or candidate.get("based_on_policy_version", "")
+        or store.get("active_version", "")
+        or ""
+    )
+    base_policy = (
+        policy_engine._find_policy_version(store, base_version)
+        or policy_engine._find_policy_version(store, store.get("active_version", ""))
+        or (policies[-1] if policies else None)
+    )
+    if not base_policy:
+        return {"ok": False, "message": "❌ 当前没有可用的策略版本作为灰度/转正基线"}
+
+    overlay = candidate.get("overlay", {}) if isinstance(candidate.get("overlay", {}), dict) else {}
+    overlay_lines = overlay.get("prompt_lines", []) if isinstance(overlay.get("prompt_lines", []), list) else []
+    writeback_lines = _dedupe_lines(list(base_policy.get("writeback_lines", []) or []) + list(overlay_lines or []))[:8]
+    created_at = _now_text()
+    summary = f"{summary_prefix} {candidate.get('candidate_version', '')} | {candidate.get('rule_name', '')}"
+    evidence_package = {
+        "kind": "learning_candidate",
+        "candidate_id": str(candidate.get("candidate_id", "") or ""),
+        "candidate_version": str(candidate.get("candidate_version", "") or ""),
+        "rule_id": str(candidate.get("rule_id", "") or ""),
+        "rule_name": str(candidate.get("rule_name", "") or ""),
+        "activation_mode": activation_mode,
+        "overlay": overlay,
+        "candidate_evidence": candidate.get("evidence_package", {}) if isinstance(candidate.get("evidence_package", {}), dict) else {},
+    }
+    policy = {
+        "policy_id": str(base_policy.get("policy_id", store.get("policy_id", "")) or ""),
+        "policy_version": policy_engine._next_policy_version(store),
+        "source": "learning_candidate",
+        "activation_mode": activation_mode,
+        "status": "ready",
+        "created_at": created_at,
+        "activated_at": "",
+        "based_on_version": str(base_policy.get("policy_version", "") or ""),
+        "summary": summary,
+        "writeback_lines": writeback_lines,
+        "prompt_fragment": policy_engine._render_prompt_fragment(summary, writeback_lines),
+        "evidence_hash": str(candidate.get("candidate_hash", "") or f"learn_{uuid.uuid4().hex[:8]}"),
+        "evidence_package": evidence_package,
+    }
+    store.setdefault("policies", []).append(policy)
+    policy_engine._write_policy_store(user_ctx, store)
+    try:
+        history_analysis.record_policy_version(user_ctx, policy)
+        history_analysis.record_policy_event(
+            user_ctx,
+            policy_id=str(policy.get("policy_id", "") or ""),
+            policy_version=str(policy.get("policy_version", "") or ""),
+            event_type=f"learning_prepare_{activation_mode}",
+            reason=summary,
+            previous_version=str(base_policy.get("policy_version", "") or ""),
+            payload=evidence_package,
+        )
+    except Exception:
+        pass
+    return {"ok": True, "created": True, "policy": policy}
+
+
+def _record_learning_promotion_event(
+    user_ctx,
+    candidate: Dict[str, Any],
+    *,
+    event_type: str,
+    target_policy_version: str,
+    reason: str,
+    payload: Optional[Dict[str, Any]] = None,
+) -> None:
+    created_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")
+    history_analysis.record_learning_promotion(
+        user_ctx,
+        {
+            "promotion_id": f"lp_{datetime.now().strftime('%Y%m%d%H%M%S%f')}_{uuid.uuid4().hex[:8]}",
+            "candidate_id": str(candidate.get("candidate_id", "") or ""),
+            "candidate_version": str(candidate.get("candidate_version", "") or ""),
+            "event_type": str(event_type or ""),
+            "target_policy_version": str(target_policy_version or ""),
+            "reason": str(reason or ""),
+            "payload": payload or {},
+            "created_at": created_at,
+        },
+    )
+
+
+def gray_candidate(user_ctx, ident: str = "", target: str = "") -> Dict[str, Any]:
+    target_result = _resolve_gray_target_user(user_ctx, target)
+    if not target_result.get("ok", False):
+        return {"ok": False, "message": str(target_result.get("message", "❌ 无法解析灰度目标账号"))}
+
+    center = load_learning_center(user_ctx)
+    candidate = _find_candidate(center, ident)
+    if not candidate:
+        return {"ok": False, "message": "❌ 未找到对应学习候选"}
+    if str(candidate.get("last_evaluation_status", "") or "") in {"", LEARNING_EVAL_FAIL}:
+        return {"ok": False, "message": "❌ 当前候选尚未通过离线评估，不能进入灰度"}
+    if int(candidate.get("last_shadow_sample_size", 0) or 0) <= 0:
+        return {"ok": False, "message": "❌ 当前候选还没有影子样本，不能直接进入灰度"}
+    if str(candidate.get("last_shadow_status", "") or "") == LEARNING_SHADOW_FAIL:
+        return {"ok": False, "message": "❌ 当前候选影子结果偏弱，暂不允许进入灰度"}
+
+    target_ctx = target_result.get("user_ctx", user_ctx)
+    target_name = str(getattr(getattr(target_ctx, "config", None), "name", "") or "")
+    target_user_id = str(getattr(target_ctx, "user_id", "") or "")
+    target_store = policy_engine.load_policy_store(target_ctx)
+    active_policy = (
+        policy_engine._find_policy_version(target_store, target_store.get("active_version", ""))
+        or policy_engine._sorted_policies(target_store)[-1]
+    )
+    current_active_version = str(active_policy.get("policy_version", "") or "")
+
+    ensure_result = _ensure_candidate_policy_version(
+        target_ctx,
+        candidate,
+        activation_mode="gray",
+        policy_field="gray_policy_version",
+        summary_prefix="学习候选灰度",
+        based_on_version=current_active_version,
+    )
+    if not ensure_result.get("ok", False):
+        return {"ok": False, "message": str(ensure_result.get("message", "❌ 无法生成灰度策略版本"))}
+    gray_policy = ensure_result.get("policy", {}) if isinstance(ensure_result.get("policy", {}), dict) else {}
+    gray_version = str(gray_policy.get("policy_version", "") or "")
+    result = policy_engine.activate_policy_version(
+        target_ctx,
+        gray_version,
+        reason=f"学习候选灰度 {candidate.get('candidate_version', '')}",
+    )
+    if not result.get("ok", False):
+        return result
+
+    now_text = _now_text()
+    candidate_id = str(candidate.get("candidate_id", "") or "")
+    center["active_gray_candidate_id"] = candidate_id
+    if str(center.get("active_shadow_candidate_id", "") or "") == candidate_id:
+        center["active_shadow_candidate_id"] = ""
+    center["last_promotion_event_at"] = now_text
+    idx = _find_candidate_index(center, candidate_id)
+    if idx >= 0:
+        center["candidates"][idx]["status"] = LEARNING_STATUS_GRAY
+        center["candidates"][idx]["updated_at"] = now_text
+        center["candidates"][idx]["gray_started_at"] = now_text
+        center["candidates"][idx]["gray_target_user_id"] = target_user_id
+        center["candidates"][idx]["gray_target_user_name"] = target_name
+        center["candidates"][idx]["gray_policy_version"] = gray_version
+        center["candidates"][idx]["gray_base_policy_version"] = current_active_version
+        center["candidates"][idx]["rollback_policy_version"] = current_active_version
+        center["candidates"][idx]["last_gray_summary"] = (
+            f"灰度中：{target_name or target_user_id} -> {gray_version}（基线 {current_active_version}）"
+        )
+        try:
+            history_analysis.record_learning_candidate(user_ctx, center["candidates"][idx])
+        except Exception:
+            pass
+
+    _record_learning_promotion_event(
+        user_ctx,
+        candidate,
+        event_type="gray_start",
+        target_policy_version=gray_version,
+        reason="学习候选开始单账号灰度",
+        payload={
+            "target_user_id": target_user_id,
+            "target_user_name": target_name,
+            "base_policy_version": current_active_version,
+            "gray_policy_version": gray_version,
+            "shadow_status": str(candidate.get("last_shadow_status", "") or ""),
+            "shadow_samples": int(candidate.get("last_shadow_sample_size", 0) or 0),
+        },
+    )
+    _write_learning_center(user_ctx, center)
+    _update_runtime_learning_snapshot(user_ctx, center)
+    return {
+        "ok": True,
+        "policy_version": gray_version,
+        "message": (
+            "🧠 已启动学习候选灰度\n\n"
+            f"候选：{candidate.get('candidate_version', '')} | {candidate.get('rule_name', '')}\n"
+            f"账号：{target_name or target_user_id}\n"
+            f"策略版本：{gray_version}（基于 {current_active_version}）\n"
+            "说明：当前只允许单账号灰度，且不覆盖硬风控。"
+        ),
+    }
+
+
+def promote_candidate(user_ctx, ident: str = "") -> Dict[str, Any]:
+    center = load_learning_center(user_ctx)
+    candidate = _find_candidate(center, ident)
+    if not candidate:
+        return {"ok": False, "message": "❌ 未找到对应学习候选"}
+
+    candidate_id = str(candidate.get("candidate_id", "") or "")
+    if str(center.get("active_gray_candidate_id", "") or "") != candidate_id:
+        return {"ok": False, "message": "❌ 当前候选未处于灰度运行中，不能直接转正"}
+
+    gray_policy_version = str(candidate.get("gray_policy_version", "") or "")
+    if not gray_policy_version:
+        return {"ok": False, "message": "❌ 当前候选还没有灰度策略版本，不能转正"}
+
+    rollback_version = str(
+        candidate.get("rollback_policy_version", "")
+        or candidate.get("gray_base_policy_version", "")
+        or candidate.get("based_on_policy_version", "")
+        or ""
+    )
+    ensure_result = _ensure_candidate_policy_version(
+        user_ctx,
+        candidate,
+        activation_mode="baseline",
+        policy_field="promoted_policy_version",
+        summary_prefix="学习候选转正",
+        based_on_version=gray_policy_version,
+    )
+    if not ensure_result.get("ok", False):
+        return {"ok": False, "message": str(ensure_result.get("message", "❌ 无法生成转正策略版本"))}
+    promoted_policy = ensure_result.get("policy", {}) if isinstance(ensure_result.get("policy", {}), dict) else {}
+    promoted_version = str(promoted_policy.get("policy_version", "") or "")
+    result = policy_engine.activate_policy_version(
+        user_ctx,
+        promoted_version,
+        reason=f"学习候选转正 {candidate.get('candidate_version', '')}",
+    )
+    if not result.get("ok", False):
+        return result
+
+    now_text = _now_text()
+    center["active_gray_candidate_id"] = ""
+    center["promoted_candidate_id"] = candidate_id
+    center["last_promotion_event_at"] = now_text
+    idx = _find_candidate_index(center, candidate_id)
+    if idx >= 0:
+        center["candidates"][idx]["status"] = LEARNING_STATUS_PROMOTED
+        center["candidates"][idx]["updated_at"] = now_text
+        center["candidates"][idx]["promoted_at"] = now_text
+        center["candidates"][idx]["promoted_policy_version"] = promoted_version
+        center["candidates"][idx]["rollback_policy_version"] = rollback_version
+        center["candidates"][idx]["last_gray_summary"] = (
+            f"已转正：{promoted_version}（可回滚到 {rollback_version or '-' }）"
+        )
+        try:
+            history_analysis.record_learning_candidate(user_ctx, center["candidates"][idx])
+        except Exception:
+            pass
+
+    _record_learning_promotion_event(
+        user_ctx,
+        candidate,
+        event_type="promote",
+        target_policy_version=promoted_version,
+        reason="学习候选人工确认转正",
+        payload={
+            "gray_policy_version": gray_policy_version,
+            "promoted_policy_version": promoted_version,
+            "rollback_policy_version": rollback_version,
+        },
+    )
+    _write_learning_center(user_ctx, center)
+    _update_runtime_learning_snapshot(user_ctx, center)
+    return {
+        "ok": True,
+        "policy_version": promoted_version,
+        "message": (
+            "🧠 已转正学习候选\n\n"
+            f"候选：{candidate.get('candidate_version', '')} | {candidate.get('rule_name', '')}\n"
+            f"正式策略：{promoted_version}\n"
+            f"回滚锚点：{rollback_version or '-'}"
+        ),
+    }
+
+
+def rollback_candidate(user_ctx) -> Dict[str, Any]:
+    center = load_learning_center(user_ctx)
+    candidate = _find_candidate_strict(center, str(center.get("active_gray_candidate_id", "") or ""))
+    if not candidate:
+        candidate = _find_candidate_strict(center, str(center.get("promoted_candidate_id", "") or ""))
+    if not candidate:
+        for item in reversed(_sorted_candidates(center)):
+            if str(item.get("status", "") or "") in {LEARNING_STATUS_GRAY, LEARNING_STATUS_PROMOTED}:
+                candidate = item
+                break
+    if not candidate:
+        return {"ok": False, "message": "❌ 当前没有可回滚的学习候选"}
+
+    rollback_version = str(
+        candidate.get("rollback_policy_version", "")
+        or candidate.get("gray_base_policy_version", "")
+        or candidate.get("based_on_policy_version", "")
+        or ""
+    )
+    if not rollback_version:
+        return {"ok": False, "message": "❌ 当前候选缺少回滚锚点，无法执行回滚"}
+
+    current_policy_version = str(user_ctx.state.runtime.get("policy_active_version", "") or "")
+    result = policy_engine.activate_policy_version(
+        user_ctx,
+        rollback_version,
+        reason=f"学习候选回滚 {candidate.get('candidate_version', '')}",
+    )
+    if not result.get("ok", False):
+        return result
+
+    now_text = _now_text()
+    candidate_id = str(candidate.get("candidate_id", "") or "")
+    if str(center.get("active_gray_candidate_id", "") or "") == candidate_id:
+        center["active_gray_candidate_id"] = ""
+    if str(center.get("promoted_candidate_id", "") or "") == candidate_id:
+        center["promoted_candidate_id"] = ""
+    center["last_promotion_event_at"] = now_text
+    idx = _find_candidate_index(center, candidate_id)
+    if idx >= 0:
+        center["candidates"][idx]["status"] = LEARNING_STATUS_ROLLED_BACK
+        center["candidates"][idx]["updated_at"] = now_text
+        center["candidates"][idx]["rolled_back_at"] = now_text
+        center["candidates"][idx]["rolled_back_to_version"] = rollback_version
+        center["candidates"][idx]["last_gray_summary"] = (
+            f"已回滚：{current_policy_version or '-'} -> {rollback_version}"
+        )
+        try:
+            history_analysis.record_learning_candidate(user_ctx, center["candidates"][idx])
+        except Exception:
+            pass
+
+    _record_learning_promotion_event(
+        user_ctx,
+        candidate,
+        event_type="rollback",
+        target_policy_version=rollback_version,
+        reason="学习候选手动回滚",
+        payload={
+            "from_policy_version": current_policy_version,
+            "rollback_policy_version": rollback_version,
+        },
+    )
+    _write_learning_center(user_ctx, center)
+    _update_runtime_learning_snapshot(user_ctx, center)
+    return {
+        "ok": True,
+        "policy_version": rollback_version,
+        "message": (
+            "🧠 已回滚学习候选\n\n"
+            f"候选：{candidate.get('candidate_version', '')} | {candidate.get('rule_name', '')}\n"
+            f"回滚到：{rollback_version}"
+        ),
+    }
+
+
 def build_learning_evaluation_text(candidate: Dict[str, Any], evaluation: Dict[str, Any]) -> str:
     metrics = evaluation.get("metrics", {}) if isinstance(evaluation.get("metrics", {}), dict) else {}
     status = str(evaluation.get("status", LEARNING_EVAL_WATCH) or LEARNING_EVAL_WATCH)
@@ -1367,7 +1776,9 @@ def build_learning_overview_text(user_ctx) -> str:
     center = load_learning_center(user_ctx)
     candidates = _sorted_candidates(center)
     latest = candidates[-1] if candidates else {}
-    active_shadow = _find_candidate(center, str(center.get("active_shadow_candidate_id", "") or ""))
+    active_shadow = _find_candidate_strict(center, str(center.get("active_shadow_candidate_id", "") or ""))
+    active_gray = _find_candidate_strict(center, str(center.get("active_gray_candidate_id", "") or ""))
+    promoted = _find_candidate_strict(center, str(center.get("promoted_candidate_id", "") or ""))
     active_policy = policy_engine.build_policy_prompt_context(user_ctx)
     status_counter: Dict[str, int] = {}
     for item in candidates:
@@ -1377,7 +1788,7 @@ def build_learning_overview_text(user_ctx) -> str:
     lines = [
         "🧠 受控自学习中心",
         "",
-        "当前实现：H1/H2/H3/H4 已启用（候选中心 / 规则生成 / 离线评估 / 影子验证）",
+        "当前实现：H1/H2/H3/H4/H5 已启用（候选中心 / 规则生成 / 离线评估 / 影子验证 / 灰度转正回滚）",
         f"当前策略：{active_policy.get('policy_id', '')}@{active_policy.get('policy_version', '')} ({active_policy.get('policy_mode', '')})",
         f"候选总数：{len(candidates)}",
         f"状态分布：{status_text}",
@@ -1386,11 +1797,14 @@ def build_learning_overview_text(user_ctx) -> str:
         f"候选摘要：{latest.get('summary', '') or '-'}",
         f"最近评估：{latest.get('last_evaluation_status', '') or '-'} / {latest.get('last_score_total', '-')}",
         f"影子运行：{active_shadow.get('candidate_version', '-') if active_shadow else '-'}",
+        f"灰度运行：{active_gray.get('candidate_version', '-') if active_gray else '-'}",
+        f"最近转正：{promoted.get('candidate_version', '-') if promoted else '-'}",
         f"最近影子：{center.get('last_shadow_recorded_at', '') or '-'}",
+        f"最近晋退事件：{center.get('last_promotion_event_at', '') or '-'}",
         "",
         "命令：`learn` / `learn gen` / `learn list` / `learn show <id|cX>` / `learn eval [id|cX]`",
         "影子：`learn shadow` / `learn shadow <id|cX> on` / `learn shadow off`",
-        "后续：`learn gray` / `learn promote` / `learn rollback`",
+        "灰度：`learn gray <id|cX> [当前账号名|ID]` / `learn promote <id|cX>` / `learn rollback`",
     ]
     return "\n".join(lines)
 
@@ -1435,6 +1849,7 @@ def build_learning_detail_text(user_ctx, ident: str = "") -> str:
         f"创建时间：{candidate.get('created_at', '')}",
         f"最近评估：{candidate.get('last_evaluation_status', '') or '-'} / {candidate.get('last_score_total', '-')}",
         f"影子状态：{candidate.get('last_shadow_status', '-') or '-'} | 样本 {int(candidate.get('last_shadow_sample_size', 0) or 0)}",
+        f"灰度状态：{candidate.get('gray_policy_version', '-') or '-'} | 转正版本 {candidate.get('promoted_policy_version', '-') or '-'}",
         f"摘要：{candidate.get('summary', '')}",
         f"标签：{', '.join(candidate.get('tags', []) or []) or '-'}",
         "",
@@ -1459,12 +1874,14 @@ def build_learning_detail_text(user_ctx, ident: str = "") -> str:
         lines.extend(["", "离线评估摘要：", str(candidate.get("last_evaluation_summary", "") or "-")])
     if candidate.get("last_shadow_summary"):
         lines.extend(["", "影子验证摘要：", str(candidate.get("last_shadow_summary", "") or "-")])
+    if candidate.get("last_gray_summary"):
+        lines.extend(["", "灰度/转正摘要：", str(candidate.get("last_gray_summary", "") or "-")])
     return "\n".join(lines)
 
 
 def build_learning_shadow_text(user_ctx, ident: str = "") -> str:
     center = load_learning_center(user_ctx)
-    active_candidate = _find_candidate(center, str(center.get("active_shadow_candidate_id", "") or ""))
+    active_candidate = _find_candidate_strict(center, str(center.get("active_shadow_candidate_id", "") or ""))
     target = _find_candidate(center, ident) if ident else active_candidate
     lines = [
         "🧠 学习候选影子验证",
@@ -1498,7 +1915,7 @@ def build_learning_shadow_text(user_ctx, ident: str = "") -> str:
             f"回撤：{int(metrics.get('candidate_drawdown', 0) or 0):,} | 基线：{int(metrics.get('base_drawdown', 0) or 0):,} | 改善 {int(metrics.get('delta_drawdown', 0) or 0):+,}",
             f"摘要：{metrics.get('summary', '暂无影子样本') or '暂无影子样本'}",
             "",
-            "命令：`learn shadow <id|cX> on` / `learn shadow off`",
+            "命令：`learn shadow <id|cX> on` / `learn gray <id|cX>` / `learn shadow off`",
         ]
     )
     return "\n".join(lines)
@@ -1506,12 +1923,12 @@ def build_learning_shadow_text(user_ctx, ident: str = "") -> str:
 
 def build_learning_pending_text(subcmd: str) -> str:
     mapping = {
-        "gray": "H5 单账号灰度",
-        "promote": "H5 转正",
-        "rollback": "H5 回滚",
+        "gray": "单账号灰度",
+        "promote": "转正",
+        "rollback": "回滚",
     }
     stage_text = mapping.get(str(subcmd or "").strip().lower(), "后续阶段")
     return (
         f"🧠 `{subcmd}` 尚未实现\n\n"
-        f"该命令属于 {stage_text}，当前分支已完成 H1/H2/H3/H4，接下来会按顺序继续实现。"
+        f"该命令属于 {stage_text}，当前分支尚未提供对应实现。"
     )
