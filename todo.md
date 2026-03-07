@@ -70,10 +70,20 @@
   - I4 告警摘要：`watch alerts`、当前风险 + 最近播报
   - I5 文档、测试、回归
 
+### [x] J. 执行稳定性与启动自检 V1
+- 说明书：[docs/runtime-stability-v1-tech-spec.md](./docs/runtime-stability-v1-tech-spec.md)
+- 当前实现：J1/J2/J3/J4/J5 全部完成
+- 交付：
+  - J1 配置自检：`doctor / doctor fleet`
+  - J2 启动阻断：启动前阻断明显错配，避免静默带病运行
+  - J3 运行态稳态修复：清理非法值守缓存、过期暂停/影子状态、失效挂单标记
+  - J4 异常快照：统一 `runtime_faults / last_runtime_fault`
+  - J5 文档、测试、回归
+
 ---
 
 ## 4. 当前状态
-当前既定阶段 A 到 I 均已完成。
+当前既定阶段 A 到 J 均已完成。
 
 下一步不是继续补旧计划，而是等待新的阶段目标。
 
@@ -95,6 +105,7 @@ python -m pytest `
   tests_multiuser\test_multi_account_orchestrator_v1.py `
   tests_multiuser\test_self_learning_v1.py `
   tests_multiuser\test_tg_watch_v1.py `
+  tests_multiuser\test_runtime_stability_v1.py `
   -q
 ```
 

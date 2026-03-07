@@ -10,6 +10,7 @@
 - [多账号编排 V1 技术说明书](./multi-account-orchestration-v1-tech-spec.md)
 - [受控自学习 V1 技术说明书](./controlled-self-learning-v1-tech-spec.md)
 - [Telegram 值守播报 V1 技术说明书](./tg-watch-v1-tech-spec.md)
+- [执行稳定性与启动自检 V1 技术说明书](./runtime-stability-v1-tech-spec.md)
 - [重构路线图](./refactor-roadmap.md)
 
 ## 使用建议

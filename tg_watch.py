@@ -7,6 +7,7 @@ import history_analysis
 import multi_account_orchestrator
 import policy_engine
 import risk_control
+import runtime_stability
 import self_learning_engine
 from user_manager import get_registered_user_contexts
 
@@ -338,10 +339,23 @@ def _current_watch_alerts(user_ctx) -> List[Tuple[int, str]]:
     name = multi_account_orchestrator._account_name(user_ctx)  # type: ignore[attr-defined]
     alerts: List[Tuple[int, str]] = []
 
-    if bool(rt.get("fund_pause_notified", False)):
+    recent_fault = runtime_stability.get_recent_runtime_fault(user_ctx, max_age_sec=12 * 3600)
+    if recent_fault and str(recent_fault.get("severity", "info") or "info") in {"warning", "error"}:
         alerts.append(
             (
                 0,
+                (
+                    f"- {name} ({user_ctx.user_id}) | 运行异常 | "
+                    f"{str(recent_fault.get('stage', '') or 'runtime')} | "
+                    f"{runtime_stability.format_runtime_fault_brief(recent_fault)}"
+                ),
+            )
+        )
+
+    if bool(rt.get("fund_pause_notified", False)):
+        alerts.append(
+            (
+                1,
                 f"- {name} ({user_ctx.user_id}) | 资金不足暂停 | 资金 {int(rt.get('gambling_fund', 0) or 0):,} | 余额 {int(rt.get('account_balance', 0) or 0):,}",
             )
         )
@@ -351,7 +365,7 @@ def _current_watch_alerts(user_ctx) -> List[Tuple[int, str]]:
         reason = str(rt.get("pause_countdown_reason", "") or rt.get("pause_resume_pending_reason", "") or "自动暂停")
         alerts.append(
             (
-                1,
+                2,
                 f"- {name} ({user_ctx.user_id}) | 自动暂停中 | 原因 {reason} | 剩余 {remaining} 局",
             )
         )
@@ -364,7 +378,7 @@ def _current_watch_alerts(user_ctx) -> List[Tuple[int, str]]:
     if active_gray:
         alerts.append(
             (
-                2,
+                3,
                 f"- {name} ({user_ctx.user_id}) | 学习灰度中 | {active_gray.get('candidate_version', '-') or '-'} -> {active_gray.get('gray_policy_version', '-') or '-'}",
             )
         )
@@ -377,7 +391,7 @@ def _current_watch_alerts(user_ctx) -> List[Tuple[int, str]]:
     if temp_level in {"cold", "very_cold"} and pnl24 < 0:
         alerts.append(
             (
-                3,
+                4,
                 f"- {name} ({user_ctx.user_id}) | 24h 偏冷 | 盈亏 {pnl24:+,} | 回撤 {int(overview.get('max_drawdown', 0) or 0):,} | 温度 {_temperature_text(temp_level)}",
             )
         )

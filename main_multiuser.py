@@ -12,6 +12,7 @@ import time
 import sys
 import errno
 from typing import Any, Dict, List
+import runtime_stability
 from telethon import TelegramClient, events
 from logging.handlers import TimedRotatingFileHandler
 from user_manager import UserManager, UserContext
@@ -529,19 +530,19 @@ async def start_user(user_ctx: UserContext, global_config: dict):
                 category='warning',
             )
 
-        zq_group_targets = _iter_targets(user_ctx.config.groups.get("zq_group", []))
-        zq_bot_targets = _iter_targets(user_ctx.config.groups.get("zq_bot"))
         admin_chat = _resolve_admin_chat(user_ctx)
+        startup_doctor = runtime_stability.inspect_user_context(user_ctx)
 
-        # 启动前校验，避免“进程运行但账号无命令/无结算”的静默失败。
-        if not zq_group_targets or not zq_bot_targets:
+        if startup_doctor.get("status") == "blocked":
+            blocker_preview = " | ".join(
+                item.get("message", "") for item in startup_doctor.get("blockers", [])[:3]
+            )
             log_event(
                 logging.ERROR,
                 'start',
-                '用户启动失败：缺少必要监听配置',
+                '用户启动失败：启动自检未通过',
                 user_id=user_ctx.user_id,
-                zq_group=zq_group_targets,
-                zq_bot=zq_bot_targets,
+                blockers=blocker_preview or "unknown",
             )
             return None
         if not admin_chat:
@@ -582,6 +583,13 @@ async def start_user(user_ctx: UserContext, global_config: dict):
                           user_id=user_ctx.user_id)
                 print(f"✅ 用户 {user_ctx.config.name} 登录成功！\n")
             except Exception as e:
+                runtime_stability.record_runtime_fault(
+                    user_ctx,
+                    "startup_login",
+                    e,
+                    action="账号未完成授权登录",
+                    persist=True,
+                )
                 log_event(logging.ERROR, 'start', '登录失败',
                           user_id=user_ctx.user_id, error=str(e))
                 print(f"❌ 登录失败: {e}")
@@ -612,6 +620,7 @@ async def start_user(user_ctx: UserContext, global_config: dict):
             deep=risk_mode.get("deep_enabled"),
         )
         heal_result = heal_stale_pending_bets(user_ctx)
+        reconcile_result = runtime_stability.reconcile_runtime_state(user_ctx)
 
         user_ctx.save_state()
 
@@ -651,10 +660,42 @@ async def start_user(user_ctx: UserContext, global_config: dict):
                 focus_msg = build_startup_focus_reminder(user_ctx)
                 await client.send_message(admin_chat, focus_msg)
             except Exception as e:
+                runtime_stability.record_runtime_fault(
+                    user_ctx,
+                    "startup_focus_notice",
+                    e,
+                    action="启动提醒未成功发送",
+                )
                 log_event(
                     logging.ERROR,
                     'start',
                     '启动重点设置提醒发送失败',
+                    user_id=user_ctx.user_id,
+                    error=str(e),
+                )
+
+        startup_doctor = runtime_stability.inspect_user_context(user_ctx)
+        if startup_doctor.get("warnings") or reconcile_result.get("changed", False):
+            try:
+                from zq_multiuser import send_to_watch
+
+                startup_health = runtime_stability.build_startup_health_text(
+                    user_ctx,
+                    startup_doctor,
+                    reconcile_result,
+                )
+                await send_to_watch(client, startup_health, user_ctx, global_config)
+            except Exception as e:
+                runtime_stability.record_runtime_fault(
+                    user_ctx,
+                    "startup_health_notice",
+                    e,
+                    action="启动自检摘要未成功发送",
+                )
+                log_event(
+                    logging.ERROR,
+                    'start',
+                    '启动自检摘要发送失败',
                     user_id=user_ctx.user_id,
                     error=str(e),
                 )
@@ -665,6 +706,13 @@ async def start_user(user_ctx: UserContext, global_config: dict):
         return client
         
     except Exception as e:
+        runtime_stability.record_runtime_fault(
+            user_ctx,
+            "startup",
+            e,
+            action="账号启动失败",
+            persist=True,
+        )
         log_event(logging.ERROR, 'start', '用户启动失败',
                   user_id=user_ctx.user_id, error=str(e))
         if lock_acquired:

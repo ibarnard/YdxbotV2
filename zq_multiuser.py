@@ -26,6 +26,7 @@ import history_analysis
 import multi_account_orchestrator
 import policy_engine
 import risk_control
+import runtime_stability
 import self_learning_engine
 import task_engine
 import task_package_engine
@@ -924,6 +925,13 @@ async def _send_tg_bot_notification(
         try:
             await _post_json_async(url, payload, timeout=5)
         except Exception as e:
+            runtime_stability.record_runtime_fault(
+                user_ctx,
+                "tg_bot_notify",
+                e,
+                message=log_event_name,
+                action="值守/TG Bot 通知已降级跳过",
+            )
             log_event(logging.ERROR, 'send_msg', log_event_name, user_id=user_ctx.user_id, data=str(e))
 
 
@@ -960,6 +968,12 @@ async def send_message_v2(
                 # 修复：多用户分支 - 返回管理员消息对象，确保仪表盘/统计可被后续刷新删除。
                 sent_message = await client.send_message(admin_chat, admin_message, parse_mode=parse_mode)
         except Exception as e:
+            runtime_stability.record_runtime_fault(
+                user_ctx,
+                "send_admin",
+                e,
+                action="管理员消息已降级跳过",
+            )
             log_event(logging.ERROR, 'send_msg', '发送管理员消息失败', user_id=user_ctx.user_id, data=str(e))
 
     if "priority" in channels or "all" in channels:
@@ -1058,6 +1072,12 @@ async def send_to_watch(
         if watch_chat:
             sent_message = await client.send_message(watch_chat, watch_message, parse_mode=parse_mode)
     except Exception as e:
+        runtime_stability.record_runtime_fault(
+            user_ctx,
+            "send_watch",
+            e,
+            action="值守聊天消息已降级跳过",
+        )
         log_event(logging.ERROR, 'send_msg', '发送值守播报失败', user_id=user_ctx.user_id, data=str(e))
 
     watch_tg_bot_cfg = _resolve_watch_tg_bot(user_ctx)
@@ -1583,6 +1603,12 @@ async def predict_next_bet_v10(user_ctx: UserContext, global_config: dict, curre
         return prediction
         
     except Exception as e:
+        runtime_stability.record_runtime_fault(
+            user_ctx,
+            "predict_v10",
+            e,
+            action="已切换到终极保底预测",
+        )
         log_event(logging.ERROR, 'predict_v10', 'M-SMP异常，最终保底', 
                   user_id=user_ctx.user_id, data=str(e))
         
@@ -4845,6 +4871,13 @@ async def process_settle(client, event, user_ctx: UserContext, global_config: di
         user_ctx.save_state()
         
     except Exception as e:
+        runtime_stability.record_runtime_fault(
+            user_ctx,
+            "settle",
+            e,
+            action="结算流程异常，已保留当前运行态",
+            persist=True,
+        )
         log_event(logging.ERROR, 'settle', '结算处理失败', 
                   user_id=user_ctx.user_id, data=str(e))
 
@@ -5164,6 +5197,8 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
 - `learn eval [id|cX]` : 对候选执行离线评估
 - `learn shadow` / `learn shadow <id|cX> on` / `learn shadow off` : 管理学习候选影子验证
 - `learn gray <id|cX> [当前账号名|ID]` / `learn promote <id|cX>` / `learn rollback` : 学习候选灰度、转正、回滚
+- `doctor` : 查看当前账号启动/运行自检摘要
+- `doctor fleet` : 查看多账号自检总览
 - `watch` : 发送当前账号值守摘要到值守通道
 - `watch fleet` : 发送多账号值守摘要到值守通道
 - `watch learn` : 发送学习值守摘要到值守通道
@@ -5738,6 +5773,38 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
                 user_ctx,
                 global_config,
             )
+            return
+
+        if cmd == "doctor":
+            if len(my) == 1:
+                message = await send_to_admin(client, runtime_stability.build_doctor_text(user_ctx), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 120))
+                return
+
+            subcmd = str(my[1]).strip().lower()
+            if subcmd == "fleet":
+                message = await send_to_admin(client, runtime_stability.build_doctor_fleet_text(user_ctx), user_ctx, global_config)
+                asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+                if message:
+                    asyncio.create_task(delete_later(client, message.chat_id, message.id, 120))
+                return
+
+            message = await send_to_admin(
+                client,
+                (
+                    "❌ 参数格式错误\n"
+                    "用法：\n"
+                    "`doctor`\n"
+                    "`doctor fleet`"
+                ),
+                user_ctx,
+                global_config,
+            )
+            asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
+            if message:
+                asyncio.create_task(delete_later(client, message.chat_id, message.id, 60))
             return
 
         if cmd == "watch":
@@ -6429,6 +6496,13 @@ async def process_user_command(client, event, user_ctx: UserContext, global_conf
         asyncio.create_task(delete_later(client, event.chat_id, event.id, 10))
         
     except Exception as e:
+        runtime_stability.record_runtime_fault(
+            user_ctx,
+            f"user_command:{cmd}",
+            e,
+            action="命令执行失败",
+            persist=True,
+        )
         log_event(logging.ERROR, 'user_cmd', '命令执行出错', user_id=user_ctx.user_id, error=str(e))
         await send_to_admin(client, f"命令执行出错: {e}", user_ctx, global_config)
 
